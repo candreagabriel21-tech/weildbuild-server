@@ -1,0 +1,10 @@
+{
+  "item_key": "FACE-2",
+  "name": "Pity Face",
+  "type": "face",
+  "price": 10,
+  "description": "Why are you so mean? :(",
+  "date_created": "2026-02-25",
+  "creator": "WeildBuild",
+  "data": "/items/faces/FACE-2.png"
+}

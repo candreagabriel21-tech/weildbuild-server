@@ -1,0 +1,178 @@
+# ═══════════════════════════════════════════════════════════════════
+# WeildBuild — Render Blueprint
+# ═══════════════════════════════════════════════════════════════════
+# Push this repo to GitHub, then: https://dashboard.render.com/blueprints
+#
+# ⚠️ READ THIS FIRST — THE FREE-TIER MATH ⚠️
+# Render free accounts get 750 instance-hours/month. A service kept
+# awake 24/7 burns ~730 h/month. So ONE always-awake service per
+# account fits — but this blueprint's four services together would
+# burn ~2,920 h/month and get suspended around day 8.
+#
+# ▶ RECOMMENDED (the 4-account plan — see DEPLOY.md for the
+#   click-by-click guide):
+#     Account 1 (you)          → weildbuild-main
+#     Account 2 (friend)       → weildbuild-realtime
+#     Account 3 (friend)       → weildbuild-gamehost-1
+#     Account 4 (friend)       → weildbuild-gamehost-2
+#   Each friend creates ONE web service from THIS SAME GitHub repo
+#   (values in DEPLOY.md tables). Every account stays under 750 h.
+#
+# ▶ THIS FILE AS-IS = all four services on ONE account. Fine for a
+#   quick test / staging, NOT for a 24/7 production setup on free
+#   tier. Delete the services you don't want on this account before
+#   applying (or comment them out below).
+#
+# ▶ KEEP-AWAKE: no extra service and no 5th account needed — set up
+#   a free UptimeRobot (or cron-job.org) monitor per service, each
+#   pinging /health every 5 minutes. See DEPLOY.md section 6.
+# ═══════════════════════════════════════════════════════════════════
+
+services:
+
+  # ─────────────── 1. MAIN SERVER (the brain) ───────────────
+  - type: web
+    name: weildbuild-main
+    runtime: node
+    plan: free
+    region: frankfurt
+    buildCommand: npm install && npm run build
+    startCommand: npm run start:main
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: NODE_ENV
+        value: production
+      # ── Secrets (fill in during blueprint setup — Render asks you) ──
+      - key: DATABASE_URL          # Neon connection string
+        sync: false
+      - key: AUTH_SECRET           # same 96-hex-char value on EVERY service
+        sync: false
+      - key: INTERNAL_TOKEN        # same value on main + both game hosts
+        sync: false
+      - key: B2_KEY_ID             # Backblaze application key ID
+        sync: false
+      - key: B2_APPLICATION_KEY    # Backblaze application key
+        sync: false
+      # ── B2 buckets (four storage categories) ──
+      - key: B2_ENDPOINT
+        value: s3.eu-central-003.backblazeb2.com
+      - key: B2_ASSETS_BUCKET
+        value: weildbuild
+      - key: B2_GAMEFILES_BUCKET
+        value: weildbuild-gamefiles
+      - key: B2_REPORTS_BUCKET
+        value: weildbuild-reports
+      - key: B2_BACKUPS_BUCKET
+        value: weildbuild-backups
+      # ── Client origins allowed to call the API ──
+      - key: ALLOWED_ORIGINS
+        value: "tauri://localhost,http://tauri.localhost,http://localhost:3000,https://weildbuild.vercel.app"
+      # ── Client version gate (bump when you release a new desktop build) ──
+      - key: CLIENT_LATEST_VERSION
+        value: "13.1.0"
+      - key: CLIENT_MIN_VERSION
+        value: "13.0.0"
+      - key: CLIENT_DOWNLOAD_URL
+        value: https://weildbuild.vercel.app
+
+  # ─────────────── 2. REALTIME (presence, friends, DM push) ───────────────
+  - type: web
+    name: weildbuild-realtime
+    runtime: node
+    plan: free
+    region: frankfurt
+    buildCommand: npm install && npm run build
+    startCommand: npm run start:realtime
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: DATABASE_URL
+        sync: false
+      - key: AUTH_SECRET           # MUST match the Main Server's value
+        sync: false
+      - key: ALLOWED_ORIGINS
+        value: "tauri://localhost,http://tauri.localhost,http://localhost:3000,https://weildbuild.vercel.app"
+
+  # ─────────────── 3. GAME HOST 1 ("Server 1") ───────────────
+  # Runs the mini-server instances (rooms). Server 1 fills first.
+  - type: web
+    name: weildbuild-gamehost-1
+    runtime: node
+    plan: free
+    region: frankfurt
+    buildCommand: npm install && npm run build
+    startCommand: npm run start:gamehost
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: DATABASE_URL
+        sync: false
+      - key: AUTH_SECRET           # MUST match the Main Server's value
+        sync: false
+      - key: INTERNAL_TOKEN        # MUST match the Main Server's value
+        sync: false
+      - key: ALLOWED_ORIGINS
+        value: "tauri://localhost,http://tauri.localhost,http://localhost:3000,https://weildbuild.vercel.app"
+      # ── Where the Main Server lives (adjust if your URL differs) ──
+      - key: MAIN_SERVER_URL
+        value: https://weildbuild-main.onrender.com
+      # ── This host's identity (RENDER_EXTERNAL_URL is set by Render) ──
+      - key: HOST_ID
+        value: server-1
+      - key: HOST_LABEL
+        value: "Server 1"
+      - key: HOST_PRIORITY
+        value: "1"
+      - key: MAX_INSTANCES_PER_HOST
+        value: "6"
+      - key: MAX_PLAYERS_PER_INSTANCE   # user spec: 10 per mini server
+        value: "10"
+      - key: EMPTY_GRACE_MS             # 0-player instance deleted after this
+        value: "20000"
+      - key: HEARTBEAT_INTERVAL_MS
+        value: "15000"
+
+  # ─────────────── 4. GAME HOST 2 ("Server 2" — the overflow) ───────────────
+  # Same code, different identity. Server 2 only gets instances once
+  # Server 1 is full (priority ordering in the Main Server).
+  - type: web
+    name: weildbuild-gamehost-2
+    runtime: node
+    plan: free
+    region: frankfurt
+    buildCommand: npm install && npm run build
+    startCommand: npm run start:gamehost
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: DATABASE_URL
+        sync: false
+      - key: AUTH_SECRET           # MUST match the Main Server's value
+        sync: false
+      - key: INTERNAL_TOKEN        # MUST match the Main Server's value
+        sync: false
+      - key: ALLOWED_ORIGINS
+        value: "tauri://localhost,http://tauri.localhost,http://localhost:3000,https://weildbuild.vercel.app"
+      - key: MAIN_SERVER_URL
+        value: https://weildbuild-main.onrender.com
+      - key: HOST_ID
+        value: server-2
+      - key: HOST_LABEL
+        value: "Server 2"
+      - key: HOST_PRIORITY
+        value: "2"
+      - key: MAX_INSTANCES_PER_HOST
+        value: "6"
+      - key: MAX_PLAYERS_PER_INSTANCE
+        value: "10"
+      - key: EMPTY_GRACE_MS
+        value: "20000"
+      - key: HEARTBEAT_INTERVAL_MS
+        value: "15000"

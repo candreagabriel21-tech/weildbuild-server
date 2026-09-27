@@ -1,0 +1,243 @@
+// ═══════════════════════════════════════════════════════════
+// WeildBuild — Database schema (Neon Postgres via Prisma)
+// ═══════════════════════════════════════════════════════════
+// Ported from scripts/supabase-schema.sql. Column names are kept
+// identical so existing data could be migrated later if ever needed.
+// Timestamps are now real timestamps (not epoch-ms BIGINT) since
+// this is a fresh database.
+//
+// NEW tables for the game-instance orchestration (Roblox-style):
+//   ServerHost    — registry of game host services (Server 1, Server 2)
+//   GameInstance  — a running "mini server" of one game
+//   Report        — bug reports / moderation reports metadata
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ─────────────────────────── USERS ───────────────────────────
+model User {
+  username       String   @id
+  password       String   @map("password") // scrypt hash (128 hex) or legacy SHA-256 (64 hex)
+  salt           String
+  hashVersion    Int      @default(1) @map("hash_version")
+  userKey        String?  @unique @map("user_key") // 8-char random Object Key
+
+  avatar         Json     @default("{}")
+  description    String   @default("")
+  language       String   @default("en")
+  profileVisible Boolean  @default(true) @map("profile_visible")
+
+  webuy          Int      @default(0)
+  itemsOwned     String[] @default([]) @map("items_owned")
+
+  friends          String[] @default([])
+  friendRequests   String[] @default([]) @map("friend_requests")
+  blockedUsers     String[] @default([]) @map("blocked_users")
+
+  adminRole      String   @default("none") @map("admin_role") // none | admin | top_admin
+  banned         Json     @default("{\"is_banned\":false,\"reason\":\"\"}")
+
+  notifyFriends    Boolean @default(true) @map("notify_friends")
+  notifyPurchases  Boolean @default(true) @map("notify_purchases")
+  notifyGames      Boolean @default(true) @map("notify_games")
+
+  notifications  String[] @default([])
+  visualSettings Json     @default("{\"dark_mode\":true,\"ui_scale\":1,\"animations\":true,\"reduce_motion\":false}") @map("visual_settings")
+
+  created    DateTime @default(now()) @map("created")
+  lastLogin  DateTime @default(now()) @map("last_login")
+
+  // Legacy Python-desktop compat fields (kept so old rows stay valid)
+  email          String @default("")
+  unreadMessages Int    @default(0) @map("unread_messages")
+  userId         Int    @default(0) @map("user_id")
+  messages       Json   @default("{}")
+  inventory      Json   @default("[]")
+
+  @@index([userKey])
+  @@map("users")
+}
+
+// ─────────────────────────── ITEMS ───────────────────────────
+model Item {
+  id           String   @id // e.g. "FACE-1"
+  displayName  String   @default("") @map("display_name")
+  itemType     String   @default("") @map("item_type") // face | shirt | pants
+  price        Int      @default(0)
+  description  String   @default("")
+  creator      String   @default("WeildBuild")
+  color        String   @default("#888")
+  dateCreated  DateTime @default(now()) @map("date_created")
+  data         String? // image path for faces, null for color items
+
+  @@index([itemType])
+  @@map("items")
+}
+
+// ─────────────────────────── GAMES ───────────────────────────
+// "Game files": all studio state lives in extra_data JSONB.
+// Game hosts READ this to run instances — never modify at root.
+model Game {
+  id          String   @id
+  name        String   @default("")
+  description String   @default("")
+  creator     String   @default("")
+  plays       Int      @default(0)
+  created     DateTime @default(now())
+  lastUpdate  DateTime @default(now()) @map("last_update")
+  extraData   Json     @default("{}") @map("extra_data")
+
+  @@index([creator])
+  @@index([created(sort: Desc)])
+  @@map("games")
+}
+
+// ─────────────────────── NOTIFICATIONS ───────────────────────
+model Notification {
+  id        String   @id
+  username  String
+  type      String   @default("")
+  message   String   @default("")
+  fromUser  String   @default("") @map("from_user")
+  read      Boolean  @default(false)
+  timestamp DateTime @default(now())
+
+  @@index([username])
+  @@index([timestamp(sort: Desc)])
+  @@map("notifications")
+}
+
+// ─────────────────────────── DMs ─────────────────────────────
+model Dm {
+  id              String   @id
+  from            String
+  to              String
+  conversationKey String   @map("conversation_key") // [from,to].sort().join("_")
+  content         String   @default("")
+  timestamp       DateTime @default(now())
+
+  @@index([conversationKey])
+  @@index([timestamp])
+  @@map("dms")
+}
+
+// ────────────────────── GLOBAL CHAT ──────────────────────────
+// (legacy table, kept for compatibility / future global chat)
+model Message {
+  id        String   @id
+  sender    String
+  content   String   @default("")
+  receiver  String   @default("all")
+  timestamp DateTime @default(now())
+  read      Boolean  @default(false)
+
+  @@index([sender])
+  @@index([timestamp])
+  @@map("messages")
+}
+
+// ──────────────────────── SESSIONS ───────────────────────────
+// token = signed JWT issued at login. Sessions never expire
+// (10-year JWT), max 5 devices per user (oldest evicted).
+model Session {
+  token     String   @id
+  username  String
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@index([username])
+  @@index([createdAt])
+  @@map("sessions")
+}
+
+// ──────────────────────── RATE LIMITS ────────────────────────
+model RateLimit {
+  identifier  String   @id // e.g. "login_alice"
+  attempts    Int      @default(0)
+  windowStart DateTime @default(now()) @map("window_start")
+
+  @@index([windowStart])
+  @@map("rate_limits")
+}
+
+// ───────────────────── TRANSACTION LOGS ──────────────────────
+model TransactionLog {
+  id            String   @id
+  logDate       DateTime @default(now()) @map("log_date")
+  timestamp     DateTime @default(now())
+  type          String // purchase | refund | reward | transfer | admin_adjust
+  username      String
+  itemId        String   @default("") @map("item_id")
+  amount        Int      @default(0)
+  balanceBefore Int      @default(0) @map("balance_before")
+  balanceAfter  Int      @default(0) @map("balance_after")
+  description   String   @default("")
+  performedBy   String   @default("") @map("performed_by")
+
+  @@index([logDate])
+  @@index([username])
+  @@map("transaction_logs")
+}
+
+// ──────────────── GAME HOST REGISTRY (NEW) ───────────────────
+// One row per deployed game-host service (Server 1, Server 2...).
+// Hosts register on boot and heartbeat every 15 seconds.
+model ServerHost {
+  id               String   @id // e.g. "server-1"
+  label            String   @default("") // e.g. "Server 1"
+  url              String // public socket URL of this host
+  priority         Int      @default(1) // lower = preferred (Server 1 before Server 2)
+  maxInstances     Int      @default(6) @map("max_instances")
+  currentInstances Int      @default(0) @map("current_instances")
+  currentPlayers   Int      @default(0) @map("current_players")
+  status           String   @default("offline") // online | offline
+  lastHeartbeat    DateTime @default(now()) @map("last_heartbeat")
+  createdAt        DateTime @default(now()) @map("created_at")
+
+  @@map("server_hosts")
+}
+
+// ─────────────── GAME INSTANCES (NEW) ────────────────────────
+// A "mini server": one running room of one game. Same game can
+// have many instances — different players, different state.
+// Created via Main's placement API, deleted when 0 players.
+model GameInstance {
+  id            String    @id
+  gameId        String    @map("game_id")
+  hostId        String    @map("host_id")
+  status        String    @default("starting") // starting | running | closed
+  playerCount   Int       @default(0) @map("player_count")
+  maxPlayers    Int       @default(10) @map("max_players")
+  createdAt     DateTime  @default(now()) @map("created_at")
+  lastHeartbeat DateTime  @default(now()) @map("last_heartbeat")
+  closedAt      DateTime? @map("closed_at")
+
+  @@index([gameId])
+  @@index([status])
+  @@index([hostId])
+  @@map("game_instances")
+}
+
+// ─────────────────── REPORTS (NEW) ───────────────────────────
+// Bug reports / moderation reports. Metadata here, attachments
+// in the B2 "reports" bucket.
+model Report {
+  id              String   @id
+  type            String // bug | player | game | moderation
+  reporter        String   @default("")
+  targetType      String   @default("") @map("target_type") // user | game | other
+  targetId        String   @default("") @map("target_id")
+  content         String   @default("")
+  attachmentKey   String?  @map("attachment_key") // B2 object key if a file was attached
+  status          String   @default("open") // open | resolved | dismissed
+  createdAt       DateTime @default(now()) @map("created_at")
+
+  @@index([status])
+  @@index([createdAt(sort: Desc)])
+  @@map("reports")
+}

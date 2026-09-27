@@ -1,0 +1,10 @@
+{
+  "item_key": "FACE-1",
+  "name": "Smile Face",
+  "type": "face",
+  "price": 0,
+  "description": "The iconic pixel smile — a WeildBuild classic",
+  "date_created": "2026-02-25",
+  "creator": "WeildBuild",
+  "data": "/items/faces/FACE-1.png"
+}
