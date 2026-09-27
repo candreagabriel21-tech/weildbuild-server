@@ -38,7 +38,7 @@ function healthHandler(_req: express.Request, res: express.Response) {
   res.json({
     status: "ok",
     service: "weildbuild-main",
-    version: "1.1.0",
+    version: "1.2.0",
     timestamp: new Date().toISOString(),
   });
 }

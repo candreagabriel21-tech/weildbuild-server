@@ -1,5 +1,15 @@
 # WeildBuild Server
 
+> **v1.2.0 — build fix for Render.** v1.1 failed to build on Render with
+> `TS7016: Could not find a declaration file for module 'express'`. Cause:
+> Render builds run with `NODE_ENV=production`, and npm **skips
+> devDependencies** in that mode — so `@types/express` (and `tsx`) never got
+> installed, while other dev deps slipped through. Fix: all build-time tools
+> (`prisma`, `typescript`, `tsx`, `@types/*`) now live in `dependencies`, so
+> the build works no matter what `NODE_ENV` is. **If you deployed v1.1: just
+> replace your repo with this version and push — no Render settings need to
+> change.**
+
 The platform backend for **WeildBuild** — a 3D game creation platform (think Roblox Studio). This repo replaces the old Next.js API routes + Supabase setup with a proper multi-service architecture deployed on free tiers.
 
 ```

@@ -67,7 +67,7 @@ Supabase's free tier deletes inactive databases — Neon doesn't. That's why we'
    ```bash
    git init
    git add .
-   git commit -m "WeildBuild platform server v1.1"
+   git commit -m "WeildBuild platform server v1.2 (Render build fix)"
    git remote add origin https://github.com/YOUR-NAME/weildbuild-server.git
    git push -u origin main
    ```
@@ -305,6 +305,7 @@ Then the real test: **log in from the desktop app** (the rewired v13.1 client) �
 
 | Symptom | Fix |
 |---|---|
+| Build fails: `TS7016 Could not find a declaration file for module 'express'` | **Fixed in v1.2.0** — Render builds with `NODE_ENV=production`, and npm skips devDependencies in that mode. v1.2 puts `prisma`, `typescript`, `tsx` and all `@types/*` in `dependencies`, so this can't happen. If you ever see it again, someone moved them back to `devDependencies` — undo that. |
 | `502` / cold start slowness on first request | Free-tier wake-up (~30–60 s). If it keeps happening, check the UptimeRobot monitor for this service is **Up** with a 5-minute interval (section 6). |
 | Login fails with CORS error in app logs | The desktop origin is missing from `ALLOWED_ORIGINS`. Windows Tauri = `http://tauri.localhost`, macOS/Linux = `tauri://localhost`. Add both. |
 | Game join says "No game servers available" | No game host has registered with main. Check the host's logs — `MAIN_SERVER_URL` correct? `INTERNAL_TOKEN` matches main's? Registration retries every 15 s. |
