@@ -4,12 +4,15 @@
 // full Prisma database and upload to Backblaze B2 (was Dropbox).
 // ═══════════════════════════════════════════════════════════
 import { Router } from "express";
+import { z } from "zod";
 import { prisma } from "../../db/client";
 import { runCleanup, trimUserNotificationArrays } from "../../db/data";
 import { config } from "../../shared/config";
-import { safeHandler } from "../../shared/http";
-import { attachUser, requireAdmin } from "../middleware";
+import { safeHandler, validateBody } from "../../shared/http";
+import { attachUser, requireAdmin, originOk } from "../middleware";
 import { uploadBackup } from "../../b2/b2";
+import { getEffectiveSettings, saveSettings, EffectiveSettings } from "../../db/settings";
+import { listInstancesDetailed, sweepStale } from "../../db/instances";
 
 export const adminRouter = Router();
 
@@ -167,4 +170,126 @@ adminRouter.post("/cleanup", safeHandler(async (req, res) => {
   } catch (e: any) {
     return res.status(500).json({ error: "Cleanup failed: " + e.message });
   }
+}));
+
+// ═══════════════════════════════════════════════════════════
+// v1.3 — WB Admin CTRL support: settings + one-click overview
+// ═══════════════════════════════════════════════════════════
+
+
+// GET /admin/settings — the effective version gate + download links
+// (DB overrides merged over env defaults, with a per-field source map)
+adminRouter.get("/settings", safeHandler(async (req, res) => {
+  const admin = await requireAdmin(req, res);
+  if (!admin) return;
+
+  const settings = await getEffectiveSettings();
+  return res.json({ settings });
+}));
+
+const settingsUpdateSchema = z.object({
+  clientLatestVersion: z.string().max(30).optional(),
+  clientMinVersion: z.string().max(30).optional(),
+  downloadWindows: z.string().max(300).optional(),
+  downloadMacos: z.string().max(300).optional(),
+  downloadLinux: z.string().max(300).optional(),
+  downloadAndroid: z.string().max(300).optional(),
+  downloadWeb: z.string().max(300).optional(),
+  maintenanceMode: z.boolean().optional(),
+});
+
+// PUT /admin/settings — update the version gate / download links.
+// Empty string on a field = "clear the override" (falls back to env).
+adminRouter.put("/settings", safeHandler(async (req, res) => {
+  if (!originOk(req, res)) return;
+  const admin = await requireAdmin(req, res);
+  if (!admin) return;
+
+  const parsed = validateBody(settingsUpdateSchema, req.body, res);
+  if ("error" in parsed) return;
+  const update = parsed.data;
+
+  // Version strings must look like semver when non-empty
+  const semverish = /^\d+\.\d+\.\d+/;
+  for (const v of [update.clientLatestVersion, update.clientMinVersion]) {
+    if (v !== undefined && v !== "" && !semverish.test(v)) {
+      return res.status(400).json({ error: `Version must look like 1.2.3 — got "${v}"` });
+    }
+  }
+  // Download links must look like URLs or paths when non-empty
+  for (const [field, v] of Object.entries(update)) {
+    if (field.startsWith("download") && typeof v === "string" && v !== "" && !/^(https?:\/\/|\/)/.test(v)) {
+      return res.status(400).json({ error: `${field} must start with http(s):// or / — got "${v}"` });
+    }
+  }
+
+  try {
+    await saveSettings(update, admin);
+    const settings: EffectiveSettings = await getEffectiveSettings();
+    return res.json({ success: true, settings });
+  } catch (e: any) {
+    return res.status(500).json({ error: "Failed to save settings: " + e.message });
+  }
+}));
+
+// GET /admin/overview — ONE call with everything WB Admin CTRL shows:
+// counts, version gate, game hosts, live instances + player names,
+// recent DMs and open reports.
+adminRouter.get("/overview", safeHandler(async (req, res) => {
+  const admin = await requireAdmin(req, res);
+  if (!admin) return;
+
+  await sweepStale();
+
+  const [userCount, gameCount, itemCount, sessionCount, openReports, hosts, instances, recentDms, recentGames, settings] =
+    await Promise.all([
+      prisma.user.count(),
+      prisma.game.count(),
+      prisma.item.count(),
+      prisma.session.count(),
+      prisma.report.count({ where: { status: "open" } }),
+      prisma.serverHost.findMany({ orderBy: { priority: "asc" } }),
+      listInstancesDetailed(),
+      prisma.dm.findMany({ orderBy: { timestamp: "desc" }, take: 50 }),
+      prisma.game.findMany({ select: { id: true, name: true, creator: true, plays: true }, take: 200 }),
+      getEffectiveSettings(),
+    ]);
+
+  const gameNameById = new Map(recentGames.map((g) => [g.id, g]));
+  const totalPlayers = instances.reduce((sum: number, i: any) => sum + i.players, 0);
+
+  return res.json({
+    fetchedBy: admin,
+    server: {
+      version: "1.3.0",
+      uptimeSeconds: Math.floor(process.uptime()),
+      timestamp: new Date().toISOString(),
+    },
+    counts: { users: userCount, games: gameCount, items: itemCount, sessions: sessionCount, openReports },
+    players: { online: totalPlayers, inInstances: instances.length },
+    versionGate: settings,
+    hosts: hosts.map((h) => ({
+      id: h.id,
+      label: h.label || h.id,
+      url: h.url,
+      priority: h.priority,
+      maxInstances: h.maxInstances,
+      currentInstances: h.currentInstances,
+      currentPlayers: h.currentPlayers,
+      uptimeSeconds: h.uptimeSeconds,
+      status: h.status,
+      lastHeartbeat: h.lastHeartbeat.toISOString(),
+    })),
+    instances: instances.map((i: any) => ({
+      ...i,
+      gameName: gameNameById.get(i.gameId)?.name || i.gameId,
+    })),
+    recentDms: recentDms.map((d) => ({
+      id: d.id,
+      from: d.from,
+      to: d.to,
+      content: d.content,
+      timestamp: d.timestamp.toISOString(),
+    })),
+  });
 }));

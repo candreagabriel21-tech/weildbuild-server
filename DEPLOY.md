@@ -244,18 +244,31 @@ Same idea: **https://cron-job.org** → free account → **Create Cronjob** → 
 
 ---
 
-## 7. First-run database setup (3 min)
+## 7. First-run database setup — AUTOMATIC (0 min)
 
-The schema needs to be pushed to Neon **once**. Easiest: from the Render dashboard of **`weildbuild-main`**:
+**You don't have to do anything.** As of **v1.3.1**, the Main Server sets up the database **by itself**, in the background, a few seconds after every start:
 
-1. Open the service → **Shell** tab → run:
-   ```bash
-   npx prisma db push
-   npx tsx prisma/seed.ts   # loads the 34 shop items + admin account
-   ```
-   *(If the Shell tab isn't available on your plan, run the same two commands on your own machine with `DATABASE_URL` set to the Neon string.)*
+1. It runs `prisma db push` — this creates/updates all tables. It's safe to re-run: if the database is already up to date it does nothing and finishes in about a second.
+2. If the database is **completely empty** (a brand-new Neon project), it also runs the seed — the default admin account (**WeildBuild**) + the 34 shop items. If even one user account already exists, the seed is skipped, so it can never reset a password you changed.
 
-2. Verify — visit `https://weildbuild-main.onrender.com/api/items?type=face` in a browser. You should see 21 face JSONs.
+This replaced the old instructions that used the **Render Shell** — which Render has since made a **paid feature** ("Shell is not supported for free compute plans"). No Shell needed anymore.
+
+You can watch it happen: Render dashboard → `weildbuild-main` → **Logs** → right after startup you'll see lines starting with `[db-setup]`, ending with `Database ready`.
+
+<details>
+<summary>Manual alternative (only if you like doing things by hand)</summary>
+
+On your own computer, with `DATABASE_URL` set to the Neon connection string in a `.env` file inside this folder:
+
+```bash
+npm install
+npm run setup   # = prisma db push + seed (same thing the server does automatically)
+```
+
+This is also the fix if you ever want to *force* a re-seed: the automatic seed only runs on a completely empty database.
+</details>
+
+**Verify it worked** — a minute or two after the first deploy, visit `https://<your-main-server>.onrender.com/api/items?type=face` in a browser. You should see 20 face JSONs.
 
 ---
 
@@ -295,7 +308,8 @@ Then the real test: **log in from the desktop app** (the rewired v13.1 client) �
 | **Release a new client version** | Set `CLIENT_LATEST_VERSION` (+ `CLIENT_MIN_VERSION` if it's a forced update) on the Main Service env vars. Old clients see the update screen on next launch. |
 | **Deploy server code changes** | `git push` to `main` — every service auto-deploys (autoDeploy: true). |
 | **Take a backup** | Settings → Back Up Now in the app (admin), or `POST /api/admin/backup` — lands in the `weildbuild-backups` B2 bucket. |
-| **See who's playing** | `GET /api/instances` — live list of running mini servers + player counts. |
+| **See who's playing** | `GET /api/instances` — live list of running mini servers + player counts. Or open **WB Admin CTRL** (player *names* per instance). |
+| **Change client version / download links** | Open **WB Admin CTRL** → *Version gate* card → edit → Save. Applies instantly (clients check `/version` on boot). Values set here override the `CLIENT_*` env vars. |
 | **Check uptime** | UptimeRobot dashboard — every monitor should be **Up**; you get an email alert the moment one goes down. |
 | **Add Game Host 3** | Another friend account, same as Account 3 but `HOST_ID=server-3`, `HOST_PRIORITY=3` — plus one more UptimeRobot monitor for its `/health` URL (section 6). |
 

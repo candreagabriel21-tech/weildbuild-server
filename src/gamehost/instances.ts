@@ -41,6 +41,7 @@ export interface HeartbeatInstanceEntry {
   gameId: string;
   players: number;
   status: "running" | "closed";
+  playerNames?: string[]; // v1.3: usernames in the room (admin "who's playing")
 }
 
 /** Aggregated stats for the /health endpoint. */
@@ -158,6 +159,7 @@ export class GameInstanceManager {
       gameId: i.gameId,
       players: i.players.size,
       status: "running",
+      playerNames: Array.from(i.players.values()).map((p) => p.username), // v1.3: admin "who's playing"
     }));
     const closed: HeartbeatInstanceEntry[] = this.closedList.map((c) => ({
       id: c.id,

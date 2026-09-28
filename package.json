@@ -1,9 +1,9 @@
 {
   "name": "weildbuild-server",
-  "version": "1.2.0",
+  "version": "1.3.1",
   "private": true,
-  "description": "WeildBuild platform servers: Main Server (REST API + orchestration), Realtime (presence/chat), Game Host (game instances). Deploys to Render, database on Neon.",
-  "//": "BUILD FIX v1.2.0: prisma, typescript, tsx and @types/* live in dependencies ON PURPOSE. Render builds run with NODE_ENV=production, and npm silently skips devDependencies in that mode — that is what broke the v1.1 deploy (TS7016: no declaration file for 'express'). Do NOT move them back to devDependencies.",
+  "description": "WeildBuild platform servers: Main Server (REST API + orchestration), Realtime (presence/chat), Game Host (game instances). Deploys to Render, database on Neon. v1.3 adds admin settings + overview API for WB Admin CTRL; v1.3.1 makes database setup fully automatic on boot (Render Shell is no longer needed - it became a paid feature).",
+  "//": "BUILD FIX v1.2.0: prisma, typescript, tsx and @types/* live in dependencies ON PURPOSE. Render builds run with NODE_ENV=production, and npm silently skips devDependencies in that mode \u2014 that is what broke the v1.1 deploy (TS7016: no declaration file for 'express'). Do NOT move them back to devDependencies.",
   "engines": {
     "node": ">=18.0.0"
   },

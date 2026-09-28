@@ -1,14 +1,27 @@
 # WeildBuild Server
 
-> **v1.2.0 — build fix for Render.** v1.1 failed to build on Render with
-> `TS7016: Could not find a declaration file for module 'express'`. Cause:
+> **v1.3.1 — no more Render Shell needed (it went paid-only).** Render
+> removed Shell access from free plans, so the old "run `npm run migrate`
+> in the Shell" step is gone. The Main Server now sets up the database
+> **by itself, automatically, every time it boots**: it syncs the schema
+> (`prisma db push` — a no-op when already in sync) and, if the database
+> is completely empty (brand-new Neon project), also runs the seed
+> (default admin account + 34 shop items). Deploy and you're done.
+>
+> **v1.3.0 — admin settings + WB Admin CTRL.** The version gate (client
+> min/latest + **per-platform download links**) is now stored in the database
+> and editable at runtime via the new admin API (`GET/PUT /api/admin/settings`)
+> — no redeploys needed to change them. New `GET /api/admin/overview`
+> returns the whole platform state in one call (counts, hosts, live
+> instances **with player usernames**, uptime, recent DMs). Game hosts now
+> report player names + uptime in heartbeats.
+>
+> **v1.2.0 — build fix for Render.** v1.1 failed to build with `TS7016`:
 > Render builds run with `NODE_ENV=production`, and npm **skips
 > devDependencies** in that mode — so `@types/express` (and `tsx`) never got
-> installed, while other dev deps slipped through. Fix: all build-time tools
-> (`prisma`, `typescript`, `tsx`, `@types/*`) now live in `dependencies`, so
-> the build works no matter what `NODE_ENV` is. **If you deployed v1.1: just
-> replace your repo with this version and push — no Render settings need to
-> change.**
+> installed. Fix: all build-time tools (`prisma`, `typescript`, `tsx`,
+> `@types/*`) now live in `dependencies`, so the build works no matter what
+> `NODE_ENV` is.
 
 The platform backend for **WeildBuild** — a 3D game creation platform (think Roblox Studio). This repo replaces the old Next.js API routes + Supabase setup with a proper multi-service architecture deployed on free tiers.
 
