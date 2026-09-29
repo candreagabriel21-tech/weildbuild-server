@@ -46,15 +46,29 @@ export function corsOrigin(origin: string | undefined, callback: (err: Error | n
   // No Origin header = non-browser client (Tauri webview on some platforms, curl,
   // server-to-server) → allow. Browsers always send Origin on cross-origin calls.
   if (!origin) return callback(null, true);
-  const clean = origin.replace(/\/$/, "");
-  if (config.allowedOrigins.some((o) => o.replace(/\/$/, "") === clean)) {
-    return callback(null, true);
-  }
-  // Allow any Render URL (server-to-server between our own services)
-  if (/^https:\/\/[a-z0-9-]+\.onrender\.com$/i.test(clean)) {
-    return callback(null, true);
-  }
+  if (isAllowedOrigin(origin)) return callback(null, true);
   return callback(null, false);
+}
+
+/**
+ * v1.3.2: one shared origin checker. Local development origins are
+ * ALWAYS allowed, no matter what ALLOWED_ORIGINS says:
+ *   • http(s)://localhost:<any port> and http(s)://127.0.0.1:<any port>
+ *     (the web client on :3000, WB Admin CTRL in browser mode on :5173,
+ *      any future local tool on any port — no more "add my port to the
+ *      env var" dance)
+ *   • tauri://localhost + http://tauri.localhost (desktop apps)
+ * Localhost is the machine itself, so this is safe to allow broadly.
+ * Production origins still come from ALLOWED_ORIGINS.
+ */
+export function isAllowedOrigin(origin: string): boolean {
+  const clean = origin.replace(/\/$/, "");
+  if (config.allowedOrigins.some((o) => o.replace(/\/$/, "") === clean)) return true;
+  if (/^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/i.test(clean)) return true;
+  if (/^(tauri|https?):\/\/(tauri\.)?localhost(:\d+)?$/i.test(clean)) return true;
+  // Allow any Render URL (server-to-server between our own services)
+  if (/^https:\/\/[a-z0-9-]+\.onrender\.com$/i.test(clean)) return true;
+  return false;
 }
 
 /** CSRF-style origin validation for mutating requests (ported from security.ts). */
@@ -63,16 +77,10 @@ export function validateOrigin(req: Request, res: Response): boolean {
   const origin = req.headers.origin;
   const referer = req.headers.referer;
   if (!origin && !referer) return true; // desktop app / API clients
-  const header = origin || referer || "";
-  const clean = header.replace(/\/$/, "");
-  const ok =
-    config.allowedOrigins.some((o) => o.replace(/\/$/, "") === clean) ||
-    /^https:\/\/[a-z0-9-]+\.onrender\.com$/i.test(clean);
-  if (!ok) {
-    res.status(403).json({ error: "Invalid origin. Request blocked for security." });
-    return false;
-  }
-  return true;
+  const header = (origin || referer || "").replace(/\/$/, "");
+  if (isAllowedOrigin(header)) return true;
+  res.status(403).json({ error: "Invalid origin. Request blocked for security." });
+  return false;
 }
 
 /** Extract the client IP (Render proxy sends x-forwarded-for). */

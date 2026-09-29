@@ -1,5 +1,12 @@
 # WeildBuild Server
 
+> **v1.3.2 — local dev always welcome (CORS).** Any `localhost` /
+> `127.0.0.1` origin (any port) and the Tauri desktop origins are now
+> ALWAYS allowed, no matter what `ALLOWED_ORIGINS` says. This fixes
+> WB Admin CTRL run in browser mode (`npm run dev`, port 5173) getting
+> "Failed to fetch" against the live server. Production origins still
+> come from `ALLOWED_ORIGINS`.
+>
 > **v1.3.1 — no more Render Shell needed (it went paid-only).** Render
 > removed Shell access from free plans, so the old "run `npm run migrate`
 > in the Shell" step is gone. The Main Server now sets up the database

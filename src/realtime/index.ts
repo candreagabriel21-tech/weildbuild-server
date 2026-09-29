@@ -29,6 +29,7 @@
 import { createServer, IncomingMessage, ServerResponse } from "http";
 import { Server, Socket } from "socket.io";
 import { config, assertSecrets } from "../shared/config";
+import { isAllowedOrigin } from "../shared/http";
 import { verifyTicket } from "../shared/jwt";
 
 // dotenv is loaded by the shared config import (config.ts calls
@@ -140,14 +141,7 @@ function originAllowed(
   callback: (err: Error | null, allow?: boolean) => void
 ): void {
   if (!origin) return callback(null, true);
-  const clean = origin.replace(/\/$/, "");
-  if (config.allowedOrigins.some((o) => o.replace(/\/$/, "") === clean)) {
-    return callback(null, true);
-  }
-  // Allow any https://*.onrender.com (Render previews + our own services)
-  if (/^https:\/\/[a-z0-9-]+\.onrender\.com$/i.test(clean)) {
-    return callback(null, true);
-  }
+  if (isAllowedOrigin(origin)) return callback(null, true); // v1.3.2: shared checker (localhost any port + tauri + configured + onrender)
   return callback(null, false);
 }
 

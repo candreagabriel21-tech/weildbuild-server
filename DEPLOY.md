@@ -155,7 +155,7 @@ Environment variables:
 | `B2_GAMEFILES_BUCKET` | `weildbuild-gamefiles` |
 | `B2_REPORTS_BUCKET` | `weildbuild-reports` |
 | `B2_BACKUPS_BUCKET` | `weildbuild-backups` |
-| `ALLOWED_ORIGINS` | `tauri://localhost,http://tauri.localhost,http://localhost:3000,https://weildbuild.vercel.app` |
+| `ALLOWED_ORIGINS` | `tauri://localhost,http://tauri.localhost,http://localhost:3000,https://weildbuild.vercel.app` — v1.3.2+: every `localhost`/`127.0.0.1` port is ALSO always allowed, so local tools (e.g. Admin CTRL on :5173) work no matter what |
 | `CLIENT_LATEST_VERSION` | `13.1.0` |
 | `CLIENT_MIN_VERSION` | `13.0.0` |
 | `CLIENT_DOWNLOAD_URL` | `https://weildbuild.vercel.app` |
@@ -173,7 +173,7 @@ Environment variables:
 | `NODE_ENV` | `production` |
 | `DATABASE_URL` | *(same Neon string)* |
 | `AUTH_SECRET` | *(same as main — critical!)* |
-| `ALLOWED_ORIGINS` | `tauri://localhost,http://tauri.localhost,http://localhost:3000,https://weildbuild.vercel.app` |
+| `ALLOWED_ORIGINS` | `tauri://localhost,http://tauri.localhost,http://localhost:3000,https://weildbuild.vercel.app` — v1.3.2+: every `localhost`/`127.0.0.1` port is ALSO always allowed, so local tools (e.g. Admin CTRL on :5173) work no matter what |
 
 ### Account 3 — `weildbuild-gamehost-1` ("Server 1")
 
@@ -189,7 +189,7 @@ Environment variables:
 | `DATABASE_URL` | *(same Neon string)* |
 | `AUTH_SECRET` | *(same as main)* |
 | `INTERNAL_TOKEN` | *(same as main)* |
-| `ALLOWED_ORIGINS` | `tauri://localhost,http://tauri.localhost,http://localhost:3000,https://weildbuild.vercel.app` |
+| `ALLOWED_ORIGINS` | `tauri://localhost,http://tauri.localhost,http://localhost:3000,https://weildbuild.vercel.app` — v1.3.2+: every `localhost`/`127.0.0.1` port is ALSO always allowed, so local tools (e.g. Admin CTRL on :5173) work no matter what |
 | `MAIN_SERVER_URL` | `https://weildbuild-main.onrender.com` *(your actual main URL)* |
 | `HOST_ID` | `server-1` |
 | `HOST_LABEL` | `Server 1` |
