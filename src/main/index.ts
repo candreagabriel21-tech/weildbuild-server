@@ -21,8 +21,6 @@ import { adminRouter } from "./routes/admin";
 import { storageRouter } from "./routes/storage";
 import { reportsRouter } from "./routes/reports";
 import { instancesRouter, internalRouter } from "./routes/instances";
-import { getEffectiveSettings } from "../db/settings";
-import { ensureDatabase } from "../db/ensure";
 
 assertSecrets("main");
 
@@ -34,45 +32,26 @@ app.use(cors({ origin: corsOrigin, credentials: true }));
 app.use(express.json({ limit: "2mb" })); // avatar payloads can be chunky
 
 // ── Health check (Render + uptime monitors) ──
-const startedAt = Date.now();
 app.get("/", healthHandler);
 app.get("/health", healthHandler);
 function healthHandler(_req: express.Request, res: express.Response) {
   res.json({
     status: "ok",
     service: "weildbuild-main",
-    version: "1.3.2",
-    uptimeSeconds: Math.floor((Date.now() - startedAt) / 1000),
+    version: "1.2.0",
     timestamp: new Date().toISOString(),
   });
 }
 
 // ── Version gate (roadmap 2.5 — client checks on boot) ──
-// v1.3: admin-editable — DB settings (set via WB Admin CTRL) override
-// the env vars. Response shape stays compatible with client v13.1:
-// `latest` / `minimum` / `downloadUrl` unchanged, `downloads` is new.
-app.get("/version", async (_req, res) => {
-  try {
-    const settings = await getEffectiveSettings();
-    res.json({
-      latest: settings.latestVersion,
-      minimum: settings.minVersion,
-      downloadUrl: settings.downloads.web,
-      downloads: settings.downloads,
-      maintenance: settings.maintenanceMode,
-      service: "weildbuild-main",
-      timestamp: new Date().toISOString(),
-    });
-  } catch {
-    // DB unreachable → env fallback so clients still get an answer
-    res.json({
-      latest: config.client.latestVersion,
-      minimum: config.client.minVersion,
-      downloadUrl: config.client.downloadUrl,
-      service: "weildbuild-main",
-      timestamp: new Date().toISOString(),
-    });
-  }
+app.get("/version", (_req, res) => {
+  res.json({
+    latest: config.client.latestVersion,
+    minimum: config.client.minVersion,
+    downloadUrl: config.client.downloadUrl,
+    service: "weildbuild-main",
+    timestamp: new Date().toISOString(),
+  });
 });
 
 // ── Routers (mounted under /api/* — the exact same paths the
@@ -101,14 +80,4 @@ app.listen(port, () => {
   console.log("║  WeildBuild MAIN SERVER listening on port " + String(port).padEnd(8) + "║");
   console.log("║  Origins: " + JSON.stringify(config.allowedOrigins).slice(0, 38).padEnd(39) + "║");
   console.log("╚══════════════════════════════════════════════════════╝");
-
-  // v1.3.1: set up the database BY OURSELVES in the background
-  // (schema sync + first-run seed). Render made the Shell tab a
-  // paid feature, so this replaces the old "run npm run migrate
-  // in the Shell" step. Runs AFTER the port is bound so health
-  // checks pass instantly; every step fails soft (see ensure.ts).
-  // Only the main server does this — never realtime/gamehost.
-  ensureDatabase().catch((e) =>
-    console.error("[db-setup] unexpected error (non-fatal):", e)
-  );
 });

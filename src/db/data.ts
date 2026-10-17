@@ -106,7 +106,12 @@ export function flattenGame(row: any): any {
     created: row.created instanceof Date ? row.created.toISOString() : row.created,
     last_update: row.lastUpdate instanceof Date ? row.lastUpdate.toISOString() : row.lastUpdate,
   };
-  return { ...base, ...(row.extraData || {}) };
+  // v1.2.0 BUG FIX: the extraData JSON used to be spread AFTER the top-level
+  // fields, and (pre-fix) createGameRecord let `name`/`description` leak into
+  // extraData via `...rest`. The stale copies then SHADOWED the real columns,
+  // so renaming a game (PUT) never showed up in API responses. Top-level
+  // columns now always win; extraData only fills the extended fields.
+  return { ...(row.extraData || {}), ...base };
 }
 
 export async function getGame(gameId: string) {
@@ -132,9 +137,15 @@ const GAME_TOP_LEVEL_FIELDS = ["name", "description", "creator", "plays"];
 
 export async function createGameRecord(gameData: any) {
   const id = gameData.id || randomBytes(4).toString("hex");
-  const { studioState, primitives, spawn_point, sky_color_top, sky_color_bottom,
+  // v1.2.0: name/description/creator/plays/id are destructured OUT so they
+  // can never leak into extraData via `...rest` (the shadowing bug).
+  const {
+    studioState, primitives, spawn_point, sky_color_top, sky_color_bottom,
     baseplate_color, baseplate_size, max_players, public: isPublic,
-    multiplayer, ...rest } = gameData;
+    multiplayer,
+    name: _name, description: _description, creator: _creator, plays: _plays, id: _id,
+    ...rest
+  } = gameData;
 
   const row = {
     id,
@@ -154,7 +165,7 @@ export async function createGameRecord(gameData: any) {
     return flattenGame(created);
   } catch (e: any) {
     console.error("[db] createGameRecord error:", e.message);
-    return { ...row, ...row.extraData };
+    return { ...(row.extraData || {}), ...row };
   }
 }
 
@@ -171,6 +182,14 @@ export async function updateGameRecord(gameId: string, updates: any) {
 
   const existingRow = await prisma.game.findUnique({ where: { id: gameId }, select: { extraData: true } });
   const newExtraData = { ...((existingRow?.extraData as any) || {}), ...extraDataUpdates };
+  // v1.2.0 cleanup: legacy rows may carry stale name/description/creator/plays
+  // inside extraData (from the pre-fix createGameRecord). Strip them so the
+  // real columns are the single source of truth from now on.
+  delete newExtraData.name;
+  delete newExtraData.description;
+  delete newExtraData.creator;
+  delete newExtraData.plays;
+  delete newExtraData.id;
 
   try {
     const updated = await prisma.game.update({
@@ -188,6 +207,22 @@ export async function incrementGamePlays(gameId: string) {
   try {
     await prisma.game.update({ where: { id: gameId }, data: { plays: { increment: 1 } } });
   } catch {}
+}
+
+/** v1.2.0 (client v13.9): permanently delete a game row. Any registered
+ *  game instances for it are removed too (best effort - the gamehost reaps
+ *  them on heartbeat anyway; a failure there must not block the delete). */
+export async function deleteGameRecord(gameId: string) {
+  try {
+    try {
+      await prisma.gameInstance.deleteMany({ where: { gameId } });
+    } catch {}
+    await prisma.game.delete({ where: { id: gameId } });
+    return true;
+  } catch (e: any) {
+    console.error("[db] deleteGameRecord error:", e.message);
+    return false;
+  }
 }
 
 // ─────────────────────── NOTIFICATIONS ───────────────────────
