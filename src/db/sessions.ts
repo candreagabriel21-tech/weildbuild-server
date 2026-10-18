@@ -22,9 +22,18 @@ export async function createSession(username: string): Promise<string> {
     await prisma.session.deleteMany({ where: { token: { in: toEvict.map((s) => s.token) } } });
   }
 
-  const token = await signSessionToken(username);
-  await prisma.session.create({ data: { token, username } });
-  return token;
+  // v1.3.2: unique jti makes tokens unique, but keep a one-shot retry
+  // as a safety net against any future token-collision edge case.
+  for (let attempt = 0; ; attempt++) {
+    const token = await signSessionToken(username);
+    try {
+      await prisma.session.create({ data: { token, username } });
+      return token;
+    } catch (e: any) {
+      if (attempt === 0 && e?.code === "P2002") continue; // duplicate token → mint a fresh one
+      throw e;
+    }
+  }
 }
 
 /**

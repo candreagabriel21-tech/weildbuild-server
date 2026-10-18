@@ -7,7 +7,7 @@
 import { Router, Request } from "express";
 import { z } from "zod";
 import {
-  getAllGames, getGame, createGameRecord, updateGameRecord, deleteGameRecord,
+  getAllGames, getGame, createGameRecord, updateGameRecord,
 } from "../../db/data";
 import { getUser, sanitizeString } from "../../db/users";
 import { requireRateLimit } from "../../db/ratelimits";
@@ -126,41 +126,4 @@ gamesRouter.put("/", safeHandler(async (req, res) => {
   const game = await updateGameRecord(id, updates);
   if (!game) return res.status(404).json({ error: "Game not found" });
   return res.json(game);
-}));
-
-// DELETE /games?id= — permanently remove a game. REQUIRES authentication
-// + ownership or admin (same rules as PUT). v1.2.0 (client v13.9): the
-// Inventory tab's Delete button. The game row AND any registered game
-// instances are removed.
-gamesRouter.delete("/", safeHandler(async (req, res) => {
-  // Validate origin
-  if (!originOk(req, res)) return;
-
-  // Rate limit
-  const rl = await requireRateLimit("general_api", clientIp(req));
-  if (rl) return res.status(429).json({ error: rl.error, retryAfter: rl.retryAfter });
-
-  // REQUIRE authentication
-  const sessionUser = await requireAuth(req, res);
-  if (!sessionUser) return;
-
-  // Accept the id from the query string (primary) or JSON body (fallback)
-  const id = qp(req, "id") || (typeof (req.body as any)?.id === "string" ? (req.body as any).id : null);
-  if (!id) return res.status(400).json({ error: "Game ID required" });
-
-  // Verify the game exists + the user may delete it (creator or admin)
-  const existingGame = await getGame(id);
-  if (!existingGame) return res.status(404).json({ error: "Game not found" });
-
-  if (existingGame.creator !== sessionUser) {
-    const user = await getUser(sessionUser);
-    if (!user || (user.admin_role !== "admin" && user.admin_role !== "top_admin")) {
-      return res.status(403).json({ error: "You can only delete your own games." });
-    }
-  }
-
-  const ok = await deleteGameRecord(id);
-  if (!ok) return res.status(500).json({ error: "Failed to delete game" });
-  console.log(`[games] "${existingGame.name}" (${id}) deleted by ${sessionUser}`);
-  return res.json({ success: true, id });
 }));

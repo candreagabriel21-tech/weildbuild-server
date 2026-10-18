@@ -195,6 +195,7 @@ model ServerHost {
   maxInstances     Int      @default(6) @map("max_instances")
   currentInstances Int      @default(0) @map("current_instances")
   currentPlayers   Int      @default(0) @map("current_players")
+  uptimeSeconds    Int      @default(0) @map("uptime_seconds") // reported in heartbeats
   status           String   @default("offline") // online | offline
   lastHeartbeat    DateTime @default(now()) @map("last_heartbeat")
   createdAt        DateTime @default(now()) @map("created_at")
@@ -212,6 +213,7 @@ model GameInstance {
   hostId        String    @map("host_id")
   status        String    @default("starting") // starting | running | closed
   playerCount   Int       @default(0) @map("player_count")
+  playerNames   String[]  @default([]) @map("player_names") // usernames currently in the room (from heartbeats)
   maxPlayers    Int       @default(10) @map("max_players")
   createdAt     DateTime  @default(now()) @map("created_at")
   lastHeartbeat DateTime  @default(now()) @map("last_heartbeat")
@@ -240,4 +242,26 @@ model Report {
   @@index([status])
   @@index([createdAt(sort: Desc)])
   @@map("reports")
+}
+
+// ────────────── SERVER SETTINGS (NEW in v1.3) ────────────────
+// Admin-editable platform settings (WB Admin CTRL app edits these).
+// Single row, id = "global". Empty string = "not set" → the value
+// falls back to the environment variable / built-in default.
+// This lets you change the version gate + download links WITHOUT
+// redeploying (env vars stay the fallback).
+model ServerSetting {
+  id                  String   @id // always "global"
+  clientLatestVersion String   @default("") @map("client_latest_version")
+  clientMinVersion    String   @default("") @map("client_min_version")
+  downloadWindows     String   @default("") @map("download_windows")
+  downloadMacos       String   @default("") @map("download_macos")
+  downloadLinux       String   @default("") @map("download_linux")
+  downloadAndroid     String   @default("") @map("download_android")
+  downloadWeb         String   @default("") @map("download_web")
+  maintenanceMode     Boolean  @default(false) @map("maintenance_mode")
+  updatedAt           DateTime @default(now()) @map("updated_at")
+  updatedBy           String   @default("") @map("updated_by")
+
+  @@map("server_settings")
 }

@@ -117,11 +117,13 @@ internalRouter.post("/hosts/register", safeHandler(async (req, res) => {
 
 const heartbeatSchema = z.object({
   hostId: z.string().min(1).max(50),
+  uptimeSeconds: z.number().int().min(0).max(400000000).optional(), // v1.3: host process uptime
   instances: z.array(z.object({
     id: z.string().min(1),
     gameId: z.string().min(1),
     players: z.number().int().min(0),
     status: z.string().min(1),
+    playerNames: z.array(z.string().min(1).max(30)).max(50).optional(), // v1.3
   })),
 });
 
@@ -130,9 +132,9 @@ internalRouter.post("/hosts/heartbeat", safeHandler(async (req, res) => {
   if (!isInternalRequest(req)) return res.status(401).json({ error: "Unauthorized" });
   const parsed = validateBody(heartbeatSchema, req.body, res);
   if ("error" in parsed) return;
-  const { hostId, instances } = parsed.data;
+  const { hostId, instances, uptimeSeconds } = parsed.data;
   try {
-    const stats = await hostHeartbeat(hostId, instances);
+    const stats = await hostHeartbeat(hostId, instances, uptimeSeconds);
     return res.json({ success: true, ...stats });
   } catch (e: any) {
     console.error("[instances] hostHeartbeat error:", e.message);

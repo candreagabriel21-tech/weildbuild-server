@@ -8,9 +8,14 @@ export const MAX_SESSIONS_PER_USER = 5;
 /** JWT lifetime: 10 years (sessions "never expire", matching the old system). */
 export const SESSION_LIFETIME_SECONDS = 60 * 60 * 24 * 365 * 10;
 
-/** Rate limit presets, ported from the original security.ts. */
+/** Rate limit presets, ported from the original security.ts.
+ *  v1.3.1: register raised 5 -> 10 per hour. 5 was too tight while
+ *  testing (EVERY register press counts, including attempts that
+ *  fail validation, e.g. username already taken) — the developer
+ *  got locked out during their own testing. 10/h is still plenty
+ *  of anti-spam protection for account creation. */
 export const RATE_LIMITS: Record<string, { maxAttempts: number; windowMs: number }> = {
-  register: { maxAttempts: 5, windowMs: 60 * 60 * 1000 }, // 5 registrations per hour per IP
+  register: { maxAttempts: 10, windowMs: 60 * 60 * 1000 }, // 10 registrations per hour per IP
   login: { maxAttempts: 10, windowMs: 15 * 60 * 1000 }, // 10 login attempts per 15 min
   buy_item: { maxAttempts: 100, windowMs: 60 * 1000 },
   send_message: { maxAttempts: 60, windowMs: 60 * 1000 },

@@ -20,6 +20,7 @@ export interface HeartbeatInstance {
   gameId: string;
   players: number;
   status: string; // running | closed
+  playerNames?: string[]; // usernames currently in the room (v1.3 — for admin "who's playing")
 }
 
 export async function registerHost(input: {
@@ -32,7 +33,7 @@ export async function registerHost(input: {
   });
 }
 
-export async function hostHeartbeat(hostId: string, instances: HeartbeatInstance[]) {
+export async function hostHeartbeat(hostId: string, instances: HeartbeatInstance[], uptimeSeconds?: number) {
   const now = new Date();
   const running = instances.filter((i) => i.status === "running");
   const totalPlayers = running.reduce((sum, i) => sum + i.players, 0);
@@ -44,20 +45,22 @@ export async function hostHeartbeat(hostId: string, instances: HeartbeatInstance
       lastHeartbeat: now,
       currentInstances: running.length,
       currentPlayers: totalPlayers,
+      ...(typeof uptimeSeconds === "number" ? { uptimeSeconds: Math.max(0, Math.floor(uptimeSeconds)) } : {}),
     },
   });
 
   // Sync instance rows with what the host reports (source of truth = host memory)
   for (const inst of instances) {
     if (inst.status === "running") {
+      const playerNames = (inst.playerNames || []).slice(0, 50);
       await prisma.gameInstance.upsert({
         where: { id: inst.id },
         create: {
           id: inst.id, gameId: inst.gameId, hostId,
-          status: "running", playerCount: inst.players,
+          status: "running", playerCount: inst.players, playerNames,
           maxPlayers: DEFAULT_MAX_PLAYERS_PER_INSTANCE, lastHeartbeat: now,
         },
-        update: { status: "running", playerCount: inst.players, lastHeartbeat: now, closedAt: null },
+        update: { status: "running", playerCount: inst.players, playerNames, lastHeartbeat: now, closedAt: null },
       });
     } else {
       // Closed on the host → mark closed here too (keep the row briefly for stats)
@@ -190,6 +193,27 @@ export async function listInstances(gameId?: string) {
     gameId: r.gameId,
     host: hostLabelById.get(r.hostId) || r.hostId,
     players: r.playerCount,
+    maxPlayers: r.maxPlayers,
+    created: r.createdAt.toISOString(),
+  }));
+}
+
+/** Detailed instance list for the admin overview — includes player NAMES. */
+export async function listInstancesDetailed() {
+  const hosts = await prisma.serverHost.findMany();
+  const hostById = new Map(hosts.map((h) => [h.id, h]));
+  const rows = await prisma.gameInstance.findMany({
+    where: { status: "running" },
+    orderBy: { playerCount: "desc" },
+    take: 100,
+  });
+  return rows.map((r) => ({
+    id: r.id,
+    gameId: r.gameId,
+    host: hostById.get(r.hostId)?.label || r.hostId,
+    hostId: r.hostId,
+    players: r.playerCount,
+    playerNames: r.playerNames,
     maxPlayers: r.maxPlayers,
     created: r.createdAt.toISOString(),
   }));

@@ -29,6 +29,7 @@
 import { createServer, IncomingMessage, ServerResponse } from "http";
 import { Server, Socket } from "socket.io";
 import { config, assertSecrets } from "../shared/config";
+import { isAllowedOrigin } from "../shared/http";
 import { verifyTicket } from "../shared/jwt";
 
 // dotenv is loaded by the shared config import (config.ts calls
@@ -108,15 +109,21 @@ function leaveGameRoom(socket: Socket, gameId: string): PlayerState | undefined 
 }
 
 // ─── HTTP server with health check ───
+const realtimeStartedAt = Date.now();
 const httpServer = createServer((req: IncomingMessage, res: ServerResponse) => {
-  // Render pings this endpoint to check if the service is alive
+  // Render pings this endpoint to check if the service is alive.
+  // v1.3: allow any origin so the WB Admin CTRL desktop app can
+  // poll uptime too (plain GET, no credentials — safe for *).
+  res.setHeader("Access-Control-Allow-Origin", "*");
   if (req.url === "/" || req.url === "/health") {
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify({
       status: "ok",
       service: "weildbuild-realtime",
+      version: "1.3.0",
       connectedUsers: usernameToSocketId.size,
       activeGames: gameRooms.size,
+      uptimeSeconds: Math.floor((Date.now() - realtimeStartedAt) / 1000),
       timestamp: new Date().toISOString(),
     }));
     return;
@@ -134,14 +141,7 @@ function originAllowed(
   callback: (err: Error | null, allow?: boolean) => void
 ): void {
   if (!origin) return callback(null, true);
-  const clean = origin.replace(/\/$/, "");
-  if (config.allowedOrigins.some((o) => o.replace(/\/$/, "") === clean)) {
-    return callback(null, true);
-  }
-  // Allow any https://*.onrender.com (Render previews + our own services)
-  if (/^https:\/\/[a-z0-9-]+\.onrender\.com$/i.test(clean)) {
-    return callback(null, true);
-  }
+  if (isAllowedOrigin(origin)) return callback(null, true); // v1.3.2: shared checker (localhost any port + tauri + configured + onrender)
   return callback(null, false);
 }
 

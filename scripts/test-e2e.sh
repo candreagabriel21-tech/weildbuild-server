@@ -8,7 +8,7 @@
 # → buy item → friends → publish game → instance placement →
 # gamehost join → heartbeat → version gate.
 set -e
-cd /home/z/my-project/weildbuild-server
+cd "$(dirname "$0")/.."
 
 export DATABASE_URL="postgresql://postgres:postgres@localhost:5433/weildbuild"
 export AUTH_SECRET="e2e-test-secret-0123456789abcdef0123456789abcdef"
@@ -106,7 +106,61 @@ check "internal instance create" 'instanceId' "$CAP"
 BADTOKEN=$(curl -s -o /dev/null -w "%{http_code}" -X POST http://localhost:3004/internal/instances -H "Content-Type: application/json" -H "x-internal-token: WRONG" -d "{\"gameId\":\"$GAME_ID\",\"maxPlayers\":10}")
 check "internal API rejects bad token" '401' "$BADTOKEN"
 
-echo "── 13. Cleanup ──"
+echo "── 13. v1.3: Admin settings + overview (WB Admin CTRL API) ──"
+# /version before any override — env defaults + downloads object
+check "version gate has downloads object" '"downloads"' "$(curl -s http://localhost:8000/version)"
+check "downloads.windows default derived" '/download/windows' "$(curl -s http://localhost:8000/version)"
+
+# Admin settings read
+SETTINGS=$(curl -s http://localhost:8000/api/admin/settings -H "X-Session-Token: $ADMIN_TOKEN")
+check "admin settings readable" '"source"' "$SETTINGS"
+check "settings source=env before override" '"latestVersion":"env"' "$SETTINGS"
+
+# Non-admin is rejected
+NONADMIN=$(curl -s -o /dev/null -w "%{http_code}" -X PUT http://localhost:8000/api/admin/settings -H "Content-Type: application/json" -H "X-Session-Token: $PLAYER_TOKEN" -d '{"clientLatestVersion":"9.9.9"}')
+check "non-admin settings update rejected" '403' "$NONADMIN"
+
+# Invalid version rejected
+BADVER=$(curl -s -X PUT http://localhost:8000/api/admin/settings -H "Content-Type: application/json" -H "X-Session-Token: $ADMIN_TOKEN" -d '{"clientLatestVersion":"not-a-version"}')
+check "invalid semver rejected" 'must look like 1.2.3' "$BADVER"
+
+# Valid override → /version reflects it immediately
+PUTOK=$(curl -s -X PUT http://localhost:8000/api/admin/settings -H "Content-Type: application/json" -H "X-Session-Token: $ADMIN_TOKEN" -d '{"clientLatestVersion":"1.14.1","clientMinVersion":"1.14.0","downloadWindows":"https://weildbuild.vercel.app/download/windows","downloadAndroid":"https://weildbuild.vercel.app/download/android"}')
+check "settings update accepted" '"success":true' "$PUTOK"
+check "updated settings source=db" '"latestVersion":"db"' "$PUTOK"
+VER=$(curl -s http://localhost:8000/version)
+check "/version reflects DB override" '"latest":"1.14.1"' "$VER"
+check "/version per-platform windows link" 'download/windows' "$VER"
+check "/version per-platform android link" 'download/android' "$VER"
+
+# Clear one override → falls back to env
+CLEAR=$(curl -s -X PUT http://localhost:8000/api/admin/settings -H "Content-Type: application/json" -H "X-Session-Token: $ADMIN_TOKEN" -d '{"clientLatestVersion":""}')
+check "clear override falls back to env" '"latestVersion":"env"' "$CLEAR"
+
+# Heartbeat with player names → lands in DB → surfaces in overview
+# (kill the real gamehost first so its heartbeats can't overwrite ours;
+#  the host stays "online" in the DB because stale-sweep needs 45s+)
+kill $GH_PID 2>/dev/null || true
+sleep 1
+HB=$(curl -s -X POST http://localhost:8000/internal/hosts/heartbeat -H "Content-Type: application/json" -H "x-internal-token: $INTERNAL_TOKEN" -d "{\"hostId\":\"server-1\",\"uptimeSeconds\":1234,\"instances\":[{\"id\":\"$INSTANCE_ID\",\"gameId\":\"$GAME_ID\",\"players\":1,\"status\":\"running\",\"playerNames\":[\"TestPlayer1\"]}]}" )
+check "heartbeat with playerNames accepted" '"success":true' "$HB"
+
+# Overview — the one-click dashboard payload
+OV=$(curl -s http://localhost:8000/api/admin/overview -H "X-Session-Token: $ADMIN_TOKEN")
+check "overview has counts" '"counts"' "$OV"
+check "overview counts 2 users" '"users":2' "$OV"
+check "overview has hosts" '"Server 1"' "$OV"
+check "overview host uptime from heartbeat" '"uptimeSeconds":1234' "$OV"
+check "overview instance shows player names" 'TestPlayer1' "$OV"
+check "overview recent DMs" 'hello from e2e!' "$OV"
+check "overview version gate merged" '"minVersion":"1.14.0"' "$OV"
+check "overview reports server uptime" '"uptimeSeconds"' "$OV"
+
+# Public instance list must NOT leak player names
+PUB=$(curl -s "http://localhost:8000/api/instances?gameId=$GAME_ID")
+if echo "$PUB" | grep -q "playerNames"; then FAIL=$((FAIL+1)); echo "✗ public instance list leaks playerNames"; else PASS=$((PASS+1)); echo "✓ public instance list hides player names"; fi
+
+echo "── 14. Cleanup ──"
 kill $MAIN_PID $RT_PID $GH_PID 2>/dev/null || true
 sleep 1
 echo ""

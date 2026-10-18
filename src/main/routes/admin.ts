@@ -1,20 +1,18 @@
 // ═══════════════════════════════════════════════════════════
-// WeildBuild Main — /admin routes. Backups + cleanup (ported from
-// the original), plus the v1.2.0 moderation endpoints that power
-// the desktop app's Admin tab (client v13.9): search players,
-// warn, ban (kills all their sessions) and unban.
+// WeildBuild Main — /admin routes (faithful port of the Next.js
+// admin backup + admin cleanup API routes). Backups now dump the
+// full Prisma database and upload to Backblaze B2 (was Dropbox).
 // ═══════════════════════════════════════════════════════════
 import { Router } from "express";
 import { z } from "zod";
 import { prisma } from "../../db/client";
-import { runCleanup, trimUserNotificationArrays, createNotification, getNotifications } from "../../db/data";
-import { getUser, saveUser, sanitizeString } from "../../db/users";
-import { deleteUserSessions } from "../../db/sessions";
-import { requireRateLimit } from "../../db/ratelimits";
+import { runCleanup, trimUserNotificationArrays } from "../../db/data";
 import { config } from "../../shared/config";
-import { safeHandler, validateBody, clientIp } from "../../shared/http";
-import { attachUser, requireAdmin, requireAuth, originOk } from "../middleware";
+import { safeHandler, validateBody } from "../../shared/http";
+import { attachUser, requireAdmin, originOk } from "../middleware";
 import { uploadBackup } from "../../b2/b2";
+import { getEffectiveSettings, saveSettings, EffectiveSettings } from "../../db/settings";
+import { listInstancesDetailed, sweepStale } from "../../db/instances";
 
 export const adminRouter = Router();
 
@@ -175,125 +173,123 @@ adminRouter.post("/cleanup", safeHandler(async (req, res) => {
 }));
 
 // ═══════════════════════════════════════════════════════════
-// ─────────────── Moderation (v1.2.0 / client v13.9) ───────────────
-// Powers the desktop app's Admin tab: search players, warn, ban,
-// unban. Bans kill every active session immediately (the player is
-// logged out everywhere) and block future logins with the reason.
-// Warnings are notifications of type "warning" — the player sees
-// them in their Notifications tab and the admin panel counts them.
+// v1.3 — WB Admin CTRL support: settings + one-click overview
 // ═══════════════════════════════════════════════════════════
 
-// GET /admin/users?search= — list players for the moderation panel.
-// No search → the 50 most recent accounts. Each row carries the ban
-// flag, the admin role and the player's warning count.
-adminRouter.get("/users", safeHandler(async (req, res) => {
-  // Verify admin
+
+// GET /admin/settings — the effective version gate + download links
+// (DB overrides merged over env defaults, with a per-field source map)
+adminRouter.get("/settings", safeHandler(async (req, res) => {
   const admin = await requireAdmin(req, res);
   if (!admin) return;
 
-  const rl = await requireRateLimit("general_api", clientIp(req));
-  if (rl) return res.status(429).json({ error: rl.error, retryAfter: rl.retryAfter });
-
-  const search = typeof req.query.search === "string" ? req.query.search.trim() : "";
-  const rows = search
-    ? await prisma.user.findMany({
-        where: { username: { contains: search, mode: "insensitive" } },
-        orderBy: { created: "desc" },
-        take: 50,
-      })
-    : await prisma.user.findMany({ orderBy: { created: "desc" }, take: 50 });
-
-  // Warning counts come from the notification history (type "warning")
-  const warningRows = await prisma.notification.findMany({
-    where: { type: "warning" },
-    select: { username: true },
-  });
-  const warningCounts: Record<string, number> = {};
-  for (const w of warningRows) warningCounts[w.username] = (warningCounts[w.username] || 0) + 1;
-
-  const users = rows.map((r: any) => ({
-    username: r.username,
-    admin_role: r.adminRole || "none",
-    banned: r.banned || { is_banned: false, reason: "" },
-    warnings: warningCounts[r.username] || 0,
-    created: r.created instanceof Date ? r.created.toISOString() : r.created,
-    last_login: r.lastLogin instanceof Date ? r.lastLogin.toISOString() : r.lastLogin,
-  }));
-  return res.json({ users, total: users.length });
+  const settings = await getEffectiveSettings();
+  return res.json({ settings });
 }));
 
-const moderateSchema = z.object({
-  action: z.enum(["ban", "unban", "warn"]),
-  username: z.string().min(1).max(20),
-  reason: z.string().max(200).optional(),
-  message: z.string().max(200).optional(),
+const settingsUpdateSchema = z.object({
+  clientLatestVersion: z.string().max(30).optional(),
+  clientMinVersion: z.string().max(30).optional(),
+  downloadWindows: z.string().max(300).optional(),
+  downloadMacos: z.string().max(300).optional(),
+  downloadLinux: z.string().max(300).optional(),
+  downloadAndroid: z.string().max(300).optional(),
+  downloadWeb: z.string().max(300).optional(),
+  maintenanceMode: z.boolean().optional(),
 });
 
-// POST /admin/moderate — ban / unban / warn a player.
-// Guard rails (enforced server-side, mirrored in the client UI):
-//   • nobody can moderate their own account
-//   • only the top admin can moderate other admins
-//   • a ban REQUIRES a reason (shown to the player at login)
-//   • a warn REQUIRES a message
-adminRouter.post("/moderate", safeHandler(async (req, res) => {
-  // Validate origin
+// PUT /admin/settings — update the version gate / download links.
+// Empty string on a field = "clear the override" (falls back to env).
+adminRouter.put("/settings", safeHandler(async (req, res) => {
   if (!originOk(req, res)) return;
-
-  // Verify admin
   const admin = await requireAdmin(req, res);
   if (!admin) return;
 
-  const rl = await requireRateLimit("general_api", clientIp(req));
-  if (rl) return res.status(429).json({ error: rl.error, retryAfter: rl.retryAfter });
-
-  const parsed = validateBody(moderateSchema, req.body, res);
+  const parsed = validateBody(settingsUpdateSchema, req.body, res);
   if ("error" in parsed) return;
-  const { action, username } = parsed.data;
+  const update = parsed.data;
 
-  if (username === admin) {
-    return res.status(400).json({ error: "You cannot moderate your own account." });
+  // Version strings must look like semver when non-empty
+  const semverish = /^\d+\.\d+\.\d+/;
+  for (const v of [update.clientLatestVersion, update.clientMinVersion]) {
+    if (v !== undefined && v !== "" && !semverish.test(v)) {
+      return res.status(400).json({ error: `Version must look like 1.2.3 — got "${v}"` });
+    }
   }
-
-  const target = await getUser(username);
-  if (!target) return res.status(404).json({ error: "Player not found" });
-
-  // Only the top admin may moderate other admins.
-  const targetIsAdmin = target.admin_role === "admin" || target.admin_role === "top_admin";
-  if (targetIsAdmin) {
-    const requester = await getUser(admin);
-    if (requester?.admin_role !== "top_admin") {
-      return res.status(403).json({ error: "Only the top admin can moderate other admins." });
+  // Download links must look like URLs or paths when non-empty
+  for (const [field, v] of Object.entries(update)) {
+    if (field.startsWith("download") && typeof v === "string" && v !== "" && !/^(https?:\/\/|\/)/.test(v)) {
+      return res.status(400).json({ error: `${field} must start with http(s):// or / — got "${v}"` });
     }
   }
 
-  if (action === "ban") {
-    const reason = sanitizeString(parsed.data.reason || "", 200);
-    if (!reason) return res.status(400).json({ error: "A ban reason is required." });
-    target.banned = { is_banned: true, reason } as any;
-    const saveResult = await saveUser(username, target);
-    if (saveResult.error) return res.status(500).json({ error: "Failed to save ban: " + saveResult.error });
-    // Kick EVERY active session - banned means logged out everywhere, now.
-    try { await deleteUserSessions(username); } catch {}
-    await createNotification(username, "banned", `Your account has been banned. Reason: ${reason}`, admin);
-    console.log(`[moderation] ${admin} banned ${username} (${reason})`);
-    return res.json({ success: true, action: "ban", username });
+  try {
+    await saveSettings(update, admin);
+    const settings: EffectiveSettings = await getEffectiveSettings();
+    return res.json({ success: true, settings });
+  } catch (e: any) {
+    return res.status(500).json({ error: "Failed to save settings: " + e.message });
   }
+}));
 
-  if (action === "unban") {
-    target.banned = { is_banned: false, reason: "" } as any;
-    const saveResult = await saveUser(username, target);
-    if (saveResult.error) return res.status(500).json({ error: "Failed to save unban: " + saveResult.error });
-    await createNotification(username, "unbanned", "Your ban has been lifted. You can log in again - welcome back!", admin);
-    console.log(`[moderation] ${admin} unbanned ${username}`);
-    return res.json({ success: true, action: "unban", username });
-  }
+// GET /admin/overview — ONE call with everything WB Admin CTRL shows:
+// counts, version gate, game hosts, live instances + player names,
+// recent DMs and open reports.
+adminRouter.get("/overview", safeHandler(async (req, res) => {
+  const admin = await requireAdmin(req, res);
+  if (!admin) return;
 
-  // action === "warn"
-  const message = sanitizeString(parsed.data.message || "", 200);
-  if (!message) return res.status(400).json({ error: "A warning message is required." });
-  await createNotification(username, "warning", `Official warning from the WeildBuild team: ${message}`, admin);
-  const notifs = await getNotifications(username);
-  const warningCount = notifs.filter((n: any) => n.type === "warning").length;
-  console.log(`[moderation] ${admin} warned ${username}: ${message}`);
-  return res.json({ success: true, action: "warn", username, warningCount });
+  await sweepStale();
+
+  const [userCount, gameCount, itemCount, sessionCount, openReports, hosts, instances, recentDms, recentGames, settings] =
+    await Promise.all([
+      prisma.user.count(),
+      prisma.game.count(),
+      prisma.item.count(),
+      prisma.session.count(),
+      prisma.report.count({ where: { status: "open" } }),
+      prisma.serverHost.findMany({ orderBy: { priority: "asc" } }),
+      listInstancesDetailed(),
+      prisma.dm.findMany({ orderBy: { timestamp: "desc" }, take: 50 }),
+      prisma.game.findMany({ select: { id: true, name: true, creator: true, plays: true }, take: 200 }),
+      getEffectiveSettings(),
+    ]);
+
+  const gameNameById = new Map(recentGames.map((g) => [g.id, g]));
+  const totalPlayers = instances.reduce((sum: number, i: any) => sum + i.players, 0);
+
+  return res.json({
+    fetchedBy: admin,
+    server: {
+      version: "1.3.0",
+      uptimeSeconds: Math.floor(process.uptime()),
+      timestamp: new Date().toISOString(),
+    },
+    counts: { users: userCount, games: gameCount, items: itemCount, sessions: sessionCount, openReports },
+    players: { online: totalPlayers, inInstances: instances.length },
+    versionGate: settings,
+    hosts: hosts.map((h) => ({
+      id: h.id,
+      label: h.label || h.id,
+      url: h.url,
+      priority: h.priority,
+      maxInstances: h.maxInstances,
+      currentInstances: h.currentInstances,
+      currentPlayers: h.currentPlayers,
+      uptimeSeconds: h.uptimeSeconds,
+      status: h.status,
+      lastHeartbeat: h.lastHeartbeat.toISOString(),
+    })),
+    instances: instances.map((i: any) => ({
+      ...i,
+      gameName: gameNameById.get(i.gameId)?.name || i.gameId,
+    })),
+    recentDms: recentDms.map((d) => ({
+      id: d.id,
+      from: d.from,
+      to: d.to,
+      content: d.content,
+      timestamp: d.timestamp.toISOString(),
+    })),
+  });
 }));

@@ -42,6 +42,12 @@ app.set("trust proxy", 1); // Render sits in front
 app.use(express.json({ limit: "1mb" }));
 
 // ── Health check (Render + monitoring) ──
+// v1.3: allow any origin so the WB Admin CTRL desktop app can poll
+// uptime too (plain GET, no credentials — safe for *).
+app.use("/health", (_req: express.Request, res: express.Response, next: () => void) => {
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  next();
+});
 app.get("/", healthHandler);
 app.get("/health", healthHandler);
 function healthHandler(_req: express.Request, res: express.Response) {
@@ -140,6 +146,7 @@ function startHeartbeat(): void {
     const body = JSON.stringify({
       hostId: config.host.id,
       instances: manager.listForHeartbeat(),
+      uptimeSeconds: Math.floor((Date.now() - startedAt) / 1000),
     });
     fetch(`${MAIN}/internal/hosts/heartbeat`, {
       method: "POST",
