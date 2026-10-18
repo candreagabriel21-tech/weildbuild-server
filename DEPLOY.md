@@ -156,8 +156,8 @@ Environment variables:
 | `B2_REPORTS_BUCKET` | `weildbuild-reports` |
 | `B2_BACKUPS_BUCKET` | `weildbuild-backups` |
 | `ALLOWED_ORIGINS` | `tauri://localhost,http://tauri.localhost,http://localhost:3000,https://weildbuild.vercel.app` — v1.3.2+: every `localhost`/`127.0.0.1` port is ALSO always allowed, so local tools (e.g. Admin CTRL on :5173) work no matter what |
-| `CLIENT_LATEST_VERSION` | `13.1.0` |
-| `CLIENT_MIN_VERSION` | `13.0.0` |
+| `CLIENT_LATEST_VERSION` | `1.0.0` |
+| `CLIENT_MIN_VERSION` | `1.0.0` |
 | `CLIENT_DOWNLOAD_URL` | `https://weildbuild.vercel.app` |
 
 ### Account 2 — `weildbuild-realtime`

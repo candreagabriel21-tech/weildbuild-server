@@ -39,8 +39,8 @@ export const config = {
 
   // ── Client version gate ──
   client: {
-    latestVersion: process.env.CLIENT_LATEST_VERSION || "13.1.0",
-    minVersion: process.env.CLIENT_MIN_VERSION || "13.0.0",
+    latestVersion: process.env.CLIENT_LATEST_VERSION || "1.0.0",
+    minVersion: process.env.CLIENT_MIN_VERSION || "1.0.0",
     downloadUrl: process.env.CLIENT_DOWNLOAD_URL || "https://weildbuild.vercel.app",
   },
 
