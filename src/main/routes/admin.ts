@@ -7,14 +7,13 @@ import { Router } from "express";
 import { z } from "zod";
 import { prisma } from "../../db/client";
 import { runCleanup, trimUserNotificationArrays, createNotification } from "../../db/data";
-import { getUser, sanitizeString } from "../../db/users";
-import { deleteUserSessions } from "../../db/sessions";
 import { config } from "../../shared/config";
 import { safeHandler, validateBody } from "../../shared/http";
 import { attachUser, requireAdmin, originOk } from "../middleware";
 import { uploadBackup } from "../../b2/b2";
 import { getEffectiveSettings, saveSettings, EffectiveSettings } from "../../db/settings";
 import { listInstancesDetailed, sweepStale } from "../../db/instances";
+import { deleteUserSessions } from "../../db/sessions";
 
 export const adminRouter = Router();
 
@@ -296,26 +295,18 @@ adminRouter.get("/overview", safeHandler(async (req, res) => {
   });
 }));
 
-// ─────────────────────────────────────────────────────────────
-// v1.4 — PLAYER MODERATION (client v13.9 Admin tab)
-// ban / unban / warn straight from the desktop app's Admin panel.
-// ─────────────────────────────────────────────────────────────
-
-// GET /admin/users?search= — list player accounts for the Admin tab.
-// No search = the 50 most recent accounts; search = substring match on
-// username. Returns exactly the fields AdminView's AdminUserRow expects.
+// ─────────────── v1.4: Player moderation ───────────────
+// GET /admin/users?search= — player list for the Admin tab (v13.9 client).
+// Returns the exact AdminUserRow shape the client renders: username,
+// admin_role, banned, warnings, created, last_login. 50 most recent by
+// default; case-insensitive substring search when ?search= is given.
 adminRouter.get("/users", safeHandler(async (req, res) => {
   const admin = await requireAdmin(req, res);
   if (!admin) return;
 
-  const rawSearch = typeof req.query.search === "string" ? req.query.search.trim() : "";
-  const search = sanitizeString(rawSearch, 20); // usernames are max 20 chars
-  const where = search
-    ? { username: { contains: search, mode: "insensitive" as const } }
-    : {};
-
+  const search = typeof req.query.search === "string" ? req.query.search.trim() : "";
   const rows = await prisma.user.findMany({
-    where,
+    where: search ? { username: { contains: search, mode: "insensitive" } } : {},
     orderBy: { created: "desc" },
     take: 50,
     select: {
@@ -327,88 +318,90 @@ adminRouter.get("/users", safeHandler(async (req, res) => {
   return res.json({
     users: rows.map((r) => ({
       username: r.username,
-      admin_role: r.adminRole || "none",
+      admin_role: r.adminRole,
       banned: (r.banned as any) || { is_banned: false, reason: "" },
-      warnings: typeof r.warnings === "number" ? r.warnings : 0,
+      warnings: r.warnings || 0,
       created: r.created instanceof Date ? r.created.toISOString() : r.created,
       last_login: r.lastLogin instanceof Date ? r.lastLogin.toISOString() : r.lastLogin,
     })),
   });
 }));
 
-// POST /admin/moderate — warn | ban | unban a player.
-// Safety rails are enforced HERE (the client hides the buttons, but the
-// server is the real gatekeeper):
-//   • you can never moderate your own account
-//   • only the top admin can moderate other admins
-//   • bans require a reason
-//   • banning kills every active session instantly (mid-session logout)
 const moderateSchema = z.object({
   action: z.enum(["warn", "ban", "unban"]),
-  username: z.string().min(1).max(20),
-  message: z.string().max(200).optional(), // warn text
-  reason: z.string().max(200).optional(),  // ban reason
+  username: z.string().min(1).max(30),
+  message: z.string().max(200).optional(), // warn: custom warning text
+  reason: z.string().max(200).optional(),  // ban: required reason
 });
 
+// POST /admin/moderate — warn / ban / unban a player (v13.9 client Admin tab).
+//   warn:   warnings counter +1 and a "warning" notification lands in the
+//           player's inbox (custom message or a default).
+//   ban:    sets banned {is_banned, reason}, notifies, and deletes ALL the
+//           player's sessions so an active login is kicked out instantly.
+//   unban:  clears the ban flag and notifies.
+// Rails (enforced server-side, no exceptions):
+//   • nobody moderates themselves
+//   • only a top_admin may moderate an admin
+//   • a ban ALWAYS needs a reason
 adminRouter.post("/moderate", safeHandler(async (req, res) => {
-  const adminName = await requireAdmin(req, res);
-  if (!adminName) return;
+  if (!originOk(req, res)) return;
+  const admin = await requireAdmin(req, res);
+  if (!admin) return;
 
   const parsed = validateBody(moderateSchema, req.body, res);
   if ("error" in parsed) return;
-  const body = parsed.data;
+  const { action, username, message, reason } = parsed.data;
 
-  // Rail 1: never moderate yourself.
-  if (body.username === adminName) {
-    return res.status(400).json({ error: "You cannot moderate your own account." });
+  if (username === admin) {
+    return res.status(400).json({ error: "You cannot moderate yourself." });
   }
 
-  // Load the target (and the acting admin, for the top_admin rail).
-  const [target, adminUser] = await Promise.all([getUser(body.username), getUser(adminName)]);
-  if (!target) return res.status(404).json({ error: "Player not found." });
+  const targetRow = await prisma.user.findUnique({ where: { username } });
+  if (!targetRow) return res.status(404).json({ error: "User not found" });
 
-  // Rail 2: only the top admin can moderate other admins.
-  if (target.admin_role === "admin" || target.admin_role === "top_admin") {
-    if (adminUser?.admin_role !== "top_admin") {
-      return res.status(403).json({ error: "Only the top admin can moderate other admins." });
+  // Only top_admin may moderate admins
+  const adminRow = await prisma.user.findUnique({ where: { username: admin } });
+  const targetIsAdmin = targetRow.adminRole === "admin" || targetRow.adminRole === "top_admin";
+  const actorIsTop = adminRow?.adminRole === "top_admin";
+  if (targetIsAdmin && !actorIsTop) {
+    return res.status(403).json({ error: "Only the top admin can moderate admins." });
+  }
+
+  if (action === "warn") {
+    const count = (targetRow.warnings || 0) + 1;
+    await prisma.user.update({ where: { username }, data: { warnings: count } });
+    await createNotification(
+      username, "warning",
+      message || `You have received a warning from ${admin} (warning #${count}).`,
+      admin,
+    );
+    return res.json({ success: true, username, warnings: count });
+  }
+
+  if (action === "ban") {
+    if (!reason || !reason.trim()) {
+      return res.status(400).json({ error: "A reason is required to ban a player." });
     }
-  }
-
-  // Rail 3: bans require a reason.
-  const reason = (body.reason || "").trim();
-  if (body.action === "ban" && !reason) {
-    return res.status(400).json({ error: "A reason is required to ban a player." });
-  }
-
-  if (body.action === "warn") {
-    const message = (body.message || "").trim() || "You have received a warning from the WeildBuild moderation team.";
     await prisma.user.update({
-      where: { username: body.username },
-      data: { warnings: { increment: 1 } },
+      where: { username },
+      data: { banned: { is_banned: true, reason: reason.trim() } as any },
     });
-    await createNotification(body.username, "warning", message);
-    console.log(`[admin] ${adminName} warned ${body.username}: ${message}`);
-    return res.json({ success: true });
-  }
-
-  if (body.action === "ban") {
-    await prisma.user.update({
-      where: { username: body.username },
-      data: { banned: { is_banned: true, reason } },
-    });
-    // The notification waits for them; the session kill is immediate.
-    await createNotification(body.username, "banned", `Your account was banned. Reason: ${reason}`);
-    await deleteUserSessions(body.username);
-    console.log(`[admin] ${adminName} banned ${body.username}: ${reason}`);
-    return res.json({ success: true });
+    await createNotification(
+      username, "banned",
+      `Your account has been banned by ${admin}. Reason: ${reason.trim()}`,
+      admin,
+    );
+    // Kick every active session — a banned player is logged out mid-game.
+    await deleteUserSessions(username);
+    return res.json({ success: true, username, banned: { is_banned: true, reason: reason.trim() } });
   }
 
   // unban
   await prisma.user.update({
-    where: { username: body.username },
-    data: { banned: { is_banned: false, reason: "" } },
+    where: { username },
+    data: { banned: { is_banned: false, reason: "" } as any },
   });
-  await createNotification(body.username, "unbanned", "Your account has been unbanned. Welcome back!");
-  console.log(`[admin] ${adminName} unbanned ${body.username}`);
-  return res.json({ success: true });
+  await createNotification(username, "unbanned", `Your account has been unbanned by ${admin}. Welcome back!`, admin);
+  return res.json({ success: true, username, banned: { is_banned: false, reason: "" } });
 }));

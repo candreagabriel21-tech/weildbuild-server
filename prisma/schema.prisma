@@ -42,8 +42,7 @@ model User {
 
   adminRole      String   @default("none") @map("admin_role") // none | admin | top_admin
   banned         Json     @default("{\"is_banned\":false,\"reason\":\"\"}")
-
-  warnings       Int      @default(0) // v1.4: moderation warning counter (admin warn action)
+  warnings       Int      @default(0) // v1.4: moderation warning counter (/admin/moderate warn++)
 
   notifyFriends    Boolean @default(true) @map("notify_friends")
   notifyPurchases  Boolean @default(true) @map("notify_purchases")

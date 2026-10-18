@@ -128,28 +128,24 @@ gamesRouter.put("/", safeHandler(async (req, res) => {
   return res.json(game);
 }));
 
-// DELETE /games?id= — permanently delete a game (v1.4, client v13.9).
-// REQUIRES authentication + ownership or admin — same permission model
-// as PUT (the creator is compared against the SESSION user, never the body).
+// DELETE /games?id= — v1.4: creator or admin only (same permission model
+// as PUT above). Removes the game row and any running instance rows.
 gamesRouter.delete("/", safeHandler(async (req, res) => {
-  // Validate origin
   if (!originOk(req, res)) return;
 
-  // Rate limit
   const rl = await requireRateLimit("general_api", clientIp(req));
   if (rl) return res.status(429).json({ error: rl.error, retryAfter: rl.retryAfter });
 
-  // REQUIRE authentication
   const sessionUser = await requireAuth(req, res);
   if (!sessionUser) return;
 
   const id = qp(req, "id");
   if (!id) return res.status(400).json({ error: "Game ID required" });
+  // Path-traversal guard (same as getGame)
   if (id.includes("..") || id.includes("/") || id.includes("\\")) {
     return res.status(400).json({ error: "Invalid game ID" });
   }
 
-  // Verify the game exists + the user is the creator or admin
   const existingGame = await getGame(id);
   if (!existingGame) return res.status(404).json({ error: "Game not found" });
 

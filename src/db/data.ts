@@ -106,12 +106,10 @@ export function flattenGame(row: any): any {
     created: row.created instanceof Date ? row.created.toISOString() : row.created,
     last_update: row.lastUpdate instanceof Date ? row.lastUpdate.toISOString() : row.lastUpdate,
   };
-  // v1.4 FIX (game renames now stick): the TOP-LEVEL columns always win.
-  // Previously extraData was spread LAST, so a stale `name`/`description`
-  // copy inside the studio-state JSON shadowed the real columns — a rename
-  // never showed up in the lobby or profile. ExtraData may still carry old
-  // copies for legacy rows; they are ignored here and actively purged on
-  // the next update (see updateGameRecord).
+  // v1.4 RENAME FIX: base columns LAST. Older rows can carry a stale copy of
+  // name/description/creator/plays INSIDE extra_data (leaked there by an old
+  // createGameRecord bug). Spreading base last means the real column always
+  // wins on read, so renames show up everywhere immediately.
   return { ...(row.extraData || {}), ...base };
 }
 
@@ -134,7 +132,7 @@ export async function getAllGames() {
   }
 }
 
-const GAME_TOP_LEVEL_FIELDS = ["name", "description", "creator", "plays"];
+const GAME_TOP_LEVEL_FIELDS = ["name", "description", "creator", "plays", "id"];
 
 export async function createGameRecord(gameData: any) {
   const id = gameData.id || randomBytes(4).toString("hex");
@@ -142,9 +140,11 @@ export async function createGameRecord(gameData: any) {
     baseplate_color, baseplate_size, max_players, public: isPublic,
     multiplayer, ...rest } = gameData;
 
-  // v1.4 FIX: never let top-level columns leak into extraData as stale
-  // copies (the root cause of the rename-shadowing bug).
-  for (const k of ["id", ...GAME_TOP_LEVEL_FIELDS]) delete rest[k];
+  // v1.4 RENAME FIX: strip top-level columns out of the extra-data spread.
+  // The old code leaked name/description/creator/plays (and any passed id)
+  // into extra_data, so a stale copy inside extra_data could shadow the real
+  // column on every later read. Columns are columns; extra_data is extras.
+  for (const k of GAME_TOP_LEVEL_FIELDS) delete rest[k];
 
   const row = {
     id,
@@ -180,10 +180,11 @@ export async function updateGameRecord(gameId: string, updates: any) {
   }
 
   const existingRow = await prisma.game.findUnique({ where: { id: gameId }, select: { extraData: true } });
-  const newExtraData = { ...((existingRow?.extraData as any) || {}), ...extraDataUpdates };
-  // v1.4 FIX: purge any stale top-level copies from extraData — legacy
-  // games are cleaned up automatically the first time they're updated.
-  for (const k of GAME_TOP_LEVEL_FIELDS) delete newExtraData[k];
+  // v1.4 RENAME FIX: purge any top-level-column copies out of the stored
+  // extra_data as we merge. Legacy poisoned rows self-clean on first update.
+  const mergedExtras = { ...((existingRow?.extraData as any) || {}), ...extraDataUpdates };
+  for (const k of GAME_TOP_LEVEL_FIELDS) delete mergedExtras[k];
+  const newExtraData = mergedExtras;
 
   try {
     const updated = await prisma.game.update({
@@ -197,9 +198,15 @@ export async function updateGameRecord(gameId: string, updates: any) {
   }
 }
 
-// v1.4: permanently remove a game + any tracked instances of it.
-// (No DB foreign keys between games and game_instances — clean up manually.)
-export async function deleteGameRecord(gameId: string): Promise<boolean> {
+export async function incrementGamePlays(gameId: string) {
+  try {
+    await prisma.game.update({ where: { id: gameId }, data: { plays: { increment: 1 } } });
+  } catch {}
+}
+
+// v1.4: delete a game + everything hanging off it. Instances have no FK to
+// Game (host-managed ids), so clear them explicitly, then remove the game.
+export async function deleteGameRecord(gameId: string) {
   try {
     await prisma.gameInstance.deleteMany({ where: { gameId } });
     await prisma.game.delete({ where: { id: gameId } });
@@ -208,12 +215,6 @@ export async function deleteGameRecord(gameId: string): Promise<boolean> {
     console.error("[db] deleteGameRecord error:", e.message);
     return false;
   }
-}
-
-export async function incrementGamePlays(gameId: string) {
-  try {
-    await prisma.game.update({ where: { id: gameId }, data: { plays: { increment: 1 } } });
-  } catch {}
 }
 
 // ─────────────────────── NOTIFICATIONS ───────────────────────

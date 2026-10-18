@@ -52,7 +52,7 @@ instancesRouter.post("/join", safeHandler(async (req, res) => {
           "x-internal-token": config.internalToken,
         },
         body: JSON.stringify({ gameId: gid, maxPlayers }),
-        signal: AbortSignal.timeout(20000), // free-tier cold start can be slow
+        signal: AbortSignal.timeout(75000), // v1.4.1: Render free-tier cold start can take 30-60s — 20s gave up mid-wake
       });
       if (!response.ok) {
         console.error(`[instances] host ${hostUrl} create failed: ${response.status}`);

@@ -152,29 +152,66 @@ export async function findOrCreateInstance(
     }
   }
 
-  // 2. Create a new instance on the best host
-  if (aliveHosts.length === 0) return { error: "No game servers are currently online" };
-
-  // Sort: priority asc (Server 1 first), then currentInstances asc (least loaded)
-  const sorted = [...aliveHosts].sort(
-    (a, b) => a.priority - b.priority || a.currentInstances - b.currentInstances
-  );
-  const host = sorted.find((h) => h.currentInstances < h.maxInstances);
-  if (!host) return { error: "All game servers are full right now. Try again in a minute!" };
-
-  const instanceId = await createOnHost(host.url, gameId, maxPlayers);
-  if (!instanceId) {
-    return { error: "Game server did not respond. Try again in a minute!" };
+  // 2. Create a new instance on the best host.
+  //
+  // v1.4.1 "SERVER OFFLINE" FIX: Render free-tier game hosts SLEEP after ~15
+  // minutes without traffic. While asleep they send no heartbeats, so by the
+  // time someone clicks Join, sweepStale() has marked every host offline and
+  // the old code answered "No game servers are currently online" — even
+  // though every service was perfectly healthy (it was just napping). The
+  // client showed "server offline" on every join.
+  //
+  // New behavior: when no host is freshly alive, fall back to the LAST KNOWN
+  // host registry (any status). The create-fetch itself WAKES the sleeping
+  // service (Render cold start ~30-60s — the route's timeout allows for it),
+  // and once booted the host re-registers and heartbeats again. We try hosts
+  // in priority order until one answers.
+  let candidates: { id: string; url: string; priority: number; currentInstances: number; maxInstances: number; alive: boolean }[];
+  if (aliveHosts.length > 0) {
+    candidates = aliveHosts.map((h) => ({
+      id: h.id, url: h.url, priority: h.priority,
+      currentInstances: h.currentInstances, maxInstances: h.maxInstances, alive: true,
+    }));
+  } else {
+    const allHosts = await prisma.serverHost.findMany({});
+    if (allHosts.length === 0) return { error: "No game servers are currently online" };
+    candidates = allHosts.map((h) => ({
+      id: h.id, url: h.url, priority: h.priority,
+      currentInstances: 0, maxInstances: h.maxInstances, alive: false,
+    }));
+    console.log(`[instances] no alive hosts — waking ${allHosts.length} registered host(s) from sleep`);
   }
 
-  await prisma.gameInstance.create({
-    data: {
-      id: instanceId, gameId, hostId: host.id,
-      status: "running", playerCount: 0, maxPlayers,
-    },
-  });
+  // Sort: priority asc (Server 1 first), then currentInstances asc (least loaded).
+  // (Woken hosts report 0 instances — the heartbeat will correct the count.)
+  const sorted = [...candidates].sort(
+    (a, b) => a.priority - b.priority || a.currentInstances - b.currentInstances
+  );
 
-  return { result: { instanceId, socketUrl: host.url, created: true } };
+  for (const host of sorted) {
+    if (host.alive && host.currentInstances >= host.maxInstances) continue; // full (awake only — woken hosts reset)
+    const instanceId = await createOnHost(host.url, gameId, maxPlayers);
+    if (instanceId) {
+      await prisma.gameInstance.create({
+        data: {
+          id: instanceId, gameId, hostId: host.id,
+          status: "running", playerCount: 0, maxPlayers,
+        },
+      });
+      // If this was a sleeping host, mark it online again right away — it
+      // clearly answered, and the next joiner shouldn't re-run the wake path.
+      if (!host.alive) {
+        await prisma.serverHost.update({
+          where: { id: host.id },
+          data: { status: "online", lastHeartbeat: new Date() },
+        }).catch(() => {});
+      }
+      return { result: { instanceId, socketUrl: host.url, created: true } };
+    }
+  }
+
+  if (sorted.length === 0) return { error: "No game servers are currently online" };
+  return { error: "All game servers are full or asleep right now. Try again in a minute!" };
 }
 
 export async function listInstances(gameId?: string) {
