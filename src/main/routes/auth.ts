@@ -77,7 +77,20 @@ authRouter.post("/", safeHandler(async (req, res) => {
     if (rl) return res.status(429).json({ error: rl.error, retryAfter: rl.retryAfter });
 
     const result = await verifyLogin(username, pwd);
-    if (result.error) return res.status(401).json({ error: result.error });
+    if (result.error) {
+      // v1.4.2 BAN VISIBILITY FIX: banned logins return 403 (Forbidden), not
+      // 401 (Unauthorized). The client's apiFetch treats ANY 401 on a write
+      // as "stale session" and swaps the real message for "Session expired.
+      // Please log in again." — so banned players never saw WHY. With 403 the
+      // client surfaces this error verbatim: "Account is banned: <reason>".
+      // (verifyLogin's message starts with "Account is banned" when banned.)
+      const banned = result.error.startsWith("Account is banned");
+      if (banned) {
+        const reason = result.error.slice("Account is banned:".length).trim() || "No reason given";
+        return res.status(403).json({ error: result.error, banned: true, reason });
+      }
+      return res.status(401).json({ error: result.error });
+    }
 
     const { user } = result;
     if (!user) return res.status(500).json({ error: "Login failed" });

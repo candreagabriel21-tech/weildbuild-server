@@ -38,6 +38,18 @@ export async function hostHeartbeat(hostId: string, instances: HeartbeatInstance
   const running = instances.filter((i) => i.status === "running");
   const totalPlayers = running.reduce((sum, i) => sum + i.players, 0);
 
+  // v1.4.2 SELF-HEAL PROTOCOL: if the host row is gone (fresh database after
+  // a main-server migration, manual cleanup, ...) the old update() threw
+  // "record not found" on EVERY heartbeat — forever, because registration
+  // only ran once at boot. Instead of crashing, tell the caller: the response
+  // carries reRegister=true and the gamehost re-runs its registration
+  // immediately (it knows its own real url/label/priority).
+  const existing = await prisma.serverHost.findUnique({ where: { id: hostId } });
+  if (!existing) {
+    console.warn(`[db] hostHeartbeat: host "${hostId}" is not registered — asking it to re-register (self-heal)`);
+    return { instances: running.length, players: totalPlayers, reRegister: true };
+  }
+
   await prisma.serverHost.update({
     where: { id: hostId },
     data: {
@@ -78,7 +90,7 @@ export async function hostHeartbeat(hostId: string, instances: HeartbeatInstance
     data: { status: "closed", playerCount: 0, closedAt: now },
   });
 
-  return { instances: running.length, players: totalPlayers };
+  return { instances: running.length, players: totalPlayers, reRegister: false };
 }
 
 /** Lazily mark hosts/instances dead if heartbeats stopped (Render restart/crash). */
@@ -174,7 +186,21 @@ export async function findOrCreateInstance(
     }));
   } else {
     const allHosts = await prisma.serverHost.findMany({});
-    if (allHosts.length === 0) return { error: "No game servers are currently online" };
+    if (allHosts.length === 0) {
+      // v1.4.2: an EMPTY registry is a CONFIG problem, not a sleep problem.
+      // The game hosts' MAIN_SERVER_URL almost certainly points somewhere
+      // else (a dead/old deployment), so their registration never lands in
+      // THIS server's database. Name the fix right in the error — the client
+      // shows it verbatim in its toast.
+      const thisMain =
+        process.env.MAIN_PUBLIC_URL || process.env.RENDER_EXTERNAL_URL || "your-main-server-url";
+      return {
+        error:
+          `No game hosts are registered with this server. ` +
+          `On each game host service, set MAIN_SERVER_URL to THIS server (${thisMain}) ` +
+          `and INTERNAL_TOKEN to the same value as this server, then restart it.`,
+      };
+    }
     candidates = allHosts.map((h) => ({
       id: h.id, url: h.url, priority: h.priority,
       currentInstances: 0, maxInstances: h.maxInstances, alive: false,

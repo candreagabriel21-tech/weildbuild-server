@@ -33,6 +33,13 @@ const INTERNAL_HEADERS = {
   "Content-Type": "application/json",
 };
 
+// v1.4.2: registration state, exposed in /health so a broken deployment is
+// visible with a single curl — no dashboard log diving required:
+//   curl https://<gamehost>/health
+//   { ..., "registered": true/false, "mainUrl": "...", "lastRegisterError": "..." }
+let registered = false;
+let lastRegisterError = "";
+
 // ═══════════════════════════════════════════
 // HTTP server (shared with Socket.IO)
 // ═══════════════════════════════════════════
@@ -55,11 +62,16 @@ function healthHandler(_req: express.Request, res: express.Response) {
   res.json({
     status: "ok",
     service: "weildbuild-gamehost",
+    version: "1.4.2",
     hostId: config.host.id,
     label: config.host.label,
     instances: stats.totalInstances,
     players: stats.totalPlayers,
     uptimeSeconds: Math.floor((Date.now() - startedAt) / 1000),
+    // v1.4.2: the two lines that answer "why don't servers work" instantly.
+    registered,
+    mainUrl: MAIN,
+    lastRegisterError: lastRegisterError || null,
     timestamp: new Date().toISOString(),
   });
 }
@@ -123,7 +135,7 @@ async function registerWithMain(): Promise<void> {
     }),
     signal: AbortSignal.timeout(10000),
   });
-  if (!res.ok) throw new Error(`Main Server responded ${res.status}`);
+  if (!res.ok) throw new Error(`Main Server (${MAIN}) responded ${res.status}`);
 }
 
 /** Keep retrying registration every 15s until Main accepts us. */
@@ -131,13 +143,40 @@ async function registerLoop(): Promise<void> {
   for (;;) {
     try {
       await registerWithMain();
+      registered = true;
+      lastRegisterError = "";
       console.log(`[gamehost] registered with Main Server as "${config.host.id}" (${config.host.label})`);
       return;
     } catch (e) {
-      console.warn(`[gamehost] registration failed: ${e instanceof Error ? e.message : e} — retrying in 15s`);
+      registered = false;
+      lastRegisterError = e instanceof Error ? e.message : String(e);
+      console.warn(
+        `[gamehost] registration with ${MAIN} failed: ${lastRegisterError} — retrying in 15s. ` +
+          `Check MAIN_SERVER_URL (must be the URL of your REAL Main Server) and INTERNAL_TOKEN (must match Main's).`
+      );
       await new Promise((resolve) => setTimeout(resolve, 15000));
     }
   }
+}
+
+/** v1.4.2: re-register periodically (default every 5 min) even after the
+ * initial success. If Main's database was ever reset/wiped, the host row is
+ * gone — heartbeats alone used to fail forever. Re-registration heals it. */
+function startReRegistrationLoop(): void {
+  const intervalMs = parseInt(process.env.REREGISTER_INTERVAL_MS || "300000", 10);
+  setInterval(() => {
+    registerWithMain()
+      .then(() => {
+        if (!registered) console.log("[gamehost] re-registered with Main Server (self-heal)");
+        registered = true;
+        lastRegisterError = "";
+      })
+      .catch((e: unknown) => {
+        registered = false;
+        lastRegisterError = e instanceof Error ? e.message : String(e);
+        console.warn(`[gamehost] periodic re-registration failed: ${lastRegisterError}`);
+      });
+  }, intervalMs);
 }
 
 /** Every heartbeatIntervalMs: report running/closed instances to Main. */
@@ -154,8 +193,26 @@ function startHeartbeat(): void {
       body,
       signal: AbortSignal.timeout(10000),
     })
-      .then((res) => {
-        if (!res.ok) console.warn(`[gamehost] heartbeat rejected by Main (HTTP ${res.status})`);
+      .then(async (res) => {
+        if (!res.ok) {
+          console.warn(`[gamehost] heartbeat rejected by Main (${MAIN}, HTTP ${res.status})`);
+          return;
+        }
+        // v1.4.2 self-heal: Main answers { reRegister: true } when our host
+        // row is missing from its database (fresh DB / wiped registry) —
+        // re-register immediately instead of failing forever.
+        try {
+          const data = (await res.json()) as { reRegister?: boolean };
+          if (data && data.reRegister) {
+            console.warn("[gamehost] Main says we are not registered — re-registering now (self-heal)");
+            registerWithMain()
+              .then(() => { registered = true; lastRegisterError = ""; })
+              .catch((e: unknown) => {
+                registered = false;
+                lastRegisterError = e instanceof Error ? e.message : String(e);
+              });
+          }
+        } catch {}
       })
       .catch((e: unknown) =>
         console.warn(`[gamehost] heartbeat failed: ${e instanceof Error ? e.message : e}`)
@@ -420,8 +477,29 @@ httpServer.listen(port, () => {
   console.log(`║  Max instances: ${String(config.host.maxInstances).slice(0, 30).padEnd(31)}║`);
   console.log(`║  Main: ${config.host.mainServerUrl.slice(0, 43).padEnd(44)}║`);
   console.log("╚══════════════════════════════════════════════════════╝");
-  // Register with Main (retry every 15s until success), then start heartbeats.
-  void registerLoop().then(() => startHeartbeat());
+  // v1.4.2: catch the most common deployment mistake right at boot — a
+  // MAIN_SERVER_URL that was never set (or still points at localhost). On
+  // Render (RENDER_EXTERNAL_URL present) that's ALWAYS wrong and gets the
+  // loud warning; on a local dev machine localhost is perfectly normal and
+  // only gets a one-line note.
+  const mainUrlLooksLocal = /localhost|127\.0\.0\.1/.test(config.host.mainServerUrl);
+  if (process.env.RENDER_EXTERNAL_URL && (!process.env.MAIN_SERVER_URL || mainUrlLooksLocal)) {
+    console.warn("");
+    console.warn("  ⚠⚠⚠  MAIN_SERVER_URL IS NOT SET (or points at localhost)  ⚠⚠⚠");
+    console.warn("  This game host will NEVER register with your Main Server, and every");
+    console.warn("  game join will fail with \"No game hosts are registered\".");
+    console.warn("  Set MAIN_SERVER_URL to your REAL Main Server URL (the same one");
+    console.warn("  clients use), e.g. https://weildbuild-server.onrender.com");
+    console.warn("");
+  } else if (!process.env.MAIN_SERVER_URL) {
+    console.log("[gamehost] note: MAIN_SERVER_URL not set — using local default " + config.host.mainServerUrl + " (fine for local dev)");
+  }
+  // Register with Main (retry every 15s until success), then start heartbeats
+  // + the periodic re-registration safety net.
+  void registerLoop().then(() => {
+    startHeartbeat();
+    startReRegistrationLoop();
+  });
 });
 
 let shuttingDown = false;

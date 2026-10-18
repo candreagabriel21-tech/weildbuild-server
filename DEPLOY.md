@@ -190,7 +190,7 @@ Environment variables:
 | `AUTH_SECRET` | *(same as main)* |
 | `INTERNAL_TOKEN` | *(same as main)* |
 | `ALLOWED_ORIGINS` | `tauri://localhost,http://tauri.localhost,http://localhost:3000,https://weildbuild.vercel.app` — v1.3.2+: every `localhost`/`127.0.0.1` port is ALSO always allowed, so local tools (e.g. Admin CTRL on :5173) work no matter what |
-| `MAIN_SERVER_URL` | `https://weildbuild-main.onrender.com` *(your actual main URL)* |
+| `MAIN_SERVER_URL` | ⚠ **THE #1 DEPLOYMENT BUG — read the warning below!** The URL of the Main Server **CLIENTS connect to**. If your main is `https://weildbuild-server.onrender.com`, use EXACTLY that — NOT `weildbuild-main.onrender.com` unless that is genuinely your main's URL. |
 | `HOST_ID` | `server-1` |
 | `HOST_LABEL` | `Server 1` |
 | `HOST_PRIORITY` | `1` |
@@ -210,7 +210,25 @@ Identical to Account 3 **except**:
 | `HOST_LABEL` | `Server 2` |
 | `HOST_PRIORITY` | `2` |
 
-> **URLs differ?** Render assigns `<name>.onrender.com` from the service name — if you named services exactly as above, the URLs match. Otherwise adjust the monitor URLs in section 6 and both hosts' `MAIN_SERVER_URL` to the real URLs.
+> **⚠⚠⚠ `MAIN_SERVER_URL` — the #1 thing that breaks game servers ⚠⚠⚠**
+>
+> The game hosts use this URL to REGISTER themselves with the Main Server.
+> It must be the URL of the main server **the clients talk to** — the same
+> one baked into the desktop app. If it points anywhere else (an old
+> deployment, a service that 404s, localhost), the hosts retry registration
+> every 15 seconds FOREVER and never appear in Main's database. Every game
+> join then fails with **"No game hosts are registered with this server"**.
+>
+> **Verify it in 5 seconds after deploying a game host:**
+> ```
+> curl https://<your-gamehost>.onrender.com/health
+> ```
+> Look for `"registered": true` and the right `"mainUrl"`. If `registered`
+> is `false`, the `lastRegisterError` field tells you exactly why (e.g.
+> `Main Server (https://...) responded 404` = wrong URL).
+>
+> And on the Main Server itself, `curl https://<your-main>.onrender.com/health`
+> should show `"hosts": { "online": 1+, "registered": 1+ }`.
 
 ---
 
@@ -322,7 +340,7 @@ Then the real test: **log in from the desktop app** (the rewired v13.1 client) �
 | Build fails: `TS7016 Could not find a declaration file for module 'express'` | **Fixed in v1.2.0** — Render builds with `NODE_ENV=production`, and npm skips devDependencies in that mode. v1.2 puts `prisma`, `typescript`, `tsx` and all `@types/*` in `dependencies`, so this can't happen. If you ever see it again, someone moved them back to `devDependencies` — undo that. |
 | `502` / cold start slowness on first request | Free-tier wake-up (~30–60 s). If it keeps happening, check the UptimeRobot monitor for this service is **Up** with a 5-minute interval (section 6). |
 | Login fails with CORS error in app logs | The desktop origin is missing from `ALLOWED_ORIGINS`. Windows Tauri = `http://tauri.localhost`, macOS/Linux = `tauri://localhost`. Add both. |
-| Game join says "No game servers available" | No game host has registered with main. Check the host's logs — `MAIN_SERVER_URL` correct? `INTERNAL_TOKEN` matches main's? Registration retries every 15 s. |
+| Game join says "No game servers available" / "No game hosts are registered" | No game host has registered with this main. **Check in 5 seconds:** `curl https://<gamehost>/health` → is `registered: true`? If not, `lastRegisterError` says why — almost always `MAIN_SERVER_URL` pointing at the wrong place (must be the URL clients use) or `INTERNAL_TOKEN` not matching main's. Registration retries every 15 s and the join error names the exact fix. |
 | Realtime connects then instantly drops | `AUTH_SECRET` on realtime differs from main → tickets don't verify. Make them identical. |
 | `P1001 Can't reach database` | `DATABASE_URL` missing/wrong on that service, or Neon project paused (it auto-resumes — just retry). |
 | Free hours exhausted (service suspended) | That account hosts more than one always-awake service. Move one to another account. |

@@ -23,6 +23,7 @@ import { reportsRouter } from "./routes/reports";
 import { instancesRouter, internalRouter } from "./routes/instances";
 import { getEffectiveSettings } from "../db/settings";
 import { ensureDatabase } from "../db/ensure";
+import { prisma } from "../db/client";
 
 assertSecrets("main");
 
@@ -38,13 +39,36 @@ const startedAt = Date.now();
 app.get("/", healthHandler);
 app.get("/health", healthHandler);
 function healthHandler(_req: express.Request, res: express.Response) {
-  res.json({
-    status: "ok",
-    service: "weildbuild-main",
-    version: "1.4.1",
-    uptimeSeconds: Math.floor((Date.now() - startedAt) / 1000),
-    timestamp: new Date().toISOString(),
-  });
+  // v1.4.2: include the host registry census — "hosts: { registered: 0 }"
+  // instantly explains "No game hosts are registered" join failures without
+  // opening a database console.
+  prisma.serverHost
+    .groupBy({ by: ["status"], _count: { _all: true } })
+    .then((groups) => {
+      let online = 0, registered = 0;
+      for (const g of groups) {
+        registered += g._count._all;
+        if (g.status === "online") online += g._count._all;
+      }
+      res.json({
+        status: "ok",
+        service: "weildbuild-main",
+        version: "1.4.2",
+        hosts: { online, registered },
+        uptimeSeconds: Math.floor((Date.now() - startedAt) / 1000),
+        timestamp: new Date().toISOString(),
+      });
+    })
+    .catch(() => {
+      res.json({
+        status: "ok",
+        service: "weildbuild-main",
+        version: "1.4.2",
+        hosts: { online: 0, registered: 0 },
+        uptimeSeconds: Math.floor((Date.now() - startedAt) / 1000),
+        timestamp: new Date().toISOString(),
+      });
+    });
 }
 
 // ── Version gate (roadmap 2.5 — client checks on boot) ──
