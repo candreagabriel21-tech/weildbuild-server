@@ -106,7 +106,13 @@ export function flattenGame(row: any): any {
     created: row.created instanceof Date ? row.created.toISOString() : row.created,
     last_update: row.lastUpdate instanceof Date ? row.lastUpdate.toISOString() : row.lastUpdate,
   };
-  return { ...base, ...(row.extraData || {}) };
+  // v1.4 FIX (game renames now stick): the TOP-LEVEL columns always win.
+  // Previously extraData was spread LAST, so a stale `name`/`description`
+  // copy inside the studio-state JSON shadowed the real columns — a rename
+  // never showed up in the lobby or profile. ExtraData may still carry old
+  // copies for legacy rows; they are ignored here and actively purged on
+  // the next update (see updateGameRecord).
+  return { ...(row.extraData || {}), ...base };
 }
 
 export async function getGame(gameId: string) {
@@ -135,6 +141,10 @@ export async function createGameRecord(gameData: any) {
   const { studioState, primitives, spawn_point, sky_color_top, sky_color_bottom,
     baseplate_color, baseplate_size, max_players, public: isPublic,
     multiplayer, ...rest } = gameData;
+
+  // v1.4 FIX: never let top-level columns leak into extraData as stale
+  // copies (the root cause of the rename-shadowing bug).
+  for (const k of ["id", ...GAME_TOP_LEVEL_FIELDS]) delete rest[k];
 
   const row = {
     id,
@@ -171,6 +181,9 @@ export async function updateGameRecord(gameId: string, updates: any) {
 
   const existingRow = await prisma.game.findUnique({ where: { id: gameId }, select: { extraData: true } });
   const newExtraData = { ...((existingRow?.extraData as any) || {}), ...extraDataUpdates };
+  // v1.4 FIX: purge any stale top-level copies from extraData — legacy
+  // games are cleaned up automatically the first time they're updated.
+  for (const k of GAME_TOP_LEVEL_FIELDS) delete newExtraData[k];
 
   try {
     const updated = await prisma.game.update({
@@ -181,6 +194,19 @@ export async function updateGameRecord(gameId: string, updates: any) {
   } catch (e: any) {
     console.error("[db] updateGameRecord error:", e.message);
     return { ...game, ...updates };
+  }
+}
+
+// v1.4: permanently remove a game + any tracked instances of it.
+// (No DB foreign keys between games and game_instances — clean up manually.)
+export async function deleteGameRecord(gameId: string): Promise<boolean> {
+  try {
+    await prisma.gameInstance.deleteMany({ where: { gameId } });
+    await prisma.game.delete({ where: { id: gameId } });
+    return true;
+  } catch (e: any) {
+    console.error("[db] deleteGameRecord error:", e.message);
+    return false;
   }
 }
 

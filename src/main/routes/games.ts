@@ -7,7 +7,7 @@
 import { Router, Request } from "express";
 import { z } from "zod";
 import {
-  getAllGames, getGame, createGameRecord, updateGameRecord,
+  getAllGames, getGame, createGameRecord, updateGameRecord, deleteGameRecord,
 } from "../../db/data";
 import { getUser, sanitizeString } from "../../db/users";
 import { requireRateLimit } from "../../db/ratelimits";
@@ -126,4 +126,41 @@ gamesRouter.put("/", safeHandler(async (req, res) => {
   const game = await updateGameRecord(id, updates);
   if (!game) return res.status(404).json({ error: "Game not found" });
   return res.json(game);
+}));
+
+// DELETE /games?id= — permanently delete a game (v1.4, client v13.9).
+// REQUIRES authentication + ownership or admin — same permission model
+// as PUT (the creator is compared against the SESSION user, never the body).
+gamesRouter.delete("/", safeHandler(async (req, res) => {
+  // Validate origin
+  if (!originOk(req, res)) return;
+
+  // Rate limit
+  const rl = await requireRateLimit("general_api", clientIp(req));
+  if (rl) return res.status(429).json({ error: rl.error, retryAfter: rl.retryAfter });
+
+  // REQUIRE authentication
+  const sessionUser = await requireAuth(req, res);
+  if (!sessionUser) return;
+
+  const id = qp(req, "id");
+  if (!id) return res.status(400).json({ error: "Game ID required" });
+  if (id.includes("..") || id.includes("/") || id.includes("\\")) {
+    return res.status(400).json({ error: "Invalid game ID" });
+  }
+
+  // Verify the game exists + the user is the creator or admin
+  const existingGame = await getGame(id);
+  if (!existingGame) return res.status(404).json({ error: "Game not found" });
+
+  if (existingGame.creator !== sessionUser) {
+    const user = await getUser(sessionUser);
+    if (!user || (user.admin_role !== "admin" && user.admin_role !== "top_admin")) {
+      return res.status(403).json({ error: "You can only delete your own games." });
+    }
+  }
+
+  const ok = await deleteGameRecord(id);
+  if (!ok) return res.status(500).json({ error: "Failed to delete game" });
+  return res.json({ success: true, id });
 }));

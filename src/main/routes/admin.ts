@@ -6,7 +6,9 @@
 import { Router } from "express";
 import { z } from "zod";
 import { prisma } from "../../db/client";
-import { runCleanup, trimUserNotificationArrays } from "../../db/data";
+import { runCleanup, trimUserNotificationArrays, createNotification } from "../../db/data";
+import { getUser, sanitizeString } from "../../db/users";
+import { deleteUserSessions } from "../../db/sessions";
 import { config } from "../../shared/config";
 import { safeHandler, validateBody } from "../../shared/http";
 import { attachUser, requireAdmin, originOk } from "../middleware";
@@ -292,4 +294,121 @@ adminRouter.get("/overview", safeHandler(async (req, res) => {
       timestamp: d.timestamp.toISOString(),
     })),
   });
+}));
+
+// ─────────────────────────────────────────────────────────────
+// v1.4 — PLAYER MODERATION (client v13.9 Admin tab)
+// ban / unban / warn straight from the desktop app's Admin panel.
+// ─────────────────────────────────────────────────────────────
+
+// GET /admin/users?search= — list player accounts for the Admin tab.
+// No search = the 50 most recent accounts; search = substring match on
+// username. Returns exactly the fields AdminView's AdminUserRow expects.
+adminRouter.get("/users", safeHandler(async (req, res) => {
+  const admin = await requireAdmin(req, res);
+  if (!admin) return;
+
+  const rawSearch = typeof req.query.search === "string" ? req.query.search.trim() : "";
+  const search = sanitizeString(rawSearch, 20); // usernames are max 20 chars
+  const where = search
+    ? { username: { contains: search, mode: "insensitive" as const } }
+    : {};
+
+  const rows = await prisma.user.findMany({
+    where,
+    orderBy: { created: "desc" },
+    take: 50,
+    select: {
+      username: true, adminRole: true, banned: true, warnings: true,
+      created: true, lastLogin: true,
+    },
+  });
+
+  return res.json({
+    users: rows.map((r) => ({
+      username: r.username,
+      admin_role: r.adminRole || "none",
+      banned: (r.banned as any) || { is_banned: false, reason: "" },
+      warnings: typeof r.warnings === "number" ? r.warnings : 0,
+      created: r.created instanceof Date ? r.created.toISOString() : r.created,
+      last_login: r.lastLogin instanceof Date ? r.lastLogin.toISOString() : r.lastLogin,
+    })),
+  });
+}));
+
+// POST /admin/moderate — warn | ban | unban a player.
+// Safety rails are enforced HERE (the client hides the buttons, but the
+// server is the real gatekeeper):
+//   • you can never moderate your own account
+//   • only the top admin can moderate other admins
+//   • bans require a reason
+//   • banning kills every active session instantly (mid-session logout)
+const moderateSchema = z.object({
+  action: z.enum(["warn", "ban", "unban"]),
+  username: z.string().min(1).max(20),
+  message: z.string().max(200).optional(), // warn text
+  reason: z.string().max(200).optional(),  // ban reason
+});
+
+adminRouter.post("/moderate", safeHandler(async (req, res) => {
+  const adminName = await requireAdmin(req, res);
+  if (!adminName) return;
+
+  const parsed = validateBody(moderateSchema, req.body, res);
+  if ("error" in parsed) return;
+  const body = parsed.data;
+
+  // Rail 1: never moderate yourself.
+  if (body.username === adminName) {
+    return res.status(400).json({ error: "You cannot moderate your own account." });
+  }
+
+  // Load the target (and the acting admin, for the top_admin rail).
+  const [target, adminUser] = await Promise.all([getUser(body.username), getUser(adminName)]);
+  if (!target) return res.status(404).json({ error: "Player not found." });
+
+  // Rail 2: only the top admin can moderate other admins.
+  if (target.admin_role === "admin" || target.admin_role === "top_admin") {
+    if (adminUser?.admin_role !== "top_admin") {
+      return res.status(403).json({ error: "Only the top admin can moderate other admins." });
+    }
+  }
+
+  // Rail 3: bans require a reason.
+  const reason = (body.reason || "").trim();
+  if (body.action === "ban" && !reason) {
+    return res.status(400).json({ error: "A reason is required to ban a player." });
+  }
+
+  if (body.action === "warn") {
+    const message = (body.message || "").trim() || "You have received a warning from the WeildBuild moderation team.";
+    await prisma.user.update({
+      where: { username: body.username },
+      data: { warnings: { increment: 1 } },
+    });
+    await createNotification(body.username, "warning", message);
+    console.log(`[admin] ${adminName} warned ${body.username}: ${message}`);
+    return res.json({ success: true });
+  }
+
+  if (body.action === "ban") {
+    await prisma.user.update({
+      where: { username: body.username },
+      data: { banned: { is_banned: true, reason } },
+    });
+    // The notification waits for them; the session kill is immediate.
+    await createNotification(body.username, "banned", `Your account was banned. Reason: ${reason}`);
+    await deleteUserSessions(body.username);
+    console.log(`[admin] ${adminName} banned ${body.username}: ${reason}`);
+    return res.json({ success: true });
+  }
+
+  // unban
+  await prisma.user.update({
+    where: { username: body.username },
+    data: { banned: { is_banned: false, reason: "" } },
+  });
+  await createNotification(body.username, "unbanned", "Your account has been unbanned. Welcome back!");
+  console.log(`[admin] ${adminName} unbanned ${body.username}`);
+  return res.json({ success: true });
 }));
