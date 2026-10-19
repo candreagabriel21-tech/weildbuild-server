@@ -39,7 +39,10 @@ export const config = {
 
   // ── Client version gate ──
   client: {
-    latestVersion: process.env.CLIENT_LATEST_VERSION || "1.0.0",
+    // 1.0.1: default latest bumped with the 1.0.1 client (loading screen
+    // fixes, wedge walk-up, zoom-only slider, jump cooldown, admin
+    // account deletion). Overridable live via Admin CTRL / server settings.
+    latestVersion: process.env.CLIENT_LATEST_VERSION || "1.0.1",
     minVersion: process.env.CLIENT_MIN_VERSION || "1.0.0",
     downloadUrl: process.env.CLIENT_DOWNLOAD_URL || "https://weildbuild.vercel.app",
   },

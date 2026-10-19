@@ -120,7 +120,7 @@ const httpServer = createServer((req: IncomingMessage, res: ServerResponse) => {
     res.end(JSON.stringify({
       status: "ok",
       service: "weildbuild-realtime",
-      version: "1.4.3",
+      version: "1.4.4",
       connectedUsers: usernameToSocketId.size,
       activeGames: gameRooms.size,
       uptimeSeconds: Math.floor((Date.now() - realtimeStartedAt) / 1000),

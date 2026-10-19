@@ -334,16 +334,21 @@ const moderateSchema = z.object({
   reason: z.string().max(200).optional(),  // ban: required reason
 });
 
-// POST /admin/moderate — warn / ban / unban a player (v13.9 client Admin tab).
+// POST /admin/moderate — warn / ban / unban / DELETE a player (v13.9 client Admin tab).
 //   warn:   warnings counter +1 and a "warning" notification lands in the
 //           player's inbox (custom message or a default).
 //   ban:    sets banned {is_banned, reason}, notifies, and deletes ALL the
 //           player's sessions so an active login is kicked out instantly.
 //   unban:  clears the ban flag and notifies.
+//   delete: (v1.4.4) PERMANENTLY removes the account and every trace:
+//           sessions, notifications, their games, DMs, chat messages,
+//           rate limits, transaction logs, reports by/about them, and
+//           their name out of everyone's friends/requests/blocked lists
+//           and live game instances. Requires confirm = exact username.
 // Rails (enforced server-side, no exceptions):
-//   • nobody moderates themselves
-//   • only a top_admin may moderate an admin
-//   • a ban ALWAYS needs a reason
+//   • nobody moderates or deletes themselves
+//   • only a top_admin may target an admin
+//   • a ban ALWAYS needs a reason; a delete ALWAYS needs the confirm name
 adminRouter.post("/moderate", safeHandler(async (req, res) => {
   if (!originOk(req, res)) return;
   const admin = await requireAdmin(req, res);
@@ -404,4 +409,81 @@ adminRouter.post("/moderate", safeHandler(async (req, res) => {
   });
   await createNotification(username, "unbanned", `Your account has been unbanned by ${admin}. Welcome back!`, admin);
   return res.json({ success: true, username, banned: { is_banned: false, reason: "" } });
+}));
+
+// ─── v1.4.4: DELETE a user account (full cascade) ───
+// Mounted on the same router as a dedicated route so the moderate schema
+// stays lean; same admin rails as /moderate.
+const deleteSchema = z.object({
+  username: z.string().min(1).max(30),
+  confirm: z.string().min(1).max(30),
+});
+
+adminRouter.post("/delete-user", safeHandler(async (req, res) => {
+  if (!originOk(req, res)) return;
+  const admin = await requireAdmin(req, res);
+  if (!admin) return;
+
+  const parsed = validateBody(deleteSchema, req.body, res);
+  if ("error" in parsed) return;
+  const { username, confirm } = parsed.data;
+
+  if (username === admin) {
+    return res.status(400).json({ error: "You cannot delete your own account." });
+  }
+  if (confirm !== username) {
+    return res.status(400).json({ error: "Confirmation failed - type the player's exact username." });
+  }
+
+  const targetRow = await prisma.user.findUnique({ where: { username } });
+  if (!targetRow) return res.status(404).json({ error: "User not found" });
+
+  // Only top_admin may delete an admin
+  const adminRow = await prisma.user.findUnique({ where: { username: admin } });
+  const targetIsAdmin = targetRow.adminRole === "admin" || targetRow.adminRole === "top_admin";
+  const actorIsTop = adminRow?.adminRole === "top_admin";
+  if (targetIsAdmin && !actorIsTop) {
+    return res.status(403).json({ error: "Only the top admin can delete admin accounts." });
+  }
+
+  // Full cascade - leave no trace of the account anywhere.
+  await deleteUserSessions(username);
+  await prisma.notification.deleteMany({ where: { OR: [{ username }, { fromUser: username }] } });
+  const games = await prisma.game.deleteMany({ where: { creator: username } });
+  await prisma.dm.deleteMany({ where: { OR: [{ from: username }, { to: username }] } });
+  await prisma.message.deleteMany({ where: { sender: username } });
+  await prisma.rateLimit.deleteMany({ where: { identifier: { contains: username } } });
+  await prisma.transactionLog.deleteMany({ where: { username } });
+  await prisma.report.deleteMany({
+    where: { OR: [{ reporter: username }, { AND: [{ targetType: "user" }, { targetId: username }] }] },
+  });
+
+  // Pull the name out of everyone's friends / requests / blocked lists
+  const others = await prisma.user.findMany({
+    where: { OR: [{ friends: { has: username } }, { friendRequests: { has: username } }, { blockedUsers: { has: username } }] },
+  });
+  for (const o of others) {
+    await prisma.user.update({
+      where: { username: o.username },
+      data: {
+        friends: o.friends.filter((f) => f !== username),
+        friendRequests: o.friendRequests.filter((f) => f !== username),
+        blockedUsers: o.blockedUsers.filter((f) => f !== username),
+      },
+    });
+  }
+
+  // Remove from live game instance player lists
+  const instances = await prisma.gameInstance.findMany({ where: { playerNames: { has: username } } });
+  for (const inst of instances) {
+    await prisma.gameInstance.update({
+      where: { id: inst.id },
+      data: { playerNames: inst.playerNames.filter((p) => p !== username) },
+    });
+  }
+
+  // Finally, the account itself
+  await prisma.user.delete({ where: { username } });
+
+  return res.json({ success: true, deleted: username, gamesRemoved: games.count, cleanedFrom: others.length });
 }));

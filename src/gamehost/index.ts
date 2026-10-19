@@ -62,7 +62,7 @@ function healthHandler(_req: express.Request, res: express.Response) {
   res.json({
     status: "ok",
     service: "weildbuild-gamehost",
-    version: "1.4.3",
+    version: "1.4.4",
     hostId: config.host.id,
     label: config.host.label,
     instances: stats.totalInstances,

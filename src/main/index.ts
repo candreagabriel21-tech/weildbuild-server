@@ -53,7 +53,7 @@ function healthHandler(_req: express.Request, res: express.Response) {
       res.json({
         status: "ok",
         service: "weildbuild-main",
-        version: "1.4.3",
+        version: "1.4.4",
         hosts: { online, registered },
         uptimeSeconds: Math.floor((Date.now() - startedAt) / 1000),
         timestamp: new Date().toISOString(),
@@ -63,7 +63,7 @@ function healthHandler(_req: express.Request, res: express.Response) {
       res.json({
         status: "ok",
         service: "weildbuild-main",
-        version: "1.4.3",
+        version: "1.4.4",
         hosts: { online: 0, registered: 0 },
         uptimeSeconds: Math.floor((Date.now() - startedAt) / 1000),
         timestamp: new Date().toISOString(),
