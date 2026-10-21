@@ -38,6 +38,10 @@ model User {
 
   friends          String[] @default([])
   friendRequests   String[] @default([]) @map("friend_requests")
+  // v1.4.5: OUTGOING friend requests (usernames I sent a request TO).
+  // friend_requests above = INCOMING. The old UI conflated the two, so a
+  // request someone sent you could render as if YOU had sent it.
+  sentRequests     String[] @default([]) @map("sent_requests")
   blockedUsers     String[] @default([]) @map("blocked_users")
 
   adminRole      String   @default("none") @map("admin_role") // none | admin | top_admin

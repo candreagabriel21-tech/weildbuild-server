@@ -375,15 +375,25 @@ export async function sendFriendRequest(from: string, to: string) {
   if (from === to) return { error: "Cannot send request to yourself" };
   if ((targetUser.friends || []).includes(from)) return { error: "Already friends" };
 
+  // v1.4.5: sent_requests on the SENDER mirrors friend_requests on the
+  // TARGET, so the client can always tell the two directions apart.
+  const addSentRequest = (user: any) => {
+    if (!user) return;
+    if (!user.sent_requests) user.sent_requests = [];
+    if (!user.sent_requests.includes(to)) user.sent_requests.push(to);
+  };
+
   // Mutual request auto-accept
   if (fromUser && (fromUser.friend_requests || []).includes(to)) {
     if (!fromUser.friends.includes(to)) fromUser.friends = [...(fromUser.friends || []), to];
     fromUser.friend_requests = (fromUser.friend_requests || []).filter((f: string) => f !== to);
+    fromUser.sent_requests = (fromUser.sent_requests || []).filter((f: string) => f !== to);
     fromUser.notifications = [...(fromUser.notifications || []), `You are now friends with ${to}!`];
     await saveUser(from, fromUser);
 
     if (!targetUser.friends.includes(from)) targetUser.friends = [...(targetUser.friends || []), from];
     targetUser.friend_requests = (targetUser.friend_requests || []).filter((f: string) => f !== from);
+    targetUser.sent_requests = (targetUser.sent_requests || []).filter((f: string) => f !== from);
     targetUser.notifications = [...(targetUser.notifications || []), `${from} accepted your friend request!`];
     await saveUser(to, targetUser);
 
@@ -396,6 +406,10 @@ export async function sendFriendRequest(from: string, to: string) {
   targetUser.friend_requests = [...(targetUser.friend_requests || []), from];
   targetUser.notifications = [...(targetUser.notifications || []), `${from} sent you a friend request!`];
   await saveUser(to, targetUser);
+  if (fromUser) {
+    addSentRequest(fromUser);
+    await saveUser(from, fromUser);
+  }
   await createNotification(to, "friend_request", `${from} sent you a friend request!`, from);
   return { success: true };
 }
@@ -411,6 +425,8 @@ export async function acceptFriendRequest(username: string, friend: string) {
   await saveUser(username, user);
 
   if (!friendUser.friends.includes(username)) friendUser.friends = [...(friendUser.friends || []), username];
+  // v1.4.5: the request is settled - clear it from the sender's outgoing list
+  friendUser.sent_requests = (friendUser.sent_requests || []).filter((f: string) => f !== username);
   friendUser.notifications = [...(friendUser.notifications || []), `${username} accepted your friend request!`];
   await saveUser(friend, friendUser);
   await createNotification(username, "friend_accepted", `You are now friends with ${friend}!`, friend);
@@ -424,6 +440,13 @@ export async function declineFriendRequest(username: string, friend: string) {
   if (!user) return { error: "User not found" };
   user.friend_requests = (user.friend_requests || []).filter((f: string) => f !== friend);
   await saveUser(username, user);
+  // v1.4.5: the DECLINED sender's outgoing list must be cleaned too,
+  // otherwise their client keeps showing a request they can never cancel.
+  const senderUser = await getUser(friend);
+  if (senderUser) {
+    senderUser.sent_requests = (senderUser.sent_requests || []).filter((f: string) => f !== username);
+    await saveUser(friend, senderUser);
+  }
   return { success: true };
 }
 
@@ -433,6 +456,12 @@ export async function cancelFriendRequest(from: string, to: string) {
   if (!targetUser) return { error: "User not found" };
   targetUser.friend_requests = (targetUser.friend_requests || []).filter((f: string) => f !== from);
   await saveUser(to, targetUser);
+  // v1.4.5: also clear the sender's own outgoing list
+  const fromUser = await getUser(from);
+  if (fromUser) {
+    fromUser.sent_requests = (fromUser.sent_requests || []).filter((f: string) => f !== to);
+    await saveUser(from, fromUser);
+  }
   return { success: true };
 }
 

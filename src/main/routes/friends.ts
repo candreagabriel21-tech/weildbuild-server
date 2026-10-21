@@ -91,6 +91,10 @@ friendsRouter.get("/", safeHandler(async (req, res) => {
     return res.json({
       friends: safe.friends || [],
       friend_requests: safe.friend_requests || [],
+      // v1.4.5: outgoing requests so the client can separate Incoming vs
+      // Sent (the old API only exposed friend_requests, and the UI treated
+      // a received request as one YOU sent).
+      sent_requests: safe.sent_requests || [],
     });
   }
 
@@ -131,7 +135,10 @@ friendsRouter.post("/", safeHandler(async (req, res) => {
       }
       const result = await cancelFriendRequest(body.from, body.to);
       if (result.error) return res.status(400).json(result);
-      return res.json({ success: true });
+      // v1.4.5: return the refreshed user so the client's Sent list updates
+      // immediately (it used to keep the cancelled entry until reload).
+      const user = await getUser(body.from);
+      return res.json({ success: true, user: stripSensitiveFields(user) });
     }
 
     case "accept": {
@@ -175,10 +182,13 @@ friendsRouter.post("/", safeHandler(async (req, res) => {
       if (!user.blocked_users.includes(body.target)) user.blocked_users.push(body.target);
       user.friends = (user.friends || []).filter((f: string) => f !== body.target);
       user.friend_requests = (user.friend_requests || []).filter((f: string) => f !== body.target);
+      // v1.4.5: also drop any OUTGOING request toward the blocked user
+      user.sent_requests = (user.sent_requests || []).filter((f: string) => f !== body.target);
       await saveUser(body.username, user);
       if (targetUser) {
         targetUser.friends = (targetUser.friends || []).filter((f: string) => f !== body.username);
         targetUser.friend_requests = (targetUser.friend_requests || []).filter((f: string) => f !== body.username);
+        targetUser.sent_requests = (targetUser.sent_requests || []).filter((f: string) => f !== body.username);
         await saveUser(body.target, targetUser);
       }
       return res.json({ success: true, user: stripSensitiveFields(user) });

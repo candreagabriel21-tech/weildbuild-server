@@ -389,12 +389,29 @@ io.on("connection", (socket) => {
     );
   });
 
-  // ── game:move { instanceId, position, rotation } ──
+  // ── game:move { instanceId, position, rotation, anim? } ──
+  // v1.4.5: the payload now optionally carries the player's body-animation
+  // state (walking/jumping/dying/sprint). It is validated to a small
+  // boolean record and relayed to the room so OTHER players see the same
+  // walk swing, jump pose and death explosion as the local player.
   socket.on("game:move", (payload: unknown) => {
     const p = asRecord(payload);
     if (!Array.isArray(p.position) || !Array.isArray(p.rotation)) return;
     const position = p.position as number[];
     const rotation = p.rotation as number[];
+
+    // Sanitize the anim flags (booleans only, known keys only)
+    let anim: import("./instances").PlayerAnimState | undefined;
+    const rawAnim = p.anim;
+    if (rawAnim && typeof rawAnim === "object" && !Array.isArray(rawAnim)) {
+      const r = rawAnim as Record<string, unknown>;
+      const cleaned: import("./instances").PlayerAnimState = {};
+      if (typeof r.walking === "boolean") cleaned.walking = r.walking;
+      if (typeof r.jumping === "boolean") cleaned.jumping = r.jumping;
+      if (typeof r.dying === "boolean") cleaned.dying = r.dying;
+      if (typeof r.sprint === "boolean") cleaned.sprint = r.sprint;
+      if (Object.keys(cleaned).length > 0) anim = cleaned;
+    }
 
     const instance = resolvePlayerInstance(socket.id, p.instanceId);
     if (!instance) return;
@@ -403,12 +420,14 @@ io.on("connection", (socket) => {
 
     player.position = position;
     player.rotation = rotation;
+    if (anim) player.anim = anim;
     // Broadcast to everyone else in the room (sender already moved locally).
     socket.to(`instance:${instance.id}`).emit("game:playerMoved", {
       socketId: socket.id,
       username: player.username,
       position,
       rotation,
+      anim: player.anim,
     });
   });
 

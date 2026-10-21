@@ -13,6 +13,14 @@ import { config } from "../shared/config";
 
 // ─────────────────── Types ───────────────────
 
+/** Broadcast body-animation state (v1.4.5 multiplayer sync). */
+export interface PlayerAnimState {
+  walking?: boolean;
+  jumping?: boolean;
+  dying?: boolean;
+  sprint?: boolean;
+}
+
 /** A player inside an instance (state shape matches the old socket server). */
 export interface GamePlayer {
   socketId: string;
@@ -20,6 +28,9 @@ export interface GamePlayer {
   avatar: unknown;
   position: number[];
   rotation: number[];
+  /** v1.4.5: last broadcast walk/jump/dying/sprint flags (optional - older
+   *  clients never send it, older clients ignore it). */
+  anim?: PlayerAnimState;
 }
 
 /** One running game instance ("mini server"). */
@@ -109,6 +120,7 @@ export class GameInstanceManager {
       avatar: p.avatar,
       position: [...p.position],
       rotation: [...p.rotation],
+      anim: p.anim ? { ...p.anim } : undefined,
     }));
   }
 
