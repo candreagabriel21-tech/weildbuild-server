@@ -18,7 +18,7 @@
 import express from "express";
 import { createServer } from "http";
 import { Server, Socket } from "socket.io";
-import { config, assertSecrets } from "../shared/config";
+import { config, assertSecrets, SERVER_VERSION } from "../shared/config";
 import { verifyTicket } from "../shared/jwt";
 import { corsOrigin } from "../shared/http";
 import { GameInstanceManager, GameInstance } from "./instances";
@@ -62,7 +62,7 @@ function healthHandler(_req: express.Request, res: express.Response) {
   res.json({
     status: "ok",
     service: "weildbuild-gamehost",
-    version: "1.4.4",
+    version: SERVER_VERSION,
     hostId: config.host.id,
     label: config.host.label,
     instances: stats.totalInstances,

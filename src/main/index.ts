@@ -9,7 +9,7 @@
 
 import express from "express";
 import cors from "cors";
-import { config, assertSecrets } from "../shared/config";
+import { config, assertSecrets, SERVER_VERSION } from "../shared/config";
 import { corsOrigin } from "../shared/http";
 import { authRouter } from "./routes/auth";
 import { usersRouter } from "./routes/users";
@@ -53,7 +53,7 @@ function healthHandler(_req: express.Request, res: express.Response) {
       res.json({
         status: "ok",
         service: "weildbuild-main",
-        version: "1.4.4",
+        version: SERVER_VERSION,
         hosts: { online, registered },
         uptimeSeconds: Math.floor((Date.now() - startedAt) / 1000),
         timestamp: new Date().toISOString(),
@@ -63,7 +63,7 @@ function healthHandler(_req: express.Request, res: express.Response) {
       res.json({
         status: "ok",
         service: "weildbuild-main",
-        version: "1.4.4",
+        version: SERVER_VERSION,
         hosts: { online: 0, registered: 0 },
         uptimeSeconds: Math.floor((Date.now() - startedAt) / 1000),
         timestamp: new Date().toISOString(),

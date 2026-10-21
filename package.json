@@ -1,9 +1,9 @@
 {
   "name": "weildbuild-server",
-  "version": "1.4.5",
+  "version": "1.4.6",
   "private": true,
-  "description": "WeildBuild platform servers: Main Server (REST API + orchestration), Realtime (presence/chat), Game Host (game instances). Deploys to Render, database on Neon. v1.4.5 fixes the friend system (new sent_requests column separates incoming vs outgoing requests, cancel/decline clean both sides) and relays per-player body-animation state (walk/jump/die/sprint) through game:move so multiplayer characters animate identically for everyone.",
-  "//": "BUILD FIX v1.2.0: prisma, typescript, tsx and @types/* live in dependencies ON PURPOSE. Render builds run with NODE_ENV=production, and npm silently skips devDependencies in that mode \u2014 that is what broke the v1.1 deploy (TS7016: no declaration file for 'express'). Do NOT move them back to devDependencies.",
+  "description": "WeildBuild platform servers: Main Server (REST API + orchestration), Realtime (presence/chat), Game Host (game instances). Deploys to Render, database on Neon. v1.4.6: honest /health versions (single source of truth), shop item description updates (FACE-1 Smile Face + FACE-15 Looking Up de-duplicated), and server-side validation of the new studio-generated side-view game thumbnails.",
+  "//": "BUILD FIX v1.2.0: prisma, typescript, tsx and @types/* live in dependencies ON PURPOSE. Render builds run with NODE_ENV=production, and npm silently skips devDependencies in that mode — that is what broke the v1.1 deploy (TS7016: no declaration file for 'express'). Do NOT move them back to devDependencies.",
   "engines": {
     "node": ">=18.0.0"
   },

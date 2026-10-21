@@ -1,46 +1,62 @@
-# WeildBuild Server v1.4.5 - Upgrade Notes
+# WeildBuild Server v1.4.6 - Upgrade Notes
 
-Deploy this over the current v1.4.4 exactly like a normal Render deploy
+Deploy this over the current v1.4.5 exactly like a normal Render deploy
 (same env vars, same services: Main, Realtime, Game Host).
 
-## ONE required step after deploying: run the migration
+## TWO steps after deploying
 
-The new version adds a `sent_requests` column to the users table (it tracks
-OUTGOING friend requests so the client can tell incoming and outgoing
-apart). The column is additive with a default - no data changes, no
-downtime. Run once from the server repo:
+**1. Migration** - no NEW columns this time (the `sent_requests` column
+from v1.4.5 is unchanged), but running it is harmless and confirms the
+schema is current:
 
 ```bash
 npm install
-npm run migrate     # prisma db push - adds the sent_requests column
+npm run migrate     # prisma db push - no-op if already current
 ```
 
-If your deploy pipeline already runs `prisma migrate deploy` / `db push`,
-it's covered automatically. The server works without the column too (it
-just writes nothing), but friend-request direction in the clients only
-fully works once the column exists.
+**2. Seed** - REQUIRED to apply the updated shop item descriptions
+(Smile Face FACE-1's new text + the fixed Looking Up FACE-15 duplicate).
+The seed is idempotent (safe to re-run, upserts only):
 
-## What changed (v1.4.5)
+```bash
+npm run seed
+```
 
-1. **Friend system direction fix**
-   - `sendFriendRequest` maintains `sent_requests` on the sender (mirrors
-     `friend_requests` on the target) in every path: normal send, mutual
-     auto-accept, cancel, decline, accept, block.
-   - `GET /friends?username=` now also returns `sent_requests`.
-   - `POST /friends action=cancel` now returns the refreshed user, so the
-     client's Sent list updates immediately.
-   - The user API shape gains `sent_requests` (defaults to `[]` on old rows).
+## What changed (v1.4.6)
 
-2. **Multiplayer body-animation relay**
-   - `game:move` accepts an optional `anim` record (walking / jumping /
-     dying / sprint booleans), sanitizes it, stores it on the player and
-     relays it in `game:playerMoved` and `game:players`.
-   - Purely additive: older clients that don't send `anim` keep working;
-     newer clients fall back to the old inference when it's absent.
+1. **Honest /health versions**
+   - All three services used to hardcode `"version": "1.4.4"` in their
+     health endpoints - after the v1.4.5 deploy they STILL reported
+     1.4.4, which looked exactly like a failed deploy. The version now
+     comes from package.json (single source of truth). After deploying,
+     `curl https://<each-service>.onrender.com/health` should say
+     `"version":"1.4.6"` on Main, Realtime AND both Game Hosts - that's
+     your deploy verification.
+
+2. **Shop item description updates (seed data)**
+   - FACE-1 "Smile Face": "Every WeildBuilder starts with this friendly
+     face. It's a WeildBuild classic!"
+   - FACE-15 "Looking Up": "Keep your eyes on the skies!" (was an
+     accidental copy of Calm Face's description)
+   - Applied by `npm run seed` (see above).
+
+3. **Game thumbnail validation**
+   - The studio now attaches a side-view photo (JPEG data URL) to games
+     on save/publish. The server validates it (must be a small
+     image data URL, capped at ~220KB) before storing it in
+     extra_data - it can't be abused as an arbitrary blob store.
 
 ## Compatibility
 
-- Clients 1.0.0+ use the new fields; older shipped clients (1.0.x) ignore
-  them - no forced update needed.
-- Database: one additive column (`users.sent_requests`).
+- Client 1.0.0 (dev folder r2 zip) uses the thumbnail; older clients
+  ignore it - no forced update needed.
+- No database schema changes beyond what v1.4.5 already added.
 - No changes to env vars, URLs, or the Render service layout.
+
+## Note on the friend system ("can't add, block or unfriend")
+
+The server was never broken - production testing showed every friend
+endpoint working. The bug was a client-side **ghost login** (expired
+session + cached profile = UI that LOOKS logged in while every write
+fails). Fixed in the client (dev folder r2). If you ever see it again
+on an old client: log out and back in, and the buttons work again.

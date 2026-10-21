@@ -6,6 +6,15 @@ import dotenv from "dotenv";
 // Load .env for local dev (Render injects env vars directly)
 dotenv.config();
 
+// v1.4.6: SINGLE source of truth for the version every /health endpoint
+// reports. The health handlers used to hardcode "1.4.4" and kept lying
+// after package.json was bumped to 1.4.5 - a fully deployed production
+// server still LOOKED like the old version (a very confusing debugging
+// session). Runtime require (not import) because package.json lives
+// outside tsc's rootDir.
+const pkg = require("../../package.json") as { version: string };
+export const SERVER_VERSION: string = pkg.version || "0.0.0";
+
 export const config = {
   // ── Ports (Render assigns PORT; these are local-dev defaults) ──
   mainPort: parseInt(process.env.PORT || "8000", 10),

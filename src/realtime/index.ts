@@ -28,7 +28,7 @@
 
 import { createServer, IncomingMessage, ServerResponse } from "http";
 import { Server, Socket } from "socket.io";
-import { config, assertSecrets } from "../shared/config";
+import { config, assertSecrets, SERVER_VERSION } from "../shared/config";
 import { isAllowedOrigin } from "../shared/http";
 import { verifyTicket } from "../shared/jwt";
 
@@ -120,7 +120,7 @@ const httpServer = createServer((req: IncomingMessage, res: ServerResponse) => {
     res.end(JSON.stringify({
       status: "ok",
       service: "weildbuild-realtime",
-      version: "1.4.4",
+      version: SERVER_VERSION,
       connectedUsers: usernameToSocketId.size,
       activeGames: gameRooms.size,
       uptimeSeconds: Math.floor((Date.now() - realtimeStartedAt) / 1000),

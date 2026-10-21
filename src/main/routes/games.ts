@@ -30,6 +30,19 @@ const updateGameSchema = z.object({
   description: z.string().max(200).optional(),
 }).passthrough();
 
+/** 1.4.6: validate + cap the auto-generated side-view thumbnail (a JPEG
+ * data URL produced by the studio when a game is saved). Rejects anything
+ * that isn't a small image data URL so extra_data can't be abused as a
+ * arbitrary blob store. */
+const THUMBNAIL_MAX_CHARS = 300_000; // ~220KB JPEG at base64
+function sanitizeThumbnail(value: unknown): string | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (typeof value !== "string") return undefined;
+  if (!/^data:image\/(jpeg|png);base64,/.test(value)) return undefined;
+  if (value.length > THUMBNAIL_MAX_CHARS) return undefined;
+  return value;
+}
+
 /** Read a single string query param (empty string counts as absent). */
 function qp(req: Request, name: string): string | null {
   const v = req.query[name];
@@ -72,6 +85,9 @@ gamesRouter.post("/", safeHandler(async (req, res) => {
   const gameData: any = { ...body };
   if (gameData.name) gameData.name = sanitizeString(gameData.name, 50);
   if (gameData.description) gameData.description = sanitizeString(gameData.description, 200);
+  // 1.4.6: side-view thumbnail (studio-generated) - validate or drop
+  const thumb = sanitizeThumbnail(gameData.thumbnail);
+  if (thumb) gameData.thumbnail = thumb; else delete gameData.thumbnail;
 
   // CRITICAL: Creator is ALWAYS from the session, NEVER from request body
   // The server decides who created the game, not the client
@@ -119,6 +135,9 @@ gamesRouter.put("/", safeHandler(async (req, res) => {
   // Sanitize updates
   if (updates.name) updates.name = sanitizeString(updates.name, 50);
   if (updates.description) updates.description = sanitizeString(updates.description, 200);
+  // 1.4.6: side-view thumbnail (studio-generated) - validate or drop
+  const thumbUpd = sanitizeThumbnail(updates.thumbnail);
+  if (thumbUpd) updates.thumbnail = thumbUpd; else delete updates.thumbnail;
 
   // Never allow changing the creator through an update
   delete updates.creator;
