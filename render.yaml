@@ -48,11 +48,17 @@ services:
         sync: false
       - key: AUTH_SECRET           # same 96-hex-char value on EVERY service
         sync: false
-      - key: INTERNAL_TOKEN        # same value on main + both game hosts
+      - key: INTERNAL_TOKEN        # same value on main + realtime + both game hosts
         sync: false
       - key: B2_KEY_ID             # Backblaze application key ID
         sync: false
       - key: B2_APPLICATION_KEY    # Backblaze application key
+        sync: false
+      # ── v1.4.7: where Main pushes instant warn/ban events ──
+      # Set this to your REALTIME service's public URL (e.g. https://weildbuild-realtime.onrender.com).
+      # Without it, moderation still works — players just see the pop-up on
+      # their next login instead of the instant push.
+      - key: REALTIME_SERVER_URL
         sync: false
       # ── B2 buckets (four storage categories) ──
       - key: B2_ENDPOINT

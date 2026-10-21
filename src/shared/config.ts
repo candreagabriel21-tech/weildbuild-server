@@ -68,6 +68,11 @@ export const config = {
     emptyGraceMs: parseInt(process.env.EMPTY_GRACE_MS || "20000", 10),
     heartbeatIntervalMs: parseInt(process.env.HEARTBEAT_INTERVAL_MS || "15000", 10),
   },
+
+  // ── Realtime (v1.4.7: Main pushes moderation events to Realtime so a
+  //    warn/ban reaches the player's open socket INSTANTLY — the client
+  //    shows the pop-up the moment it happens, no polling delay) ──
+  realtimeUrl: (process.env.REALTIME_SERVER_URL || "http://localhost:3003").replace(/\/$/, ""),
 };
 
 export function assertSecrets(serviceName: string): void {

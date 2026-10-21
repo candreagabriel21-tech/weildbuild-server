@@ -128,6 +128,76 @@ const httpServer = createServer((req: IncomingMessage, res: ServerResponse) => {
     }));
     return;
   }
+
+  // ─── v1.4.7: Main → Realtime moderation push ───
+  // The Main Server calls this the INSTANT an admin warns/bans a player,
+  // so the pop-up lands on the player's screen with zero polling delay.
+  // Auth: the shared INTERNAL_TOKEN header (same scheme Main ↔ game hosts
+  // already use — never exposed to clients).
+  if (req.url === "/internal/moderation" && req.method === "POST") {
+    const token = req.headers["x-internal-token"];
+    if (!config.internalToken || token !== config.internalToken) {
+      res.writeHead(403, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Forbidden" }));
+      return;
+    }
+    let body = "";
+    req.on("data", (chunk) => { body += chunk; if (body.length > 4096) req.destroy(); });
+    req.on("end", () => {
+      let delivered = false;
+      try {
+        const { action, username, message, reason, from } = JSON.parse(body || "{}");
+        if (typeof username === "string" && username) {
+          if (action === "warn") {
+            const sid = usernameToSocketId.get(username);
+            if (sid) {
+              io.to(sid).emit("moderation:warning", {
+                message: typeof message === "string" ? message : "You have received a warning from the WeildBuild team.",
+                from: typeof from === "string" ? from : "WeildBuild Team",
+              });
+              delivered = true;
+              console.log(`[moderation] warning pushed to ${username}`);
+            }
+          } else if (action === "ban") {
+            // Deliver the ban event to EVERY socket of that user (multiple
+            // tabs), then force-disconnect them all — a banned player is
+            // off the platform immediately.
+            const targets: string[] = [];
+            for (const [sid, name] of socketIdToUsername.entries()) {
+              if (name === username) targets.push(sid);
+            }
+            for (const sid of targets) {
+              io.to(sid).emit("moderation:banned", {
+                reason: typeof reason === "string" && reason ? reason : "No reason given",
+              });
+            }
+            delivered = targets.length > 0;
+            if (delivered) console.log(`[moderation] ban pushed to ${username} (${targets.length} socket(s))`);
+            // Disconnect after a beat so the event flushes through the
+            // websocket before the door closes.
+            setTimeout(() => {
+              for (const sid of targets) {
+                const s = io.sockets.sockets.get(sid);
+                if (s) s.disconnect(true);
+              }
+            }, 500);
+          }
+          // "unban": the player was disconnected at ban time and their
+          // sessions are gone — there is nobody online to notify. Their
+          // next login simply works again. Nothing to do here.
+        }
+      } catch {
+        // Malformed body — answer 400 below.
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Bad request" }));
+        return;
+      }
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ ok: true, delivered }));
+    });
+    return;
+  }
+
   res.writeHead(404);
   res.end("Not found");
 });

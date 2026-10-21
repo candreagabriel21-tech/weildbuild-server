@@ -17,6 +17,34 @@ import { deleteUserSessions } from "../../db/sessions";
 
 export const adminRouter = Router();
 
+// ─── v1.4.7: instant moderation push ───
+// After a warn/ban lands in the database, tell the Realtime server so the
+// player's OPEN app gets the pop-up immediately (no polling delay). Fire
+// and forget: a Realtime hiccup must never fail the moderation action
+// itself — the notification inbox + session kick still happened.
+function pushModerationToRealtime(payload: {
+  action: "warn" | "ban" | "unban";
+  username: string;
+  message?: string;
+  reason?: string;
+  from?: string;
+}): void {
+  if (!config.internalToken) return; // push disabled — client falls back to login-time detection
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 4000);
+  fetch(`${config.realtimeUrl}/internal/moderation`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "x-internal-token": config.internalToken },
+    body: JSON.stringify(payload),
+    signal: controller.signal,
+  })
+    .then(async (res) => {
+      if (!res.ok) console.warn(`[moderate] realtime push rejected (HTTP ${res.status})`);
+    })
+    .catch(() => { /* realtime asleep/unreachable — non-fatal by design */ })
+    .finally(() => clearTimeout(timer));
+}
+
 // Attach req.authUser (session identity) for every request
 adminRouter.use(attachUser);
 
@@ -376,11 +404,10 @@ adminRouter.post("/moderate", safeHandler(async (req, res) => {
   if (action === "warn") {
     const count = (targetRow.warnings || 0) + 1;
     await prisma.user.update({ where: { username }, data: { warnings: count } });
-    await createNotification(
-      username, "warning",
-      message || `You have received a warning from ${admin} (warning #${count}).`,
-      admin,
-    );
+    const warnText = message || `You have received a warning from ${admin} (warning #${count}).`;
+    await createNotification(username, "warning", warnText, admin);
+    // v1.4.7: pop the warning on the player's screen RIGHT NOW if online.
+    pushModerationToRealtime({ action: "warn", username, message: warnText, from: admin });
     return res.json({ success: true, username, warnings: count });
   }
 
@@ -399,6 +426,9 @@ adminRouter.post("/moderate", safeHandler(async (req, res) => {
     );
     // Kick every active session — a banned player is logged out mid-game.
     await deleteUserSessions(username);
+    // v1.4.7: deliver the ban pop-up to any OPEN app instantly, then the
+    // Realtime server force-disconnects their sockets.
+    pushModerationToRealtime({ action: "ban", username, reason: reason.trim(), from: admin });
     return res.json({ success: true, username, banned: { is_banned: true, reason: reason.trim() } });
   }
 
