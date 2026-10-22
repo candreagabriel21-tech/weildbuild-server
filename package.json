@@ -1,8 +1,8 @@
 {
   "name": "weildbuild-server",
-  "version": "1.4.7",
+  "version": "1.4.8",
   "private": true,
-  "description": "WeildBuild platform servers: Main Server (REST API + orchestration), Realtime (presence/chat), Game Host (game instances). Deploys to Render, database on Neon. v1.4.7: instant moderation - warns and bans are pushed to the Realtime server the moment an admin acts, so online players get the pop-up immediately and banned sockets are force-disconnected.",
+  "description": "WeildBuild platform servers: Main Server (REST API + orchestration), Realtime (presence/chat), Game Host (game instances). Deploys to Render, database on Neon. v1.4.8: Vercel web app support - any https://*.vercel.app origin is now allowed (CORS + origin validation), so the browser version can talk to the API. Same trust model as localhost: the SameSite=Lax session cookie is never sent cross-site, and cross-origin clients authenticate with the X-Session-Token header.",
   "//": "BUILD FIX v1.2.0: prisma, typescript, tsx and @types/* live in dependencies ON PURPOSE. Render builds run with NODE_ENV=production, and npm silently skips devDependencies in that mode — that is what broke the v1.1 deploy (TS7016: no declaration file for 'express'). Do NOT move them back to devDependencies.",
   "engines": {
     "node": ">=18.0.0"
