@@ -1,13 +1,17 @@
-# WeildBuild Server v1.4.8 - Upgrade Notes
+# WeildBuild Server v1.8.0 - Upgrade Notes
 
 Deploy this over the current v1.4.7 exactly like a normal Render deploy
 (same env vars, same services: Main, Realtime, Game Host). **No new env
 vars, no migration, no seed** - just deploy.
 
+**Version note:** v1.8.0 is the same code that was staged as v1.4.8,
+renumbered for the final release - the version jump from 1.4.x to 1.8.0
+is a renumber, not a bigger change. Everything below still applies as-is.
+
 If you are coming from v1.4.6 or older, read the v1.4.7 section at the
 bottom first (ONE env var on Main: `REALTIME_SERVER_URL`).
 
-## What changed (v1.4.8)
+## What changed (v1.8.0)
 
 **The web app is allowed in.** Any `https://*.vercel.app` origin (plus
 `*.vercel.dev` previews) now passes CORS and the mutating-request origin
@@ -26,8 +30,8 @@ accounts, games, chat, multiplayer, everything.
 
 ## Client that goes with it
 
-`WeildBuild-dev-1.0.0-r5.zip` (also the Vercel web app source). Its new
-features:
+`WeildBuild-dev-1.0.0-r7.zip` (also the Vercel web app source). Its
+features since the r4 exe/apk build:
 
 - Tiny in-app notification pop-ups + OS-level desktop notifications for
   new DMs / friend events (works on any server; the socket push is
@@ -35,18 +39,21 @@ features:
 - Session heartbeat: bans/sign-outs detected within ~20s WITHOUT a
   refresh. On v1.4.7+ servers bans also arrive instantly via the
   realtime push; on older servers the heartbeat is the fallback path.
-- The character edge-of-block physics fix and the icon fixes (client
-  side only).
+- Admin chat commands (`/warn`, `/ban`, `/show char-hitbox`), the red
+  admin Commands button, quick warn/ban buttons in the players list,
+  0.5s jump cooldown, and the pill/capsule character hitbox (the
+  edge-of-block fix) - all client side, work on any recent server.
+- The icon fixes (client side only).
 
 The client works fine against v1.4.7 servers too (minus the web-app
 origins) - but the Vercel site needs THIS version.
 
 ## Deploy checklist
 
-1. Deploy **all three services** from `weildbuild-server-v1.4.8.zip`
+1. Deploy **all three services** from `weildbuild-server-v1.8.0.zip`
    (they share the codebase; Main + Realtime are the ones that matter).
 2. Confirm `https://<your-site>.vercel.app` loads and can log in.
-3. Done.
+3. Done. (`/health` on each service now reports `"version": "1.8.0"`.)
 
 ---
 

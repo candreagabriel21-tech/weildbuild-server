@@ -61,8 +61,9 @@ export function corsOrigin(origin: string | undefined, callback: (err: Error | n
  * Localhost is the machine itself, so this is safe to allow broadly.
  * Production origins still come from ALLOWED_ORIGINS.
  *
- * v1.4.8: any https://*.vercel.app (and *.vercel.dev) origin is allowed —
- * the official web app runs on Vercel (plus its deploy previews). This is
+ * v1.8.0 (renumbered from the staged v1.4.8): any https://*.vercel.app
+ * (and *.vercel.dev) origin is allowed — the official web app runs on
+ * Vercel (plus its deploy previews). This is
  * the same trust level as localhost above: the session cookie is
  * SameSite=Lax (never sent cross-site by browsers), so a page on another
  * origin cannot authenticate as anyone — cross-origin clients log in and
@@ -76,7 +77,7 @@ export function isAllowedOrigin(origin: string): boolean {
   if (/^(tauri|https?):\/\/(tauri\.)?localhost(:\d+)?$/i.test(clean)) return true;
   // Allow any Render URL (server-to-server between our own services)
   if (/^https:\/\/[a-z0-9-]+\.onrender\.com$/i.test(clean)) return true;
-  // v1.4.8: the Vercel-hosted web app + its deploy previews
+  // v1.8.0: the Vercel-hosted web app + its deploy previews
   if (/^https:\/\/[a-z0-9-]+\.vercel\.(app|dev)$/i.test(clean)) return true;
   return false;
 }
