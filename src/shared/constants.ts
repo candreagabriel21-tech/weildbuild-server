@@ -38,7 +38,7 @@ export const STORAGE_PUBLIC_PREFIXES = ["items/", "assets/"];
 /** Fields users may update on their own profile. */
 export const ALLOWED_USER_UPDATES = [
   "avatar", "description", "profile_visible", "notify_friends",
-  "notify_purchases", "notify_games", "visual_settings", "language",
+  "notify_purchases", "notify_games", "notify_toasts", "visual_settings", "language",
 ];
 
 /** Fields only admins may modify. */

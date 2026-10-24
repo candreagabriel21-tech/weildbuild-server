@@ -51,6 +51,11 @@ model User {
   notifyFriends    Boolean @default(true) @map("notify_friends")
   notifyPurchases  Boolean @default(true) @map("notify_purchases")
   notifyGames      Boolean @default(true) @map("notify_games")
+  // v1.9.0: master switch for the small pop-up toasts (the client's
+  // "Toast Messages" setting). notify_purchases is kept for old clients
+  // but is no longer shown in the new UI (purchases never created
+  // notifications anyway - the toggle was dead).
+  notifyToasts     Boolean @default(true) @map("notify_toasts")
 
   notifications  String[] @default([])
   visualSettings Json     @default("{\"dark_mode\":true,\"ui_scale\":1,\"animations\":true,\"reduce_motion\":false}") @map("visual_settings")
@@ -108,6 +113,9 @@ model Notification {
   id        String   @id
   username  String
   type      String   @default("")
+  // v1.9.0: optional headline (announcements show it as the letter's
+  // subject). Empty string on every older notification.
+  title     String   @default("")
   message   String   @default("")
   fromUser  String   @default("") @map("from_user")
   read      Boolean  @default(false)

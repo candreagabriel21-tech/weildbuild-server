@@ -198,6 +198,57 @@ const httpServer = createServer((req: IncomingMessage, res: ServerResponse) => {
     return;
   }
 
+  // ─── v1.9.0: Main → Realtime announcement push ───
+  // The top admin sends a "WeildBuild Update" letter via Main; Main saves
+  // the inbox copies and then calls this so ONLINE players get the small
+  // toast (and the clickable letter) instantly. Auth: the shared
+  // INTERNAL_TOKEN header, exactly like /internal/moderation.
+  if (req.url === "/internal/announcement" && req.method === "POST") {
+    const token = req.headers["x-internal-token"];
+    if (!config.internalToken || token !== config.internalToken) {
+      res.writeHead(403, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Forbidden" }));
+      return;
+    }
+    let body = "";
+    req.on("data", (chunk: Buffer) => { body += chunk; if (body.length > 100_000) req.destroy(); });
+    req.on("end", () => {
+      let delivered = 0;
+      try {
+        const { usernames, title, message, from } = JSON.parse(body || "{}");
+        const letterTitle = typeof title === "string" && title ? title : "WeildBuild Update";
+        const letterMessage = typeof message === "string" ? message : "";
+        const letterFrom = typeof from === "string" && from ? from : "WeildBuild Team";
+        if (letterMessage && (usernames === "all" || Array.isArray(usernames))) {
+          const payload = { title: letterTitle, message: letterMessage, from: letterFrom };
+          if (usernames === "all") {
+            // Every connected socket (io.emit reaches all authenticated clients)
+            delivered = io.sockets.sockets.size;
+            io.emit("announcement:new", payload);
+          } else {
+            // Every socket of the listed usernames (a user may have several tabs)
+            const wanted = new Set(usernames as string[]);
+            for (const [sid, name] of socketIdToUsername.entries()) {
+              if (wanted.has(name)) {
+                io.to(sid).emit("announcement:new", payload);
+                delivered++;
+              }
+            }
+          }
+          console.log(`[announcement] "${letterTitle}" pushed to ${delivered} socket(s)` +
+            (usernames === "all" ? " (broadcast)" : ""));
+        }
+      } catch {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Bad request" }));
+        return;
+      }
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ ok: true, delivered }));
+    });
+    return;
+  }
+
   res.writeHead(404);
   res.end("Not found");
 });

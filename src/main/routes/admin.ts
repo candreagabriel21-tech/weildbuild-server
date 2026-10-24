@@ -45,6 +45,33 @@ function pushModerationToRealtime(payload: {
     .finally(() => clearTimeout(timer));
 }
 
+// ─── v1.9.0: announcement push ───
+// After announcement notifications are saved, tell the Realtime server so
+// every ONLINE recipient gets the small toast + letter instantly (offline
+// players find the letter in their notification inbox on next login). Fire
+// and forget, exactly like the moderation push.
+function pushAnnouncementToRealtime(payload: {
+  usernames: string[] | "all";
+  title: string;
+  message: string;
+  from: string;
+}): void {
+  if (!config.internalToken) return; // push disabled — the heartbeat delivers within 20s
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 4000);
+  fetch(`${config.realtimeUrl}/internal/announcement`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "x-internal-token": config.internalToken },
+    body: JSON.stringify(payload),
+    signal: controller.signal,
+  })
+    .then(async (res) => {
+      if (!res.ok) console.warn(`[announce] realtime push rejected (HTTP ${res.status})`);
+    })
+    .catch(() => { /* realtime asleep/unreachable — non-fatal by design */ })
+    .finally(() => clearTimeout(timer));
+}
+
 // Attach req.authUser (session identity) for every request
 adminRouter.use(attachUser);
 
@@ -356,7 +383,7 @@ adminRouter.get("/users", safeHandler(async (req, res) => {
 }));
 
 const moderateSchema = z.object({
-  action: z.enum(["warn", "ban", "unban"]),
+  action: z.enum(["warn", "ban", "unban", "make_admin", "remove_admin"]),
   username: z.string().min(1).max(30),
   message: z.string().max(200).optional(), // warn: custom warning text
   reason: z.string().max(200).optional(),  // ban: required reason
@@ -430,6 +457,55 @@ adminRouter.post("/moderate", safeHandler(async (req, res) => {
     // Realtime server force-disconnects their sockets.
     pushModerationToRealtime({ action: "ban", username, reason: reason.trim(), from: admin });
     return res.json({ success: true, username, banned: { is_banned: true, reason: reason.trim() } });
+  }
+
+  // ─── v1.9.0: admin role management (TOP ADMIN ONLY) ───
+  //   make_admin:    promote a regular player to "admin"
+  //   remove_admin:  demote an "admin" back to "player"
+  // Rails (beyond the general ones above):
+  //   • only a top_admin may ever change admin roles
+  //   • you can never change your OWN role (a top admin demoting
+  //     themselves would lock the platform out)
+  //   • make_admin only promotes plain players (never touches admins)
+  //   • remove_admin only demotes "admin" (never a fellow "top_admin")
+  if (action === "make_admin" || action === "remove_admin") {
+    if (adminRow?.adminRole !== "top_admin") {
+      return res.status(403).json({ error: "Only the top admin can manage admin roles." });
+    }
+    if (username === admin) {
+      return res.status(400).json({ error: "You cannot change your own admin role." });
+    }
+
+    if (action === "make_admin") {
+      if (targetIsAdmin) {
+        return res.status(400).json({ error: `${username} is already an admin.` });
+      }
+      await prisma.user.update({ where: { username }, data: { adminRole: "admin" } });
+      await createNotification(
+        username, "admin_role",
+        `${admin} made you an admin! You now have access to the Admin panel (warn and ban players) and the admin chat commands.`,
+        admin,
+      );
+      console.log(`[admin] ${admin} promoted ${username} to admin`);
+      return res.json({ success: true, username, admin_role: "admin" });
+    }
+
+    // remove_admin
+    if (targetRow.adminRole !== "admin") {
+      return res.status(400).json({
+        error: targetRow.adminRole === "top_admin"
+          ? "The top admin's role cannot be removed."
+          : `${username} is not an admin.`,
+      });
+    }
+    await prisma.user.update({ where: { username }, data: { adminRole: "none" } });
+    await createNotification(
+      username, "admin_role",
+      `${admin} removed your admin role. You are a regular player again.`,
+      admin,
+    );
+    console.log(`[admin] ${admin} demoted ${username} from admin`);
+    return res.json({ success: true, username, admin_role: "none" });
   }
 
   // unban
@@ -516,4 +592,93 @@ adminRouter.post("/delete-user", safeHandler(async (req, res) => {
   await prisma.user.delete({ where: { username } });
 
   return res.json({ success: true, deleted: username, gamesRemoved: games.count, cleanedFrom: others.length });
+}));
+
+// ═══════════════════════════════════════════════════════════
+// v1.9.0 — Announcements ("WeildBuild Updates")
+// ═══════════════════════════════════════════════════════════
+// TOP ADMIN ONLY. Writes a "letter" to one, several or ALL players:
+//   • every recipient gets an "announcement" notification in their inbox
+//     (the full message + optional title survive there)
+//   • online players ALSO get the small toast + letter instantly via the
+//     Realtime push (offline players simply find the letter in the inbox)
+//   • recipients may turn the pop-up off per-category in Settings
+//     (WeildBuild Updates toggle) — the inbox copy always lands
+const announceSchema = z.object({
+  title: z.string().max(100).optional(),
+  message: z.string().min(1).max(2000),
+  // "all" = every account; otherwise an array of exact usernames
+  recipients: z.union([z.literal("all"), z.array(z.string().min(1).max(30)).min(1).max(500)]),
+});
+
+adminRouter.post("/announce", safeHandler(async (req, res) => {
+  if (!originOk(req, res)) return;
+  const admin = await requireAdmin(req, res);
+  if (!admin) return;
+
+  // Announcements are official "WeildBuild Updates" from the platform
+  // itself: only the top admin may speak with that voice.
+  const adminRow = await prisma.user.findUnique({ where: { username: admin } });
+  if (adminRow?.adminRole !== "top_admin") {
+    return res.status(403).json({ error: "Only the top admin can send announcements." });
+  }
+
+  const parsed = validateBody(announceSchema, req.body, res);
+  if ("error" in parsed) return;
+  const { title, message, recipients } = parsed.data;
+
+  const trimmedMessage = message.trim();
+  if (!trimmedMessage) {
+    return res.status(400).json({ error: "The message cannot be empty." });
+  }
+  const letterTitle = (title || "").trim() || "WeildBuild Update";
+
+  // Resolve the recipient list
+  let usernames: string[];
+  const skipped: string[] = [];
+  if (recipients === "all") {
+    const rows = await prisma.user.findMany({ select: { username: true } });
+    usernames = rows.map((r) => r.username);
+  } else {
+    const unique = [...new Set(recipients.map((u) => u.trim()).filter(Boolean))];
+    const rows = await prisma.user.findMany({
+      where: { username: { in: unique } },
+      select: { username: true },
+    });
+    const found = new Set(rows.map((r) => r.username));
+    usernames = unique.filter((u) => found.has(u));
+    for (const u of unique) if (!found.has(u)) skipped.push(u);
+  }
+
+  if (usernames.length === 0) {
+    return res.status(400).json({
+      error: "No valid recipients. " + (skipped.length ? `Unknown: ${skipped.join(", ")}` : "").trim(),
+    });
+  }
+
+  // Save the inbox copy for every recipient (the letter itself).
+  for (const username of usernames) {
+    await createNotification(username, "announcement", trimmedMessage, admin, {
+      title: letterTitle,
+      maxLen: 2000,
+    });
+  }
+
+  // Instant delivery to online players (fire-and-forget).
+  pushAnnouncementToRealtime({
+    usernames: recipients === "all" ? "all" : usernames,
+    title: letterTitle,
+    message: trimmedMessage,
+    from: admin,
+  });
+
+  console.log(`[announce] ${admin} sent "${letterTitle}" to ${usernames.length} player(s)` +
+    (skipped.length ? ` (skipped unknown: ${skipped.join(", ")})` : ""));
+
+  return res.json({
+    success: true,
+    title: letterTitle,
+    recipientCount: usernames.length,
+    ...(skipped.length ? { skippedUnknown: skipped } : {}),
+  });
 }));

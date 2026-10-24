@@ -219,11 +219,22 @@ export async function deleteGameRecord(gameId: string) {
 
 // ─────────────────────── NOTIFICATIONS ───────────────────────
 
-export async function createNotification(username: string, type: string, message: string, from?: string) {
+export async function createNotification(
+  username: string,
+  type: string,
+  message: string,
+  from?: string,
+  options?: { title?: string; maxLen?: number }
+) {
   const id = randomBytes(6).toString("hex");
+  // v1.9.0: announcements carry an optional headline (letter subject) and
+  // may be longer than the usual 500 chars (letters up to 2000).
+  const maxLen = options?.maxLen ?? 500;
+  const title = sanitizeString(options?.title || "", 100);
   const notification = {
     id, username, type,
-    message: sanitizeString(message, 500),
+    title,
+    message: sanitizeString(message, maxLen),
     fromUser: from || "",
     read: false,
   };
@@ -235,6 +246,7 @@ export async function createNotification(username: string, type: string, message
   // API shape: from_user is mapped to "from" (matches original)
   return {
     id, username, type,
+    title,
     message: notification.message,
     from: notification.fromUser,
     read: false,
@@ -249,7 +261,9 @@ export async function getNotifications(username: string) {
       orderBy: { timestamp: "desc" },
     });
     return rows.map((n) => ({
-      id: n.id, username: n.username, type: n.type, message: n.message,
+      id: n.id, username: n.username, type: n.type,
+      title: (n as any).title || "",
+      message: n.message,
       from: n.fromUser || "", read: n.read,
       timestamp: n.timestamp instanceof Date ? n.timestamp.toISOString() : n.timestamp,
     }));

@@ -1,8 +1,86 @@
-# WeildBuild Server v1.8.1 - Upgrade Notes
+# WeildBuild Server v1.9.0 - Upgrade Notes
 
-Deploy this over the current v1.8.0 exactly like a normal Render deploy
+Deploy this over the current v1.8.1 exactly like a normal Render deploy
 (same env vars, same services: Main, Realtime, Game Host). **No new env
-vars, no migration, no manual seed** - just deploy.
+vars, no manual seed, no manual migration** - the Main Server's boot-time
+`prisma db push` adds the two new columns automatically (they both have
+defaults, so existing rows stay valid). Just deploy all three services.
+
+## What changed (v1.9.0)
+
+1. **Shop catalog re-names** (live the moment you redeploy, via the
+   boot-time catalog re-sync):
+
+   | Item | Was | Now | Description | Price |
+   |------|-----|-----|-------------|-------|
+   | SHIRT-5 | 24K Golden Torso | **Gold Torso** | Midas Touch oh no! | 5 WeBuy |
+   | SHIRT-6 | Dark Blue | **Navy Blue** | Stay cool, stay classic. | 5 WeBuy |
+
+2. **Admin role commands (TOP ADMIN ONLY)** - new actions on
+   `POST /admin/moderate`:
+   - `make_admin`: promote a regular player to admin (they get the Admin
+     panel + a notification telling them)
+   - `remove_admin`: demote an "admin" back to player (never works on a
+     top_admin, never on yourself)
+   - `unban` already existed - the new client exposes it as the
+     `/removeban` chat command
+   The client ships matching chat commands: `/admin <user>`,
+   `/removeadmin <user>` (also `/remove admin <user>`), `/removeban <user>`
+   (also `/remove ban <user>`).
+
+3. **Announcements ("WeildBuild Updates")** - new `POST /admin/announce`
+   (top admin only). Send a letter to one, several, or ALL players:
+   - every recipient gets an `announcement` notification in their inbox
+     (full message + optional title)
+   - online players ALSO get the small toast + the clickable letter
+     instantly (Main pushes to Realtime's new `/internal/announcement`)
+   - recipients can mute the pop-up per-category (client Settings);
+     the inbox copy always lands
+
+4. **Two new database columns** (added automatically on boot):
+   - `notifications.title` - the letter's subject line (empty on old rows)
+   - `users.notify_toasts` - the client's "Toast Messages" master switch
+
+5. Nothing else changed: same session model, same origins policy, same
+   item re-sync guarantees (never touches accounts, balances, ownership
+   or community items).
+
+## Client that goes with it
+
+`WeildBuild-dev-1.0.0-r10.zip` (game version stays 1.0.0). Built from
+the same r9 source plus:
+
+- Shop shows "Gold Torso" / "Navy Blue" (server-driven).
+- Notification fixes: no more pop-ups for the chat you are actively
+  reading, no more double pop-ups for friend events, and clicking a
+  notification now actually takes you there (it even leaves a running
+  game and opens the right conversation).
+- Notification settings that work: Friend Requests, Toast Messages
+  (replaces Purchases) and WeildBuild Updates (renamed from Game
+  Updates) all gate the pop-ups now. DM pop-ups always show; the inbox
+  always receives everything.
+- Announcements card in the Admin panel (top admin only): write a
+  message, pick recipients (one, several, all), send it as a letter.
+- Description editing no longer fires a server request when nothing
+  changed.
+- Studio: Esc no longer exits the editor - it is reserved for canceling
+  block placement (the hint now reads "Click to place (part). Esc to
+  cancel").
+
+## Deploy checklist
+
+1. Deploy **all three services** from this zip (Main + Realtime are the
+   ones that matter for these features).
+2. Watch the Main logs for `Official shop items re-synced` (the two
+   renamed shirts go live within ~30s of boot).
+3. Open the site as the top admin: the Admin panel now has the
+   Announcements card; `/admin <user>` in a game's chat promotes a
+   player.
+4. Done. (`/health` on each service now reports `"version": "1.9.0"`.)
+
+---
+
+# v1.8.1 (if you are skipping from v1.8.0 or earlier)
 
 ## What changed (v1.8.1): the shop catalog re-sync + the clothing rework
 
