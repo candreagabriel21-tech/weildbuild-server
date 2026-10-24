@@ -24,11 +24,20 @@
 //     admin password, so it must only run on a truly empty
 //     database (users == 0). That keeps it from ever resetting a
 //     password you changed.
+//   • NEW in v1.8.1 — OFFICIAL ITEM RE-SYNC on every boot: the
+//     34 official catalog items from data/items/*.json are
+//     upserted on EVERY start (not just empty databases), so a
+//     redeploy is all it takes to push catalog edits (names,
+//     descriptions, prices, colors) to the live database. It
+//     only touches items whose IDs exist in data/items — any
+//     user-created/community items are left alone.
 
 import { exec } from "child_process";
 import { promisify } from "util";
 import { join } from "path";
+import { readdirSync, readFileSync, existsSync } from "fs";
 import { prisma } from "./client";
+import { ITEM_COLORS } from "../shared/item-colors";
 
 const execAsync = promisify(exec);
 
@@ -77,10 +86,52 @@ async function runWithRetries(
   return false;
 }
 
+/**
+ * Official item re-sync (v1.8.1) — upserts every item from
+ * data/items/*.json. Runs on EVERY boot, so catalog edits deploy
+ * with a plain redeploy. Only items whose IDs are listed in
+ * data/items are touched; user-created items are never modified.
+ */
+async function syncOfficialItems(): Promise<void> {
+  const itemsDir = join(repoRoot, "data", "items");
+  if (!existsSync(itemsDir)) {
+    console.warn("! [db-setup] data/items not found — official item re-sync skipped");
+    return;
+  }
+  const files = readdirSync(itemsDir).filter((f) => f.endsWith(".json")).sort();
+  let synced = 0;
+  const failures: string[] = [];
+  for (const file of files) {
+    try {
+      const raw = JSON.parse(readFileSync(join(itemsDir, file), "utf-8"));
+      const data = {
+        id: raw.item_key,
+        displayName: raw.name || raw.display_name || raw.item_key,
+        itemType: raw.type || raw.item_type || "",
+        price: raw.price ?? 0,
+        description: raw.description || "",
+        creator: raw.creator || "WeildBuild",
+        color: ITEM_COLORS[raw.item_key] || "#888",
+        data: raw.data || null,
+        ...(raw.date_created ? { dateCreated: new Date(raw.date_created) } : {}),
+      };
+      await prisma.item.upsert({ where: { id: data.id }, create: data, update: data });
+      synced++;
+    } catch (err: any) {
+      failures.push(`${file}: ${String(err?.message ?? err).split("\n")[0]}`);
+    }
+  }
+  if (failures.length > 0) {
+    console.warn(`! [db-setup] Official item re-sync: ${failures.length} file(s) failed:`);
+    for (const f of failures) console.warn("    " + f);
+  }
+  console.log(`[db-setup] Official shop items re-synced (${synced}/${files.length} items).`);
+}
+
 export async function ensureDatabase(): Promise<void> {
   console.log("─".repeat(58));
   console.log("[db-setup] Automatic database setup started (v1.3.1)");
-  console.log("[db-setup] Step 1/2 — syncing database schema…");
+  console.log("[db-setup] Step 1/3 — syncing database schema…");
 
   const pushed = await runWithRetries(
     "npx prisma db push --skip-generate",
@@ -98,7 +149,7 @@ export async function ensureDatabase(): Promise<void> {
     return;
   }
 
-  console.log("[db-setup] Step 2/2 — checking whether seeding is needed…");
+  console.log("[db-setup] Step 2/3 — checking whether seeding is needed…");
   try {
     const users = await prisma.user.count();
     if (users === 0) {
@@ -121,6 +172,17 @@ export async function ensureDatabase(): Promise<void> {
   } catch (err: any) {
     const msg = String(err?.message ?? err).split("\n")[0];
     console.warn(`[db-setup] Could not check for seeding (non-fatal): ${msg}`);
+  }
+
+  // v1.8.1: ALWAYS re-sync the official catalog (idempotent upserts).
+  // This is what pushes catalog edits (names/descriptions/prices/colors)
+  // to an EXISTING database — a redeploy is all it takes.
+  console.log("[db-setup] Step 3/3 — re-syncing the official shop items…");
+  try {
+    await syncOfficialItems();
+  } catch (err: any) {
+    const msg = String(err?.message ?? err).split("\n")[0];
+    console.warn(`[db-setup] Official item re-sync failed (non-fatal, retried on next boot): ${msg}`);
   }
 
   console.log("─".repeat(58));

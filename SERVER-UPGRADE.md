@@ -1,15 +1,60 @@
-# WeildBuild Server v1.8.0 - Upgrade Notes
+# WeildBuild Server v1.8.1 - Upgrade Notes
 
-Deploy this over the current v1.4.7 exactly like a normal Render deploy
+Deploy this over the current v1.8.0 exactly like a normal Render deploy
 (same env vars, same services: Main, Realtime, Game Host). **No new env
-vars, no migration, no seed** - just deploy.
+vars, no migration, no manual seed** - just deploy.
 
-**Version note:** v1.8.0 is the same code that was staged as v1.4.8,
-renumbered for the final release - the version jump from 1.4.x to 1.8.0
-is a renumber, not a bigger change. Everything below still applies as-is.
+## What changed (v1.8.1): the shop catalog re-sync + the clothing rework
 
-If you are coming from v1.4.6 or older, read the v1.4.7 section at the
-bottom first (ONE env var on Main: `REALTIME_SERVER_URL`).
+**Deploying this updates the item catalog in your LIVE database
+automatically.** The Main Server now re-syncs the official catalog
+(`data/items/*.json`) into the database a few seconds after every boot -
+not just on an empty database. So the new prices/names/descriptions
+below go live on Render the moment you redeploy, with no SQL, no shell,
+no seed command.
+
+- **Every shirt and every pants item now costs 5 WeBuy.** (Faces keep
+  their existing prices.)
+- Renamed + re-described items:
+
+  | Item | Was | Now | New description |
+  |------|-----|-----|------------------|
+  | SHIRT-5 | Gold Rush | **24K Golden Torso** | Midas Touch oh no! |
+  | SHIRT-6 | Midnight | **Dark Blue** | Blue in the sky |
+  | SHIRT-7 | Blossom | **Strawberry Shirt** | Strawberry milkshake! |
+  | PANTS-2 | Midnight | **Void** | Or they could be dark jeans |
+  | PANTS-4 | Crimson | **Tomato Red** | June and July are sisters |
+  | PANTS-5 | Cloud White | Cloud White | Soft as a cloud! (desc only) |
+  | PANTS-6 | Nebula | **Purple** | You'll be either blend in or be in style with the platform |
+
+- Two colors changed (visible in the game client r9+): **Flame (SHIRT-2)
+  is now orange `#FF9B0F`**, and **Tomato Red (PANTS-4) is a true tomato
+  red `#FF6347`** (it was crimson).
+- What the re-sync will NEVER touch: user accounts, balances, owned
+  items, sessions - and any item whose ID is not in `data/items`
+  (community items, if you ever add them).
+- Players who already own renamed items keep them - ownership is by ID
+  (SHIRT-7 etc.), which did not change.
+
+## Client that goes with it
+
+`WeildBuild-dev-1.0.0-r9.zip` - same as r8 plus the two new item colors
+(orange Flame, tomato-red Tomato Red) in the shop previews and avatar
+rendering. r8 and older clients still work, they just show the old
+colors for those two items until they update.
+
+## Deploy checklist
+
+1. Deploy **all three services** from `weildbuild-server-v1.8.1.zip`
+   (they share the codebase; Main + Realtime are the ones that matter).
+2. Open the site, go to the Shop: shirts/pants should show the new names
+   and "Buy: 5 WeBuy" within ~30s of the deploy (the re-sync runs right
+   after boot; the client may need a refresh).
+3. Done. (`/health` on each service now reports `"version": "1.8.1"`.)
+
+---
+
+# v1.8.0 (if you are skipping from v1.4.7)
 
 ## What changed (v1.8.0)
 
@@ -28,7 +73,7 @@ accounts, games, chat, multiplayer, everything.
   `ALLOWED_ORIGINS` env var as before.
 - Nothing else changed - no schema, no seed, no new endpoints.
 
-## Client that goes with it
+## Client that goes with it (v1.8.0 era)
 
 `WeildBuild-dev-1.0.0-r7.zip` (also the Vercel web app source). Its
 features since the r4 exe/apk build:
@@ -48,12 +93,12 @@ features since the r4 exe/apk build:
 The client works fine against v1.4.7 servers too (minus the web-app
 origins) - but the Vercel site needs THIS version.
 
-## Deploy checklist
+## Deploy checklist (v1.8.0 era)
 
-1. Deploy **all three services** from `weildbuild-server-v1.8.0.zip`
+1. Deploy **all three services** from the v1.8.0 zip
    (they share the codebase; Main + Realtime are the ones that matter).
 2. Confirm `https://<your-site>.vercel.app` loads and can log in.
-3. Done. (`/health` on each service now reports `"version": "1.8.0"`.)
+3. Done. (`/health` on each service reports `"version": "1.8.0"`.)
 
 ---
 
