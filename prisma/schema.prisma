@@ -278,3 +278,32 @@ model ServerSetting {
 
   @@map("server_settings")
 }
+
+// ───────────── UPDATE IDEAS / VOTES (NEW in v1.9.1) ───────────
+// The "Vote" page: admins post update ideas, every player votes
+// Yes or No. Votes are ANONYMOUS: the API only ever returns
+// counts (and your OWN current vote, so the buttons can toggle);
+// nobody - not even admins - can see who voted what.
+model VoteIdea {
+  id        String   @id
+  title     String   @default("")
+  message   String   @default("")
+  createdBy String   @default("") @map("created_by")
+  closed    Boolean  @default(false)
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@index([createdAt(sort: Desc)])
+  @@map("vote_ideas")
+}
+
+model VoteVote {
+  id        String   @id // `${ideaId}:${username}` - one vote per player per idea
+  ideaId    String   @map("idea_id")
+  username  String
+  value     Int      @default(0) // 1 = Yes, -1 = No
+  timestamp DateTime @default(now())
+
+  @@unique([ideaId, username])
+  @@index([ideaId])
+  @@map("vote_votes")
+}

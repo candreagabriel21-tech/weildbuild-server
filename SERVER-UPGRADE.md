@@ -1,10 +1,73 @@
-# WeildBuild Server v1.9.0 - Upgrade Notes
+# WeildBuild Server v1.9.1 - Upgrade Notes
 
-Deploy this over the current v1.8.1 exactly like a normal Render deploy
+Deploy this over the current v1.9.0 exactly like a normal Render deploy
 (same env vars, same services: Main, Realtime, Game Host). **No new env
 vars, no manual seed, no manual migration** - the Main Server's boot-time
-`prisma db push` adds the two new columns automatically (they both have
-defaults, so existing rows stay valid). Just deploy all three services.
+`prisma db push` adds the two new Vote tables automatically (both are
+new, so existing rows are untouched). Just deploy all three services.
+
+## What changed (v1.9.1)
+
+1. **The Vote page** - a new `/api/votes` router:
+   - `GET /api/votes` - the public idea list with Yes/No counts; a
+     logged-in caller also gets their OWN current vote (so the thumb
+     buttons can toggle). No voter names are ever returned.
+   - `POST /api/votes` - create an update idea (admins only): title +
+     message.
+   - `POST /api/votes/vote` - cast, change or remove your vote
+     (`value`: `1` = Yes, `-1` = No, `0` = remove). One vote per player
+     per idea, enforced by a unique key; clicking the thumb you already
+     picked removes the vote.
+   - `DELETE /api/votes/:id` - delete an idea (the admin who posted it,
+     or the top admin).
+
+2. **ANONYMOUS by design**: the API only ever returns aggregate counts
+   plus the caller's own vote. There is no endpoint that reveals who
+   voted what - not even for admins.
+
+3. **Two new tables** (added automatically on boot):
+   - `vote_ideas` - the ideas themselves (title, message, author, date)
+   - `vote_votes` - one row per (idea, player) with value 1 / -1
+
+4. Nothing else changed: same session model, same origins policy, same
+   item re-sync guarantees.
+
+## Client that goes with it
+
+`WeildBuild-dev-1.0.0-r11.zip` (game version stays 1.0.0). Built from
+the same r10 source plus:
+
+- A **Vote button in the sidebar (right under Settings)**: view update
+  ideas from admins, vote Yes/No with thumbs, click again to take your
+  vote back. Admins get a "Post an update idea" card on the same page.
+- **In-game DM chat pop-up**: click a player in a game's Players panel
+  and a tiny chat card opens - text them without leaving the game (same
+  conversation as the Friends page; no pop-ups for the chat you are
+  actively reading, even in-game).
+- The **announcement letter got the WeildBuild look**: the square app
+  logo replaces the wax-seal stamp, "WeildBuild Update" heading, a
+  small "From: (user) on (date)" line (date only - no clock time, so
+  players in different time zones are never confused), then the title
+  in big text.
+- **Signup agreement checkbox**: "I agree to the Terms, Rules and
+  Privacy Policy." - the words are links (new tab on the web), and the
+  Create Account button stays disabled until the box is ticked.
+- **/rules text updates**: "Keep it clean" is now "No swearing", and
+  the intro now says the rules apply "across the entire WeildBuild
+  platform, including the website, the studio...".
+
+## Deploy checklist
+
+1. Deploy **all three services** from this zip (only Main changed, but
+   deploying all three keeps the versions in `/health` in sync).
+2. Open the site as any admin: the sidebar's new **Vote** page shows
+   the "Post an update idea" card; post one, then log in as a regular
+   player and vote on it.
+3. Done. (`/health` on each service now reports `"version": "1.9.1"`.)
+
+---
+
+# v1.9.0 (if you are skipping from v1.8.1 or earlier)
 
 ## What changed (v1.9.0)
 
@@ -45,7 +108,7 @@ defaults, so existing rows stay valid). Just deploy all three services.
    item re-sync guarantees (never touches accounts, balances, ownership
    or community items).
 
-## Client that goes with it
+## Client that went with it
 
 `WeildBuild-dev-1.0.0-r10.zip` (game version stays 1.0.0). Built from
 the same r9 source plus:
@@ -67,7 +130,7 @@ the same r9 source plus:
   block placement (the hint now reads "Click to place (part). Esc to
   cancel").
 
-## Deploy checklist
+## Deploy checklist (v1.9.0)
 
 1. Deploy **all three services** from this zip (Main + Realtime are the
    ones that matter for these features).
@@ -76,7 +139,7 @@ the same r9 source plus:
 3. Open the site as the top admin: the Admin panel now has the
    Announcements card; `/admin <user>` in a game's chat promotes a
    player.
-4. Done. (`/health` on each service now reports `"version": "1.9.0"`.)
+4. Done. (`/health` on each service reported `"version": "1.9.0"`.)
 
 ---
 

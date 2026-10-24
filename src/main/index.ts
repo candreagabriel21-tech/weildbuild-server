@@ -21,6 +21,7 @@ import { adminRouter } from "./routes/admin";
 import { storageRouter } from "./routes/storage";
 import { reportsRouter } from "./routes/reports";
 import { instancesRouter, internalRouter } from "./routes/instances";
+import { votesRouter } from "./routes/votes";
 import { getEffectiveSettings } from "../db/settings";
 import { ensureDatabase } from "../db/ensure";
 import { prisma } from "../db/client";
@@ -112,6 +113,7 @@ app.use("/api/admin", adminRouter);
 app.use("/api/storage", storageRouter);
 app.use("/api/reports", reportsRouter);
 app.use("/api/instances", instancesRouter);
+app.use("/api/votes", votesRouter);
 
 // Server-to-server endpoints for the game hosts (NOT under /api)
 app.use("/internal", internalRouter);

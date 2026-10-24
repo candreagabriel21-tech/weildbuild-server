@@ -1,8 +1,8 @@
 {
   "name": "weildbuild-server",
-  "version": "1.9.0",
+  "version": "1.9.1",
   "private": true,
-  "description": "WeildBuild platform servers: Main Server (REST API + orchestration), Realtime (presence/chat), Game Host (game instances). Deploys to Render, database on Neon. v1.9.0: admin role commands (/admin, remove admin, remove ban via /admin/moderate make_admin|remove_admin, top admin only), announcements (POST /admin/announce: letters to one/many/all players with instant Realtime push + inbox copy, notification titles), Notification.title + User.notifyToasts columns (auto-added by the boot-time prisma db push), and the shop catalog re-names (Gold Torso, Navy Blue). v1.8.1: any https://*.vercel.app origin is allowed (CORS + origin validation).",
+  "description": "WeildBuild platform servers: Main Server (REST API + orchestration), Realtime (presence/chat), Game Host (game instances). Deploys to Render, database on Neon. v1.9.1: the Vote page - admins post update ideas (POST /api/votes), every player votes anonymous Yes/No thumbs (POST /api/votes/vote, one vote per player per idea, toggle on/off; the API only ever returns counts + your own vote). New vote_ideas + vote_votes tables, added automatically by the boot-time prisma db push. v1.9.0: admin role commands (/admin, remove admin, remove ban via /admin/moderate make_admin|remove_admin, top admin only), announcements (POST /admin/announce: letters to one/many/all players with instant Realtime push + inbox copy, notification titles), Notification.title + User.notifyToasts columns, and the shop catalog re-names (Gold Torso, Navy Blue). v1.8.1: any https://*.vercel.app origin is allowed (CORS + origin validation).",
   "//": "BUILD FIX v1.2.0: prisma, typescript, tsx and @types/* live in dependencies ON PURPOSE. Render builds run with NODE_ENV=production, and npm silently skips devDependencies in that mode \u2014 that is what broke the v1.1 deploy (TS7016: no declaration file for 'express'). Do NOT move them back to devDependencies.",
   "engines": {
     "node": ">=18.0.0"
