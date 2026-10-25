@@ -1,7 +1,7 @@
 // ═══════════════════════════════════════════════════════════
 // WeildBuild Main — /instances routes (game placement + hosts)
 // ═══════════════════════════════════════════════════════════
-// The Roblox-style orchestration conductor:
+// The classic orchestration conductor:
 //   • Client: POST /instances/join {gameId} → {instanceId, socketUrl}
 //     (fill an existing instance with room left, else create one
 //     on the best host — Server 1 first, Server 2 as overflow)

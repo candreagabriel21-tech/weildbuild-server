@@ -271,13 +271,13 @@ adminRouter.put("/settings", safeHandler(async (req, res) => {
   const semverish = /^\d+\.\d+\.\d+/;
   for (const v of [update.clientLatestVersion, update.clientMinVersion]) {
     if (v !== undefined && v !== "" && !semverish.test(v)) {
-      return res.status(400).json({ error: `Version must look like 1.2.3 — got "${v}"` });
+      return res.status(400).json({ error: `Version must look like 1.2.3, got "${v}"` });
     }
   }
   // Download links must look like URLs or paths when non-empty
   for (const [field, v] of Object.entries(update)) {
     if (field.startsWith("download") && typeof v === "string" && v !== "" && !/^(https?:\/\/|\/)/.test(v)) {
-      return res.status(400).json({ error: `${field} must start with http(s):// or / — got "${v}"` });
+      return res.status(400).json({ error: `${field} must start with http(s):// or /, got "${v}"` });
     }
   }
 

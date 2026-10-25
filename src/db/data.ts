@@ -81,7 +81,7 @@ export async function buyItemAtomic(username: string, itemId: string): Promise<
     `;
     if (updated !== 1) {
       // Lost the race (another request spent the balance or bought the item first)
-      return { error: "Purchase failed — please try again" };
+      return { error: "Purchase failed. Please try again" };
     }
     const after = await prisma.user.findUnique({ where: { username }, select: { webuy: true } });
     return { success: true, balanceBefore, balanceAfter: after?.webuy ?? balanceBefore - item.price };

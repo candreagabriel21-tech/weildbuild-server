@@ -1,7 +1,7 @@
 // ═══════════════════════════════════════════════════════════
 // WeildBuild DB — game host registry + instance placement
 // ═══════════════════════════════════════════════════════════
-// Roblox-style orchestration:
+// Classic-style orchestration:
 //   • Each game can have multiple running instances ("mini servers").
 //   • An instance fills up to maxPlayers (default 10), then new
 //     joiners get a FRESH instance of the same game.

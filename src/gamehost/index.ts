@@ -1,7 +1,7 @@
 // ═══════════════════════════════════════════════════════════
 // WeildBuild GAME HOST SERVICE
 // ═══════════════════════════════════════════════════════════
-// The Roblox-style "mini server" runner. One process hosts MANY
+// The classic "mini server" runner. One process hosts MANY
 // game instances; the Main Server decides placement:
 //   1. Client asks Main  POST /instances/join
 //   2. Main points at an existing instance, or asks THIS host to
@@ -346,7 +346,7 @@ io.on("connection", (socket) => {
     if (!instance) {
       socket.emit("game:error", {
         code: "instance_not_found",
-        message: "Game instance not found — it may have closed. Join the game again.",
+        message: "Game instance not found. It may have closed. Join the game again.",
       });
       return;
     }
