@@ -24,8 +24,6 @@ export const RATE_LIMITS: Record<string, { maxAttempts: number; windowMs: number
   general_api: { maxAttempts: 600, windowMs: 60 * 1000 },
   join_instance: { maxAttempts: 60, windowMs: 60 * 1000 },
   create_report: { maxAttempts: 10, windowMs: 60 * 60 * 1000 }, // 10 reports per hour
-  create_idea: { maxAttempts: 6, windowMs: 60 * 1000 }, // v1.11.0: posting ideas (5-idea cap per account besides)
-  idea_vote: { maxAttempts: 60, windowMs: 60 * 1000 }, // v1.11.0: toggling votes
 };
 
 /** Default max players per game instance (user spec: 10). */

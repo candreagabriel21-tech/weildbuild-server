@@ -24,6 +24,7 @@ export const ITEM_COLORS: Record<string, string> = {
   "FACE-18": "#2E8B57", "FACE-19": "#DC143C", "FACE-20": "#4B0082", "FACE-21": "#8B4513",
   "SHIRT-1": "#CC0000", "SHIRT-2": "#FF9B0F", "SHIRT-3": "#228B22", "SHIRT-4": "#6A0DAD",
   "SHIRT-5": "#FFD700", "SHIRT-6": "#191970", "SHIRT-7": "#FFB6C1", "SHIRT-8": "#006994",
+  "SHIRT-9": "#706e6e",
   "PANTS-1": "#2196F3", "PANTS-2": "#0D1B2A", "PANTS-3": "#556B2F", "PANTS-4": "#FF6347",
-  "PANTS-5": "#F5F5F5", "PANTS-6": "#7B2D8E",
+  "PANTS-5": "#F5F5F5", "PANTS-6": "#7B2D8E", "PANTS-7": "#ffc430",
 };

@@ -1,60 +1,148 @@
-# WeildBuild Server v1.11.0 - Upgrade Notes
+# WeildBuild Server v1.9.2 - Upgrade Notes
 
-Deploy this over the current version exactly like a normal Render deploy
+Deploy this over the current v1.9.1 exactly like a normal Render deploy
 (same env vars, same services: Main, Realtime, Game Host). **No new env
 vars, no manual seed, no manual migration** - the Main Server's boot-time
-`prisma db push` adds the new tables and columns automatically (all with
-defaults, so existing rows stay valid). Just deploy all three services.
+`prisma db push` adds the new `users.is_guest` column automatically
+(default `false`, so every existing player keeps behaving exactly as
+before). Just deploy all three services.
 
-> Upgrading from v1.9.0 or older? Everything below is new since then.
+## What changed (v1.9.2)
 
-## What changed (v1.11.0)
+1. **GUEST MODE ("Continue as Guest")**:
+   - `POST /api/auth { "action": "guest" }` creates an ephemeral
+     `Guest-NNNN` account and returns a normal session ticket. The
+     password is 32 random hex chars nobody knows, so the account can
+     never be logged into again.
+   - Guests are REAL accounts, so they can join game instances, be seen
+     online and open profiles like anyone else ("offline mode + view
+     people and join servers").
+   - **Sign out deletes everything**: `POST /api/auth { "action":
+     "logout" }` from a guest purges the user row and every trace of it
+     (sessions, notifications, DMs, votes, transaction logs, reports).
+   - **Sweeper**: guests who closed the tab without signing out are
+     reaped 24h after their last activity (boot + once an hour).
 
-1. **The Votes page (ideas + upvotes)** - new `/api/ideas` endpoints:
+2. **Guest restrictions (server-enforced)** - each returns a friendly
+   403 with a "Create a free account" message:
+   - `POST /api/games`, `PUT /api/games`, `DELETE /api/games` (publish)
+   - `POST /api/items` (buy)
+   - `PUT /api/users` (avatar, description, notification toggles,
+     language, visual settings)
+   - `POST /api/friends` (all friend actions) - plus nobody can DM a
+     guest ("That player is a guest and can't receive messages.")
+   - `POST /api/votes/vote` (viewing the ideas stays open)
+   - `POST /api/auth changePassword` (guests have no password)
+   - **Game Host**: guests can neither send nor see in-game chat. The
+     host drops their messages and delivers chat to non-guests only
+     (real usernames can never contain a dash, so the `Guest-` prefix
+     is an exact split - no DB call needed).
 
-   | Method | Path | Who | What |
-   |--------|------|-----|------|
-   | GET | `/api/ideas` | public | list all ideas (logged-in callers also get their own `voted` flag per idea) |
-   | POST | `/api/ideas` | players | post an idea (title 3-100, description 0-500; max 5 ideas per account) |
-   | POST | `/api/ideas/vote` | players | toggle my upvote (rejected once the close date passed) |
-   | PATCH | `/api/ideas` | admins | set status (`open`/`approved`/`considering`/`not_approved`/`already_planned`) and/or `closesAt` (ISO date or `null` to reopen) |
-   | DELETE | `/api/ideas` | admins | remove an idea + its votes |
+3. **New column** (added automatically on boot): `users.is_guest`.
 
-   Two new tables (`ideas`, `idea_votes`) are created by the boot-time
-   schema sync. Rate limits: 6 idea posts / minute / user, 60 votes /
-   minute / user.
+## Client that goes with it
 
-2. **Starting currency is now 20 WeBuy** (was 100) - matches the Welcome
-   Letter text. Existing balances are untouched.
+`WeildBuild-dev-1.0.0-r12.zip` (game version stays 1.0.0). Built from
+the same r11 source plus:
 
-3. **Automatic Welcome Letters** - every new registration gets a
-   `welcome` notification (kind "Welcome Letter", from "WeildBuild
-   Team") with the exact 20-WeBuy greeting text. The register response
-   also carries a `welcome` object so the client can pop the pink letter
-   instantly.
+- A **green "Continue as Guest" button** on the login card (above the
+  Login / Create Account button).
+- Every guest-restricted spot in the UI shows a friendly "Create a free
+  account" hint instead of failing silently (shop Buy, avatar editor,
+  profile settings, friend actions, votes, studio Save/Publish).
+- **Guests CAN export worlds as `.wbworld` files** (and import them
+  later, also in a real account) - their builds are never held hostage.
+- **Games filters**: Oldest sort + Multiplayer / Singleplayer filter.
+- Studio publish now marks games with `max_players > 1` as multiplayer
+  (so the new filter has real data on both sides).
 
-4. **Announcement kinds** - `POST /admin/announce` accepts a `kind`
-   (max 40 chars): "WeildBuild Update" (default), "Announcement",
-   "Admin Message", "Message", or anything custom. It is stored on the
-   notification (new `kind` column), returned by `/notifications`, and
-   pushed through Realtime's `/internal/announcement` so online players
-   see it as the letter's eyebrow line immediately.
+## Deploy checklist
 
-5. **Boot-time schema sync hardening** - `ensureDatabase()` now prefers
-   the repo's own `node_modules/.bin/prisma` (and `tsx`) over `npx`:
-   some environments' npx ignores the local install, downloads a random
-   remote prisma, and the schema sync silently fails. Fallback to npx
-   when the local binary is missing.
+1. Deploy Main, Realtime AND Game Host (the chat rule lives in the
+   Game Host - an old Game Host would still relay guest chat).
+2. Wait for the boot log lines:
+   - `[db-setup] schema sync: OK`
+   - The first sweep runs ~30s after boot: `[guest] sweeper removed ...`
+     only appears if there were abandoned guests to reap.
+
+## Rollback
+
+Roll back all three services together (old clients + new server would
+still work: the `action: "guest"` auth call simply would not exist on
+an old server, and the new `is_guest` column is ignored by old code).
 
 ---
 
-# Previous: WeildBuild Server v1.9.0 - Upgrade Notes
+# WeildBuild Server v1.9.1 - Upgrade Notes
 
-Deploy this over the current v1.8.1 exactly like a normal Render deploy
+Deploy this over the current v1.9.0 exactly like a normal Render deploy
 (same env vars, same services: Main, Realtime, Game Host). **No new env
 vars, no manual seed, no manual migration** - the Main Server's boot-time
-`prisma db push` adds the two new columns automatically (they both have
-defaults, so existing rows stay valid). Just deploy all three services.
+`prisma db push` adds the two new Vote tables automatically (both are
+new, so existing rows are untouched). Just deploy all three services.
+
+## What changed (v1.9.1)
+
+1. **The Vote page** - a new `/api/votes` router:
+   - `GET /api/votes` - the public idea list with Yes/No counts; a
+     logged-in caller also gets their OWN current vote (so the thumb
+     buttons can toggle). No voter names are ever returned.
+   - `POST /api/votes` - create an update idea (admins only): title +
+     message.
+   - `POST /api/votes/vote` - cast, change or remove your vote
+     (`value`: `1` = Yes, `-1` = No, `0` = remove). One vote per player
+     per idea, enforced by a unique key; clicking the thumb you already
+     picked removes the vote.
+   - `DELETE /api/votes/:id` - delete an idea (the admin who posted it,
+     or the top admin).
+
+2. **ANONYMOUS by design**: the API only ever returns aggregate counts
+   plus the caller's own vote. There is no endpoint that reveals who
+   voted what - not even for admins.
+
+3. **Two new tables** (added automatically on boot):
+   - `vote_ideas` - the ideas themselves (title, message, author, date)
+   - `vote_votes` - one row per (idea, player) with value 1 / -1
+
+4. Nothing else changed: same session model, same origins policy, same
+   item re-sync guarantees.
+
+## Client that goes with it
+
+`WeildBuild-dev-1.0.0-r11.zip` (game version stays 1.0.0). Built from
+the same r10 source plus:
+
+- A **Vote button in the sidebar (right under Settings)**: view update
+  ideas from admins, vote Yes/No with thumbs, click again to take your
+  vote back. Admins get a "Post an update idea" card on the same page.
+- **In-game DM chat pop-up**: click a player in a game's Players panel
+  and a tiny chat card opens - text them without leaving the game (same
+  conversation as the Friends page; no pop-ups for the chat you are
+  actively reading, even in-game).
+- The **announcement letter got the WeildBuild look**: the square app
+  logo replaces the wax-seal stamp, "WeildBuild Update" heading, a
+  small "From: (user) on (date)" line (date only - no clock time, so
+  players in different time zones are never confused), then the title
+  in big text.
+- **Signup agreement checkbox**: "I agree to the Terms, Rules and
+  Privacy Policy." - the words are links (new tab on the web), and the
+  Create Account button stays disabled until the box is ticked.
+- **/rules text updates**: "Keep it clean" is now "No swearing", and
+  the intro now says the rules apply "across the entire WeildBuild
+  platform, including the website, the studio...".
+
+## Deploy checklist
+
+1. Deploy **all three services** from this zip (only Main changed, but
+   deploying all three keeps the versions in `/health` in sync).
+2. Open the site as any admin: the sidebar's new **Vote** page shows
+   the "Post an update idea" card; post one, then log in as a regular
+   player and vote on it.
+3. Done. (`/health` on each service now reports `"version": "1.9.1"`.)
+
+---
+
+# v1.9.0 (if you are skipping from v1.8.1 or earlier)
 
 ## What changed (v1.9.0)
 
@@ -95,7 +183,7 @@ defaults, so existing rows stay valid). Just deploy all three services.
    item re-sync guarantees (never touches accounts, balances, ownership
    or community items).
 
-## Client that goes with it
+## Client that went with it
 
 `WeildBuild-dev-1.0.0-r10.zip` (game version stays 1.0.0). Built from
 the same r9 source plus:
@@ -117,7 +205,7 @@ the same r9 source plus:
   block placement (the hint now reads "Click to place (part). Esc to
   cancel").
 
-## Deploy checklist
+## Deploy checklist (v1.9.0)
 
 1. Deploy **all three services** from this zip (Main + Realtime are the
    ones that matter for these features).
@@ -126,7 +214,7 @@ the same r9 source plus:
 3. Open the site as the top admin: the Admin panel now has the
    Announcements card; `/admin <user>` in a game's chat promotes a
    player.
-4. Done. (`/health` on each service now reports `"version": "1.9.0"`.)
+4. Done. (`/health` on each service reported `"version": "1.9.0"`.)
 
 ---
 

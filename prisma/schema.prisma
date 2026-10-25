@@ -48,6 +48,21 @@ model User {
   banned         Json     @default("{\"is_banned\":false,\"reason\":\"\"}")
   warnings       Int      @default(0) // v1.4: moderation warning counter (/admin/moderate warn++)
 
+  // v1.9.2: GUEST ACCOUNTS. Ephemeral accounts created by "Continue as
+  // Guest" on the login card. They are REAL rows (so they can join game
+  // instances, be seen online and open profiles like anyone else), but:
+  //   • the password is 32 random hex chars nobody knows - the account
+  //     can never be logged into again
+  //   • restricted routes reject them (publish, buy, avatar, friends,
+  //     chat, profile settings, votes - the full list lives in the route
+  //     guards; the client mirrors the same rules in its UI)
+  //   • LOGGING OUT deletes the row AND every trace of it (sessions,
+  //     notifications, DMs, votes, transaction logs, reports) - see
+  //     purgeGuestUser() in db/users.ts
+  //   • a sweeper (sweepStaleGuests) removes guests that never clicked
+  //     Sign Out after 24h, so abandoned tabs can't accumulate rows
+  isGuest       Boolean  @default(false) @map("is_guest")
+
   notifyFriends    Boolean @default(true) @map("notify_friends")
   notifyPurchases  Boolean @default(true) @map("notify_purchases")
   notifyGames      Boolean @default(true) @map("notify_games")
@@ -116,12 +131,11 @@ model Notification {
   // v1.9.0: optional headline (announcements show it as the letter's
   // subject). Empty string on every older notification.
   title     String   @default("")
-  // v1.11.0: the letter's KIND — the eyebrow line above the title
-  // ("WeildBuild Update", "Announcement", "Admin Message", "Message",
-  // any custom kind the top admin wrote, or "Welcome Letter" on the
-  // automatic welcome letters). Empty string on older notifications
-  // (clients fall back to "WeildBuild Update" for announcements).
-  kind      String   @default("")
+  // v1.9.3: the announcement CATEGORY (the "type" the admin picked when
+  // sending: WeildBuild Update, Announcement, Notice, Admin Message,
+  // Important Message, or any custom text). Only announcement rows use
+  // it; every other notification keeps it empty.
+  category  String   @default("")
   message   String   @default("")
   fromUser  String   @default("") @map("from_user")
   read      Boolean  @default(false)
@@ -130,43 +144,6 @@ model Notification {
   @@index([username])
   @@index([timestamp(sort: Desc)])
   @@map("notifications")
-}
-
-// ────────────────────────── IDEAS / VOTES (v1.11.0) ─────────────────────────
-// The "Votes" page: players post feature ideas for WeildBuild and
-// upvote each other's ideas. Admins answer with a STATUS (approved /
-// considering / not_approved / already_planned) and may set a CLOSE
-// DATE after which nobody can vote anymore.
-model Idea {
-  id          String    @id
-  title       String
-  description String    @default("")
-  creator     String
-  // open | approved | considering | not_approved | already_planned
-  status      String    @default("open")
-  // Denormalized upvote count (IdeaVote rows are the source of truth;
-  // this copy makes listing + sorting cheap).
-  votes       Int       @default(0)
-  // When voting closes. NULL = voting stays open forever.
-  closesAt    DateTime? @map("closes_at")
-  createdAt   DateTime  @default(now()) @map("created_at")
-  updatedAt   DateTime  @default(now()) @updatedAt @map("updated_at")
-
-  @@index([createdAt(sort: Desc)])
-  @@index([votes(sort: Desc)])
-  @@index([creator])
-  @@map("ideas")
-}
-
-// One upvote per user per idea (composite PK enforces it).
-model IdeaVote {
-  ideaId    String
-  username  String
-  createdAt DateTime @default(now())
-
-  @@id([ideaId, username])
-  @@index([username])
-  @@map("idea_votes")
 }
 
 // ─────────────────────────── DMs ─────────────────────────────
@@ -320,4 +297,45 @@ model ServerSetting {
   updatedBy           String   @default("") @map("updated_by")
 
   @@map("server_settings")
+}
+
+// ───────────── UPDATE IDEAS / VOTES (NEW in v1.9.1) ───────────
+// The "Vote" page: admins post update ideas, every player votes
+// Yes or No. Votes are ANONYMOUS: the API only ever returns
+// counts (and your OWN current vote, so the buttons can toggle);
+// nobody - not even admins - can see who voted what.
+model VoteIdea {
+  id        String    @id
+  title     String    @default("")
+  message   String    @default("")
+  createdBy String    @default("") @map("created_by")
+  closed    Boolean   @default(false)
+  // v1.9.3: admin stamp. Empty string = no stamp yet.
+  //   approved | not_approved | considering | implemented
+  stamp        String    @default("")
+  stampedBy    String    @default("") @map("stamped_by")
+  stampedAt    DateTime? @map("stamped_at")
+  // v1.9.3: voting window. null = open ended (no deadline).
+  // Once the date passes the idea is EFFECTIVELY closed (the API
+  // computes that on read; players can no longer vote on it).
+  openUntil    DateTime? @map("open_until")
+  // v1.9.3: when voting was closed (manually or by stamping with
+  // the close checkbox). null = still open (or never closed).
+  closedAt     DateTime? @map("closed_at")
+  createdAt    DateTime  @default(now()) @map("created_at")
+
+  @@index([createdAt(sort: Desc)])
+  @@map("vote_ideas")
+}
+
+model VoteVote {
+  id        String   @id // `${ideaId}:${username}` - one vote per player per idea
+  ideaId    String   @map("idea_id")
+  username  String
+  value     Int      @default(0) // 1 = Yes, -1 = No
+  timestamp DateTime @default(now())
+
+  @@unique([ideaId, username])
+  @@index([ideaId])
+  @@map("vote_votes")
 }

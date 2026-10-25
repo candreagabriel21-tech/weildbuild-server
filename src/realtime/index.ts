@@ -215,13 +215,16 @@ const httpServer = createServer((req: IncomingMessage, res: ServerResponse) => {
     req.on("end", () => {
       let delivered = 0;
       try {
-        const { usernames, title, kind, message, from } = JSON.parse(body || "{}");
+        const { usernames, title, message, from, category } = JSON.parse(body || "{}");
         const letterTitle = typeof title === "string" && title ? title : "WeildBuild Update";
-        const letterKind = typeof kind === "string" && kind ? kind : "WeildBuild Update";
         const letterMessage = typeof message === "string" ? message : "";
         const letterFrom = typeof from === "string" && from ? from : "WeildBuild Team";
+        // v1.9.3: the announcement category (WeildBuild Update, Notice,
+        // custom text, ...). Forwarded so the client letter shows the
+        // right heading. Falls back to the classic label.
+        const letterCategory = typeof category === "string" && category ? category : "WeildBuild Update";
         if (letterMessage && (usernames === "all" || Array.isArray(usernames))) {
-          const payload = { title: letterTitle, kind: letterKind, message: letterMessage, from: letterFrom };
+          const payload = { title: letterTitle, message: letterMessage, from: letterFrom, category: letterCategory };
           if (usernames === "all") {
             // Every connected socket (io.emit reaches all authenticated clients)
             delivered = io.sockets.sockets.size;

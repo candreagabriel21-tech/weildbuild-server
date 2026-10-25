@@ -7,6 +7,7 @@ import { Router } from "express";
 import { z } from "zod";
 import { prisma } from "../../db/client";
 import { runCleanup, trimUserNotificationArrays, createNotification } from "../../db/data";
+import { sanitizeString } from "../../db/users";
 import { config } from "../../shared/config";
 import { safeHandler, validateBody } from "../../shared/http";
 import { attachUser, requireAdmin, originOk } from "../middleware";
@@ -53,9 +54,9 @@ function pushModerationToRealtime(payload: {
 function pushAnnouncementToRealtime(payload: {
   usernames: string[] | "all";
   title: string;
-  kind?: string;
   message: string;
   from: string;
+  category?: string;
 }): void {
   if (!config.internalToken) return; // push disabled — the heartbeat delivers within 20s
   const controller = new AbortController();
@@ -608,11 +609,11 @@ adminRouter.post("/delete-user", safeHandler(async (req, res) => {
 const announceSchema = z.object({
   title: z.string().max(100).optional(),
   message: z.string().min(1).max(2000),
-  // v1.11.0: the letter's KIND — the eyebrow line above the title.
-  // Presets the client offers: "WeildBuild Update" (the default),
-  // "Announcement", "Admin Message", "Message" — or any custom kind
-  // the top admin types (e.g. "Event", "Birthday Letter", ...).
-  kind: z.string().max(40).optional(),
+  // v1.9.3: the announcement category, the "type" the admin picked:
+  // WeildBuild Update, Announcement, Notice, Admin Message,
+  // Important Message, or any custom text (max 40 chars). Falls back
+  // to "WeildBuild Update" when missing (older clients).
+  category: z.string().max(40).optional(),
   // "all" = every account; otherwise an array of exact usernames
   recipients: z.union([z.literal("all"), z.array(z.string().min(1).max(30)).min(1).max(500)]),
 });
@@ -631,16 +632,16 @@ adminRouter.post("/announce", safeHandler(async (req, res) => {
 
   const parsed = validateBody(announceSchema, req.body, res);
   if ("error" in parsed) return;
-  const { title, kind, message, recipients } = parsed.data;
+  const { title, message, recipients, category } = parsed.data;
 
   const trimmedMessage = message.trim();
   if (!trimmedMessage) {
     return res.status(400).json({ error: "The message cannot be empty." });
   }
   const letterTitle = (title || "").trim() || "WeildBuild Update";
-  // v1.11.0: the kind is what the letter shows above its title. Empty
-  // (older clients / not picked) keeps the classic "WeildBuild Update".
-  const letterKind = (kind || "").trim() || "WeildBuild Update";
+  // v1.9.3: the category labels the letter (its heading). Sanitized +
+  // defaulted so the client always receives a clean string.
+  const letterCategory = sanitizeString((category || "").trim(), 40) || "WeildBuild Update";
 
   // Resolve the recipient list
   let usernames: string[];
@@ -669,7 +670,7 @@ adminRouter.post("/announce", safeHandler(async (req, res) => {
   for (const username of usernames) {
     await createNotification(username, "announcement", trimmedMessage, admin, {
       title: letterTitle,
-      kind: letterKind,
+      category: letterCategory,
       maxLen: 2000,
     });
   }
@@ -678,18 +679,18 @@ adminRouter.post("/announce", safeHandler(async (req, res) => {
   pushAnnouncementToRealtime({
     usernames: recipients === "all" ? "all" : usernames,
     title: letterTitle,
-    kind: letterKind,
     message: trimmedMessage,
     from: admin,
+    category: letterCategory,
   });
 
-  console.log(`[announce] ${admin} sent "${letterTitle}" (${letterKind}) to ${usernames.length} player(s)` +
+  console.log(`[announce] ${admin} sent "${letterTitle}" (${letterCategory}) to ${usernames.length} player(s)` +
     (skipped.length ? ` (skipped unknown: ${skipped.join(", ")})` : ""));
 
   return res.json({
     success: true,
     title: letterTitle,
-    kind: letterKind,
+    category: letterCategory,
     recipientCount: usernames.length,
     ...(skipped.length ? { skippedUnknown: skipped } : {}),
   });

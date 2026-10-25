@@ -9,7 +9,7 @@ import { z } from "zod";
 import {
   getAllGames, getGame, createGameRecord, updateGameRecord, deleteGameRecord,
 } from "../../db/data";
-import { getUser, sanitizeString } from "../../db/users";
+import { getUser, sanitizeString, isGuestUser } from "../../db/users";
 import { requireRateLimit } from "../../db/ratelimits";
 import { safeHandler, validateBody, clientIp } from "../../shared/http";
 import { attachUser, requireAuth, originOk } from "../middleware";
@@ -77,6 +77,11 @@ gamesRouter.post("/", safeHandler(async (req, res) => {
   const sessionUser = await requireAuth(req, res);
   if (!sessionUser) return;
 
+  // v1.9.2 GUEST GUARD: guests can build and play, but never publish.
+  if (await isGuestUser(sessionUser)) {
+    return res.status(403).json({ error: "Guests can't publish games. Create a free account to publish your worlds!" });
+  }
+
   // Validate with Zod
   const parsed = validateBody(createGameSchema, req.body, res);
   if ("error" in parsed) return;
@@ -109,6 +114,12 @@ gamesRouter.put("/", safeHandler(async (req, res) => {
   // REQUIRE authentication
   const sessionUser = await requireAuth(req, res);
   if (!sessionUser) return;
+
+  // v1.9.2 GUEST GUARD: guests own no games (they can't create any), but
+  // the rule is enforced here too so the API is consistent on its own.
+  if (await isGuestUser(sessionUser)) {
+    return res.status(403).json({ error: "Guests can't publish games. Create a free account to publish your worlds!" });
+  }
 
   // Validate with Zod
   const parsed = validateBody(updateGameSchema, req.body, res);
@@ -160,6 +171,10 @@ gamesRouter.delete("/", safeHandler(async (req, res) => {
 
   const id = qp(req, "id");
   if (!id) return res.status(400).json({ error: "Game ID required" });
+  // v1.9.2 GUEST GUARD (guests own no games; enforced for consistency)
+  if (await isGuestUser(sessionUser)) {
+    return res.status(403).json({ error: "Guests can't publish games. Create a free account to publish your worlds!" });
+  }
   // Path-traversal guard (same as getGame)
   if (id.includes("..") || id.includes("/") || id.includes("\\")) {
     return res.status(400).json({ error: "Invalid game ID" });
