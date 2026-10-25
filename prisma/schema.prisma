@@ -48,6 +48,21 @@ model User {
   banned         Json     @default("{\"is_banned\":false,\"reason\":\"\"}")
   warnings       Int      @default(0) // v1.4: moderation warning counter (/admin/moderate warn++)
 
+  // v1.9.2: GUEST ACCOUNTS. Ephemeral accounts created by "Continue as
+  // Guest" on the login card. They are REAL rows (so they can join game
+  // instances, be seen online and open profiles like anyone else), but:
+  //   • the password is 32 random hex chars nobody knows - the account
+  //     can never be logged into again
+  //   • restricted routes reject them (publish, buy, avatar, friends,
+  //     chat, profile settings, votes - the full list lives in the route
+  //     guards; the client mirrors the same rules in its UI)
+  //   • LOGGING OUT deletes the row AND every trace of it (sessions,
+  //     notifications, DMs, votes, transaction logs, reports) - see
+  //     purgeGuestUser() in db/users.ts
+  //   • a sweeper (sweepStaleGuests) removes guests that never clicked
+  //     Sign Out after 24h, so abandoned tabs can't accumulate rows
+  isGuest       Boolean  @default(false) @map("is_guest")
+
   notifyFriends    Boolean @default(true) @map("notify_friends")
   notifyPurchases  Boolean @default(true) @map("notify_purchases")
   notifyGames      Boolean @default(true) @map("notify_games")

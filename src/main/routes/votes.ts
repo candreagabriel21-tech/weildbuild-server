@@ -21,7 +21,7 @@ import { randomBytes } from "crypto";
 import { z } from "zod";
 import { prisma } from "../../db/client";
 import { requireRateLimit } from "../../db/ratelimits";
-import { sanitizeString } from "../../db/users";
+import { sanitizeString, isGuestUser } from "../../db/users";
 import { safeHandler, validateBody, clientIp } from "../../shared/http";
 import { attachUser, requireAuth, requireAdmin, originOk } from "../middleware";
 
@@ -129,6 +129,12 @@ votesRouter.post("/vote", safeHandler(async (req, res) => {
 
   const username = await requireAuth(req, res);
   if (!username) return;
+
+  // v1.9.2 GUEST GUARD: everyone can VIEW the ideas; only real accounts
+  // vote. The GET above stays open (myVote is just always 0 for guests).
+  if (await isGuestUser(username)) {
+    return res.status(403).json({ error: "Guests can't vote. Create a free account to vote!" });
+  }
 
   const parsed = validateBody(voteSchema, req.body, res);
   if ("error" in parsed) return;

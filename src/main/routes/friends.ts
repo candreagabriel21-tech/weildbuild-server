@@ -7,7 +7,7 @@
 import { Router, Request } from "express";
 import { z } from "zod";
 import {
-  getUser, saveUser, searchUsers, stripSensitiveFields, sanitizeString,
+  getUser, saveUser, searchUsers, stripSensitiveFields, sanitizeString, isGuestUser,
 } from "../../db/users";
 import {
   sendFriendRequest, acceptFriendRequest, declineFriendRequest,
@@ -110,6 +110,14 @@ friendsRouter.post("/", safeHandler(async (req, res) => {
   const sessionUser = await requireAuth(req, res);
   if (!sessionUser) return;
 
+  // v1.9.2 GUEST GUARD: covers every friend action (request/cancel/accept/
+  // decline/remove/block/unblock) AND sending DMs. Guests can still SEARCH
+  // players and open their profiles (that's the GET side + /users), they
+  // just can't connect with anyone.
+  if (await isGuestUser(sessionUser)) {
+    return res.status(403).json({ error: "Guests can't add friends or send messages. Create a free account to unlock this!" });
+  }
+
   // Validate with Zod
   const parsed = validateBody(friendActionSchema, req.body, res);
   if ("error" in parsed) return;
@@ -208,6 +216,11 @@ friendsRouter.post("/", safeHandler(async (req, res) => {
     case "send_message": {
       if (body.from !== sessionUser) {
         return res.status(403).json({ error: "You can only send messages as yourself." });
+      }
+      // v1.9.2: a guest can never RECEIVE either - nobody can text an
+      // account that can't see messages.
+      if (await isGuestUser(body.to)) {
+        return res.status(403).json({ error: "That player is a guest and can't receive messages." });
       }
       // Rate limit messages
       const rl = await requireRateLimit("send_message", sessionUser);

@@ -7,6 +7,7 @@ import { z } from "zod";
 import {
   createUser, verifyLogin, getUser, saveUser,
   secureHashPassword, generateSalt, validateUsername, verifyPassword, stripSensitiveFields,
+  isGuestUser, createGuestUser, purgeGuestUser,
 } from "../../db/users";
 import {
   createSession, verifySession, deleteSession, deleteUserSessions, countUserSessions,
@@ -39,7 +40,12 @@ const changePasswordSchema = z.object({
   endOtherSessions: z.boolean().default(false),
 });
 const logoutSchema = z.object({ action: z.literal("logout") });
-const authActionSchema = z.discriminatedUnion("action", [registerSchema, loginSchema, changePasswordSchema, logoutSchema]);
+// v1.9.2: "Continue as Guest" - creates an ephemeral Guest-NNNN account.
+// No username/password from the client: the server invents both (the
+// password is random and unknown to anyone, so the account can never be
+// logged into again). Deleting on Sign Out is handled by the logout branch.
+const guestSchema = z.object({ action: z.literal("guest") });
+const authActionSchema = z.discriminatedUnion("action", [registerSchema, loginSchema, changePasswordSchema, logoutSchema, guestSchema]);
 
 // POST /auth — register | login | changePassword | logout
 authRouter.post("/", safeHandler(async (req, res) => {
@@ -101,6 +107,21 @@ authRouter.post("/", safeHandler(async (req, res) => {
     return res.json({ success: true, user: stripSensitiveFields(user), sessionToken: token });
   }
 
+  // ───── GUEST (v1.9.2) ─────
+  if (body.action === "guest") {
+    // Same anti-spam budget as registrations: guests create real rows too.
+    const rl = await requireRateLimit("register", clientIp(req));
+    if (rl) return res.status(429).json({ error: rl.error, retryAfter: rl.retryAfter });
+
+    const result = await createGuestUser();
+    if ("error" in result) return res.status(500).json({ error: result.error });
+
+    const { user } = result;
+    const token = await createSession(user.username);
+    setSessionCookie(res, token);
+    return res.json({ success: true, user: stripSensitiveFields(user), sessionToken: token });
+  }
+
   // ───── CHANGE PASSWORD ─────
   if (body.action === "changePassword") {
     const { username: targetUser, oldPassword, newPassword, endOtherSessions } = body;
@@ -109,6 +130,12 @@ authRouter.post("/", safeHandler(async (req, res) => {
     const sessionUser = currentSessionToken ? await verifySession(currentSessionToken) : null;
     if (!sessionUser) return res.status(401).json({ error: "Authentication required." });
     if (sessionUser !== targetUser) return res.status(403).json({ error: "You can only change your own password." });
+
+    // v1.9.2: guests have an unguessable random password nobody knows -
+    // changing it would turn the ephemeral account into a permanent one.
+    if (await isGuestUser(targetUser)) {
+      return res.status(403).json({ error: "Guest sessions don't have a password. Create a free account instead!" });
+    }
 
     const user = await getUser(targetUser);
     if (!user) return res.status(404).json({ error: "User not found." });
@@ -136,7 +163,19 @@ authRouter.post("/", safeHandler(async (req, res) => {
   // ───── LOGOUT ─────
   if (body.action === "logout") {
     const token = extractToken(req);
-    if (token) await deleteSession(token);
+    // v1.9.2 GUEST PURGE: signing out of a guest session deletes the
+    // account and every trace of it ("the moment they log out, everything
+    // is deleted"). purgeGuestUser also removes ALL of its sessions,
+    // including this one. Non-guests keep the normal single-session delete.
+    let username: string | null = null;
+    if (token) {
+      username = await verifySession(token);
+    }
+    if (username && (await isGuestUser(username))) {
+      await purgeGuestUser(username);
+    } else if (token) {
+      await deleteSession(token);
+    }
     clearSessionCookie(res);
     return res.json({ success: true });
   }

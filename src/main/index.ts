@@ -25,6 +25,7 @@ import { votesRouter } from "./routes/votes";
 import { getEffectiveSettings } from "../db/settings";
 import { ensureDatabase } from "../db/ensure";
 import { prisma } from "../db/client";
+import { sweepStaleGuests } from "../db/users";
 
 assertSecrets("main");
 
@@ -137,4 +138,14 @@ app.listen(port, () => {
   ensureDatabase().catch((e) =>
     console.error("[db-setup] unexpected error (non-fatal):", e)
   );
+
+  // v1.9.2 GUEST HOUSEKEEPING: reap guest accounts that were abandoned
+  // (tab closed without Sign Out). Once shortly after boot (give the DB
+  // setup a moment to settle), then once an hour. Non-fatal by design:
+  // a sweeper failure must never affect serving traffic.
+  const sweepGuests = () => {
+    sweepStaleGuests().catch((e) => console.error("[guest] sweep failed:", e));
+  };
+  setTimeout(sweepGuests, 30_000);
+  setInterval(sweepGuests, 60 * 60 * 1000).unref();
 });

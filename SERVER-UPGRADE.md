@@ -1,3 +1,78 @@
+# WeildBuild Server v1.9.2 - Upgrade Notes
+
+Deploy this over the current v1.9.1 exactly like a normal Render deploy
+(same env vars, same services: Main, Realtime, Game Host). **No new env
+vars, no manual seed, no manual migration** - the Main Server's boot-time
+`prisma db push` adds the new `users.is_guest` column automatically
+(default `false`, so every existing player keeps behaving exactly as
+before). Just deploy all three services.
+
+## What changed (v1.9.2)
+
+1. **GUEST MODE ("Continue as Guest")**:
+   - `POST /api/auth { "action": "guest" }` creates an ephemeral
+     `Guest-NNNN` account and returns a normal session ticket. The
+     password is 32 random hex chars nobody knows, so the account can
+     never be logged into again.
+   - Guests are REAL accounts, so they can join game instances, be seen
+     online and open profiles like anyone else ("offline mode + view
+     people and join servers").
+   - **Sign out deletes everything**: `POST /api/auth { "action":
+     "logout" }` from a guest purges the user row and every trace of it
+     (sessions, notifications, DMs, votes, transaction logs, reports).
+   - **Sweeper**: guests who closed the tab without signing out are
+     reaped 24h after their last activity (boot + once an hour).
+
+2. **Guest restrictions (server-enforced)** - each returns a friendly
+   403 with a "Create a free account" message:
+   - `POST /api/games`, `PUT /api/games`, `DELETE /api/games` (publish)
+   - `POST /api/items` (buy)
+   - `PUT /api/users` (avatar, description, notification toggles,
+     language, visual settings)
+   - `POST /api/friends` (all friend actions) - plus nobody can DM a
+     guest ("That player is a guest and can't receive messages.")
+   - `POST /api/votes/vote` (viewing the ideas stays open)
+   - `POST /api/auth changePassword` (guests have no password)
+   - **Game Host**: guests can neither send nor see in-game chat. The
+     host drops their messages and delivers chat to non-guests only
+     (real usernames can never contain a dash, so the `Guest-` prefix
+     is an exact split - no DB call needed).
+
+3. **New column** (added automatically on boot): `users.is_guest`.
+
+## Client that goes with it
+
+`WeildBuild-dev-1.0.0-r12.zip` (game version stays 1.0.0). Built from
+the same r11 source plus:
+
+- A **green "Continue as Guest" button** on the login card (above the
+  Login / Create Account button).
+- Every guest-restricted spot in the UI shows a friendly "Create a free
+  account" hint instead of failing silently (shop Buy, avatar editor,
+  profile settings, friend actions, votes, studio Save/Publish).
+- **Guests CAN export worlds as `.wbworld` files** (and import them
+  later, also in a real account) - their builds are never held hostage.
+- **Games filters**: Oldest sort + Multiplayer / Singleplayer filter.
+- Studio publish now marks games with `max_players > 1` as multiplayer
+  (so the new filter has real data on both sides).
+
+## Deploy checklist
+
+1. Deploy Main, Realtime AND Game Host (the chat rule lives in the
+   Game Host - an old Game Host would still relay guest chat).
+2. Wait for the boot log lines:
+   - `[db-setup] schema sync: OK`
+   - The first sweep runs ~30s after boot: `[guest] sweeper removed ...`
+     only appears if there were abandoned guests to reap.
+
+## Rollback
+
+Roll back all three services together (old clients + new server would
+still work: the `action: "guest"` auth call simply would not exist on
+an old server, and the new `is_guest` column is ignored by old code).
+
+---
+
 # WeildBuild Server v1.9.1 - Upgrade Notes
 
 Deploy this over the current v1.9.0 exactly like a normal Render deploy

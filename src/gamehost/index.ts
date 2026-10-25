@@ -301,6 +301,13 @@ function authName(socket: Socket): string {
   return socket.data.username;
 }
 
+/** v1.9.2: guest accounts are "Guest-NNNN". Real usernames can NEVER contain
+ * a dash (registration only allows letters/digits/underscore), so this prefix
+ * test is an exact guest/non-guest split - no database lookup needed. */
+function isGuestName(username: string): boolean {
+  return typeof username === "string" && username.startsWith("Guest-");
+}
+
 function asRecord(payload: unknown): Record<string, unknown> {
   return typeof payload === "object" && payload !== null ? (payload as Record<string, unknown>) : {};
 }
@@ -432,21 +439,37 @@ io.on("connection", (socket) => {
   });
 
   // ── game:chat { instanceId, username, message } ──
+  // v1.9.2 GUEST RULES: guests can neither SEND nor SEE in-game chat.
+  // The WeildBuild client hides the whole chat panel for guests; these
+  // server rules are the backstop against tampered clients.
   socket.on("game:chat", (payload: unknown) => {
     const p = asRecord(payload);
     const message = typeof p.message === "string" ? p.message : "";
     if (!message) return;
 
+    const username = authName(socket); // anti-spoof: authenticated name
+    if (isGuestName(username)) {
+      console.log(`[gamehost] dropped chat from guest ${username}`);
+      return;
+    }
+
     const instance = resolvePlayerInstance(socket.id, p.instanceId);
     if (!instance) return;
 
-    // Broadcast to the whole room (including sender, for echo confirmation).
-    io.to(`instance:${instance.id}`).emit("game:chat", {
+    const chatMessage = {
       id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-      username: authName(socket), // anti-spoof: authenticated name
+      username, // anti-spoof: authenticated name
       message,
       timestamp: Date.now(),
-    });
+    };
+
+    // Deliver to every NON-guest in the room (sender keeps its echo
+    // confirmation exactly like before). io.to(<socketId>) targets one
+    // socket - every socket is auto-joined to a room named by its id.
+    for (const [socketId, player] of instance.players) {
+      if (isGuestName(player.username)) continue;
+      io.to(socketId).emit("game:chat", chatMessage);
+    }
   });
 
   // ── game:leave { instanceId } ──
