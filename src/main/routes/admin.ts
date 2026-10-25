@@ -53,6 +53,7 @@ function pushModerationToRealtime(payload: {
 function pushAnnouncementToRealtime(payload: {
   usernames: string[] | "all";
   title: string;
+  kind?: string;
   message: string;
   from: string;
 }): void {
@@ -607,6 +608,11 @@ adminRouter.post("/delete-user", safeHandler(async (req, res) => {
 const announceSchema = z.object({
   title: z.string().max(100).optional(),
   message: z.string().min(1).max(2000),
+  // v1.11.0: the letter's KIND — the eyebrow line above the title.
+  // Presets the client offers: "WeildBuild Update" (the default),
+  // "Announcement", "Admin Message", "Message" — or any custom kind
+  // the top admin types (e.g. "Event", "Birthday Letter", ...).
+  kind: z.string().max(40).optional(),
   // "all" = every account; otherwise an array of exact usernames
   recipients: z.union([z.literal("all"), z.array(z.string().min(1).max(30)).min(1).max(500)]),
 });
@@ -625,13 +631,16 @@ adminRouter.post("/announce", safeHandler(async (req, res) => {
 
   const parsed = validateBody(announceSchema, req.body, res);
   if ("error" in parsed) return;
-  const { title, message, recipients } = parsed.data;
+  const { title, kind, message, recipients } = parsed.data;
 
   const trimmedMessage = message.trim();
   if (!trimmedMessage) {
     return res.status(400).json({ error: "The message cannot be empty." });
   }
   const letterTitle = (title || "").trim() || "WeildBuild Update";
+  // v1.11.0: the kind is what the letter shows above its title. Empty
+  // (older clients / not picked) keeps the classic "WeildBuild Update".
+  const letterKind = (kind || "").trim() || "WeildBuild Update";
 
   // Resolve the recipient list
   let usernames: string[];
@@ -660,6 +669,7 @@ adminRouter.post("/announce", safeHandler(async (req, res) => {
   for (const username of usernames) {
     await createNotification(username, "announcement", trimmedMessage, admin, {
       title: letterTitle,
+      kind: letterKind,
       maxLen: 2000,
     });
   }
@@ -668,16 +678,18 @@ adminRouter.post("/announce", safeHandler(async (req, res) => {
   pushAnnouncementToRealtime({
     usernames: recipients === "all" ? "all" : usernames,
     title: letterTitle,
+    kind: letterKind,
     message: trimmedMessage,
     from: admin,
   });
 
-  console.log(`[announce] ${admin} sent "${letterTitle}" to ${usernames.length} player(s)` +
+  console.log(`[announce] ${admin} sent "${letterTitle}" (${letterKind}) to ${usernames.length} player(s)` +
     (skipped.length ? ` (skipped unknown: ${skipped.join(", ")})` : ""));
 
   return res.json({
     success: true,
     title: letterTitle,
+    kind: letterKind,
     recipientCount: usernames.length,
     ...(skipped.length ? { skippedUnknown: skipped } : {}),
   });

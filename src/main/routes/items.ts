@@ -6,7 +6,7 @@
 // ═══════════════════════════════════════════════════════════
 import { Router, Request } from "express";
 import { z } from "zod";
-import { getUser, stripSensitiveFields, isGuestUser } from "../../db/users";
+import { getUser, stripSensitiveFields } from "../../db/users";
 import { getAllItems, getItemsByType, getItem, buyItemAtomic, logTransaction } from "../../db/data";
 import { requireRateLimit } from "../../db/ratelimits";
 import { safeHandler, validateBody, clientIp } from "../../shared/http";
@@ -59,11 +59,6 @@ itemsRouter.post("/", safeHandler(async (req, res) => {
   // REQUIRE authentication
   const sessionUser = await requireAuth(req, res);
   if (!sessionUser) return;
-
-  // v1.9.2 GUEST GUARD: guests can browse the shop, but never buy.
-  if (await isGuestUser(sessionUser)) {
-    return res.status(403).json({ error: "Guests can't buy items. Create a free account to shop!" });
-  }
 
   // Validate with Zod
   const parsed = validateBody(buyItemSchema, req.body, res);

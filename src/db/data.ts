@@ -219,21 +219,48 @@ export async function deleteGameRecord(gameId: string) {
 
 // ─────────────────────── NOTIFICATIONS ───────────────────────
 
+// ─── v1.11.0: the automatic Welcome Letter ───
+// Every freshly registered account finds one of these in its inbox (and
+// the client pops the pink letter right after the account is created).
+// The text mentions the 20 WeBuy starting balance — keep them in sync
+// with createUser()'s webuy value.
+export function buildWelcomeLetter(username: string): {
+  title: string;
+  kind: string;
+  message: string;
+  from: string;
+} {
+  return {
+    title: "Welcome to WeildBuild!",
+    kind: "Welcome Letter",
+    message:
+      `Hello, ${username}! Welcome to WeildBuild! Here's 20 WeBuy to get ` +
+      "you started! Unlock new Badges to earn more and spend them in the " +
+      "Shop or other things! Have fun!",
+    from: "WeildBuild Team",
+  };
+}
+
 export async function createNotification(
   username: string,
   type: string,
   message: string,
   from?: string,
-  options?: { title?: string; maxLen?: number }
+  options?: { title?: string; kind?: string; maxLen?: number }
 ) {
   const id = randomBytes(6).toString("hex");
   // v1.9.0: announcements carry an optional headline (letter subject) and
   // may be longer than the usual 500 chars (letters up to 2000).
+  // v1.11.0: they also carry a KIND — the eyebrow line on the letter
+  // ("WeildBuild Update", "Announcement", "Admin Message", "Message",
+  // a custom kind, or "Welcome Letter" on automatic welcome letters).
   const maxLen = options?.maxLen ?? 500;
   const title = sanitizeString(options?.title || "", 100);
+  const kind = sanitizeString(options?.kind || "", 40);
   const notification = {
     id, username, type,
     title,
+    kind,
     message: sanitizeString(message, maxLen),
     fromUser: from || "",
     read: false,
@@ -247,6 +274,7 @@ export async function createNotification(
   return {
     id, username, type,
     title,
+    kind,
     message: notification.message,
     from: notification.fromUser,
     read: false,
@@ -263,6 +291,7 @@ export async function getNotifications(username: string) {
     return rows.map((n) => ({
       id: n.id, username: n.username, type: n.type,
       title: (n as any).title || "",
+      kind: (n as any).kind || "",
       message: n.message,
       from: n.fromUser || "", read: n.read,
       timestamp: n.timestamp instanceof Date ? n.timestamp.toISOString() : n.timestamp,

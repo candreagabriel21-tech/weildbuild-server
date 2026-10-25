@@ -7,7 +7,7 @@ import { Router, Request } from "express";
 import { z } from "zod";
 import {
   getAllUsers, getUser, getUserByKey, saveUser, searchUsers,
-  stripSensitiveFields, filterUserUpdates, isGuestUser,
+  stripSensitiveFields, filterUserUpdates,
 } from "../../db/users";
 import { requireRateLimit } from "../../db/ratelimits";
 import { safeHandler, validateBody, clientIp } from "../../shared/http";
@@ -103,15 +103,6 @@ usersRouter.put("/", safeHandler(async (req, res) => {
   // REQUIRE: user must be authenticated as themselves or admin
   const authResult = await requireSelfOrAdmin(req, res, username);
   if (!authResult) return;
-
-  // v1.9.2 GUEST GUARD: guests keep the DEFAULT profile/avatar/settings.
-  // Every field in ALLOWED_USER_UPDATES (avatar, description, notification
-  // toggles, language, visual settings) is a server-side change, and none
-  // of them are allowed for guest sessions. Local device settings on the
-  // client (dark mode etc.) keep working - they never touch this route.
-  if (await isGuestUser(username)) {
-    return res.status(403).json({ error: "Guests can't change profile settings. Create a free account to unlock this!" });
-  }
 
   const user = await getUser(username);
   if (!user) return res.status(404).json({ error: "User not found" });

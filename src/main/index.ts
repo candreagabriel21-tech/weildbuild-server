@@ -18,14 +18,13 @@ import { gamesRouter } from "./routes/games";
 import { itemsRouter } from "./routes/items";
 import { notificationsRouter } from "./routes/notifications";
 import { adminRouter } from "./routes/admin";
+import { ideasRouter } from "./routes/ideas";
 import { storageRouter } from "./routes/storage";
 import { reportsRouter } from "./routes/reports";
 import { instancesRouter, internalRouter } from "./routes/instances";
-import { votesRouter } from "./routes/votes";
 import { getEffectiveSettings } from "../db/settings";
 import { ensureDatabase } from "../db/ensure";
 import { prisma } from "../db/client";
-import { sweepStaleGuests } from "../db/users";
 
 assertSecrets("main");
 
@@ -110,11 +109,11 @@ app.use("/api/friends", friendsRouter);
 app.use("/api/games", gamesRouter);
 app.use("/api/items", itemsRouter);
 app.use("/api/notifications", notificationsRouter);
+app.use("/api/ideas", ideasRouter);
 app.use("/api/admin", adminRouter);
 app.use("/api/storage", storageRouter);
 app.use("/api/reports", reportsRouter);
 app.use("/api/instances", instancesRouter);
-app.use("/api/votes", votesRouter);
 
 // Server-to-server endpoints for the game hosts (NOT under /api)
 app.use("/internal", internalRouter);
@@ -138,14 +137,4 @@ app.listen(port, () => {
   ensureDatabase().catch((e) =>
     console.error("[db-setup] unexpected error (non-fatal):", e)
   );
-
-  // v1.9.2 GUEST HOUSEKEEPING: reap guest accounts that were abandoned
-  // (tab closed without Sign Out). Once shortly after boot (give the DB
-  // setup a moment to settle), then once an hour. Non-fatal by design:
-  // a sweeper failure must never affect serving traffic.
-  const sweepGuests = () => {
-    sweepStaleGuests().catch((e) => console.error("[guest] sweep failed:", e));
-  };
-  setTimeout(sweepGuests, 30_000);
-  setInterval(sweepGuests, 60 * 60 * 1000).unref();
 });

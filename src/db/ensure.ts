@@ -48,6 +48,20 @@ const repoRoot = join(__dirname, "..", "..");
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
+// v1.11.0: prefer the LOCAL prisma / tsx binaries over `npx <pkg>…`.
+// Some environments' npx ignores node_modules/.bin and fetches a random
+// latest prisma from the registry (slow, or blocked entirely → the boot
+// schema sync fails and every table stays missing). The local binary is
+// also the exact prisma version the app itself runs — strictly better.
+// Falls back to npx when the local install isn't there.
+function localBin(name: string, args: string): string {
+  const bin = join(repoRoot, "node_modules", ".bin", name);
+  if (existsSync(bin)) return `"${bin}" ${args}`;
+  const binCmd = bin + ".cmd";
+  if (existsSync(binCmd)) return `"${binCmd}" ${args}`;
+  return `npx ${name} ${args}`;
+}
+
 function logTail(text: string | undefined, maxLines: number): void {
   if (!text?.trim()) return;
   const lines = text.trim().split("\n");
@@ -134,7 +148,7 @@ export async function ensureDatabase(): Promise<void> {
   console.log("[db-setup] Step 1/3 — syncing database schema…");
 
   const pushed = await runWithRetries(
-    "npx prisma db push --skip-generate",
+    localBin("prisma", "db push --skip-generate"),
     "schema sync"
   );
 
@@ -157,7 +171,7 @@ export async function ensureDatabase(): Promise<void> {
         "[db-setup] Empty database detected — seeding the default admin\n" +
           "    account (WeildBuild) and the shop items…"
       );
-      const seeded = await runWithRetries("npx tsx prisma/seed.ts", "seed");
+      const seeded = await runWithRetries(localBin("tsx", "prisma/seed.ts"), "seed");
       if (seeded) {
         console.log(
           "[db-setup] Seed complete. Default admin login: WeildBuild\n" +

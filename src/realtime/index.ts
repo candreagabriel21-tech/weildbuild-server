@@ -215,12 +215,13 @@ const httpServer = createServer((req: IncomingMessage, res: ServerResponse) => {
     req.on("end", () => {
       let delivered = 0;
       try {
-        const { usernames, title, message, from } = JSON.parse(body || "{}");
+        const { usernames, title, kind, message, from } = JSON.parse(body || "{}");
         const letterTitle = typeof title === "string" && title ? title : "WeildBuild Update";
+        const letterKind = typeof kind === "string" && kind ? kind : "WeildBuild Update";
         const letterMessage = typeof message === "string" ? message : "";
         const letterFrom = typeof from === "string" && from ? from : "WeildBuild Team";
         if (letterMessage && (usernames === "all" || Array.isArray(usernames))) {
-          const payload = { title: letterTitle, message: letterMessage, from: letterFrom };
+          const payload = { title: letterTitle, kind: letterKind, message: letterMessage, from: letterFrom };
           if (usernames === "all") {
             // Every connected socket (io.emit reaches all authenticated clients)
             delivered = io.sockets.sockets.size;

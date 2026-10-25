@@ -113,7 +113,6 @@ export function rowToUser(row: any): any {
     sent_requests: row.sentRequests || [],
     description: row.description || "",
     admin_role: row.adminRole || "none",
-    is_guest: row.isGuest ?? false,
     banned: row.banned || { is_banned: false, reason: "" },
     created: row.created instanceof Date ? row.created.toISOString() : row.created,
     last_login: row.lastLogin instanceof Date ? row.lastLogin.toISOString() : row.lastLogin,
@@ -150,7 +149,6 @@ function userToPrismaData(user: any, username: string) {
     sentRequests: user.sent_requests || [],
     description: user.description || "",
     adminRole: user.admin_role || "none",
-    isGuest: user.is_guest ?? false,
     banned: (user.banned || { is_banned: false, reason: "" }) as any,
     notifications: user.notifications || [],
     profileVisible: user.profile_visible ?? true,
@@ -274,7 +272,9 @@ export async function createUser(username: string, password: string) {
     salt,
     hash_version: 1,
     avatar: { shirt: "SHIRT-1", left_leg: "PANTS-1", right_leg: "PANTS-1", face: "FACE-1", skin: "#f8ff6d" },
-    webuy: 100,
+    // v1.11.0: new accounts start with 20 WeBuy (was 100). The Welcome
+    // Letter tells them about it and points at Badges + the Shop.
+    webuy: 20,
     items_owned: ["FACE-1", "SHIRT-1", "PANTS-1"],
     friends: [] as string[],
     friend_requests: [] as string[],
@@ -325,162 +325,4 @@ export async function verifyLogin(username: string, password: string) {
   user.last_login = new Date().toISOString();
   await saveUser(username, user);
   return { success: true, user };
-}
-
-// ─────────────────────── GUEST ACCOUNTS (v1.9.2) ───────────────────────
-// "Continue as Guest" creates a REAL, ephemeral account (Guest-1234).
-// It can join game instances and be seen online like anyone else, but
-// restricted routes reject it and LOGGING OUT deletes every trace.
-
-/** Quick check: is this username a guest account? (cheap indexed lookup) */
-export async function isGuestUser(username: string): Promise<boolean> {
-  if (!username) return false;
-  try {
-    const row = await prisma.user.findUnique({
-      where: { username },
-      select: { isGuest: true },
-    });
-    return !!row?.isGuest;
-  } catch {
-    return false;
-  }
-}
-
-/**
- * Pick an unused Guest-NNNN username. Real registrations can NEVER contain
- * a dash (validateUsername only allows letters/digits/underscore), so every
- * "Guest-*" name in the database is one of ours - no collision is possible
- * with a human account. 4 digits first (Guest-1000..Guest-9999); if that
- * entire range somehow filled up, widen to 5, then 6 digits.
- */
-async function pickGuestUsername(): Promise<string> {
-  for (let digits = 4; digits <= 6; digits++) {
-    const min = 10 ** (digits - 1); // 1000, 10000, 100000
-    const span = 9 * min; // 9000, 90000, 900000 candidates
-    for (let attempt = 0; attempt < 50; attempt++) {
-      const n = min + Math.floor(Math.random() * span);
-      const username = `Guest-${n}`;
-      const existing = await prisma.user.findUnique({
-        where: { username },
-        select: { username: true },
-      });
-      if (!existing) return username;
-    }
-  }
-  // Practically unreachable (would need ~9 million guests); fall back to a
-  // random 8-digit id so creation still succeeds.
-  return `Guest-${Math.floor(10000000 + Math.random() * 90000000)}`;
-}
-
-/**
- * Create a guest account. The password is 32 random hex characters that
- * NOBODY knows (not sent to the client, not stored anywhere else), so the
- * account can never be logged into again - the only ways in are the live
- * session we hand out, and Sign Out destroys everything.
- */
-export async function createGuestUser(): Promise<{
-  success: true; user: any;
-} | { error: string }> {
-  const username = await pickGuestUsername();
-  if (await getUser(username)) return { error: "Could not assign a guest ID - try again" };
-
-  const userKey = await getUniqueUserKey();
-  const salt = generateSalt();
-  // Random unguessable password - guests never log in with it.
-  const password = randomBytes(32).toString("hex");
-  const user = {
-    username,
-    password: secureHashPassword(password, salt),
-    salt,
-    hash_version: 1,
-    is_guest: true,
-    // Same starter look as a fresh account so the character renders normally.
-    avatar: { shirt: "SHIRT-1", left_leg: "PANTS-1", right_leg: "PANTS-1", face: "FACE-1", skin: "#f8ff6d" },
-    webuy: 100,
-    items_owned: ["FACE-1", "SHIRT-1", "PANTS-1"],
-    friends: [] as string[],
-    friend_requests: [] as string[],
-    sent_requests: [] as string[],
-    description: "",
-    admin_role: "none",
-    banned: { is_banned: false, reason: "" },
-    created: new Date().toISOString(),
-    last_login: new Date().toISOString(),
-    notifications: [] as string[],
-    profile_visible: true,
-    notify_friends: true,
-    notify_purchases: true,
-    notify_games: true,
-    notify_toasts: true,
-    visual_settings: { dark_mode: true, ui_scale: 1, animations: true, reduce_motion: false },
-    language: "en",
-    blocked_users: [] as string[],
-    user_key: userKey,
-  };
-  const saveResult = await saveUser(username, user);
-  if (saveResult.error) {
-    console.error("[createGuestUser] saveUser failed:", saveResult.error);
-    return { error: `Could not start a guest session: ${saveResult.error}` };
-  }
-  console.log(`[guest] created ${username}`);
-  return { success: true, user };
-}
-
-/**
- * Delete a guest account and EVERY trace of it. Runs when the guest signs
- * out (or when the sweeper reaps an abandoned one). No FK relations exist
- * between these tables, so each is deleted explicitly. GameInstance
- * playerNames are left alone ON PURPOSE - the game host's next heartbeat
- * (every ~15s) corrects them, and touching live instance rows mid-game
- * would be worse than a stale name for a few seconds.
- */
-export async function purgeGuestUser(username: string): Promise<{ deleted: boolean; rowsRemoved: number }> {
-  let rowsRemoved = 0;
-  try {
-    // Guard: only ever purge actual guest rows. A bug here must NEVER be
-    // able to delete a real player.
-    const row = await prisma.user.findUnique({ where: { username }, select: { isGuest: true } });
-    if (!row?.isGuest) return { deleted: false, rowsRemoved: 0 };
-
-    const s1 = await prisma.session.deleteMany({ where: { username } }); rowsRemoved += s1.count;
-    const s2 = await prisma.notification.deleteMany({ where: { username } }); rowsRemoved += s2.count;
-    const s3 = await prisma.dm.deleteMany({ where: { OR: [{ from: username }, { to: username }] } }); rowsRemoved += s3.count;
-    const s4 = await prisma.voteVote.deleteMany({ where: { username } }); rowsRemoved += s4.count;
-    const s5 = await prisma.transactionLog.deleteMany({ where: { username } }); rowsRemoved += s5.count;
-    const s6 = await prisma.report.deleteMany({ where: { reporter: username } }); rowsRemoved += s6.count;
-    await prisma.user.delete({ where: { username } }); rowsRemoved += 1;
-    console.log(`[guest] purged ${username} (${rowsRemoved} rows removed)`);
-    return { deleted: true, rowsRemoved };
-  } catch (e: any) {
-    console.error(`[guest] purge of ${username} failed:`, e.message);
-    return { deleted: false, rowsRemoved };
-  }
-}
-
-/**
- * Reap guest accounts that were abandoned (tab closed without Sign Out).
- * Runs at boot + hourly from the Main Server. 24h gives an active guest a
- * full day; after that their next API call fails auth, the client shows its
- * normal session-expired flow and they can Continue as Guest again.
- */
-export async function sweepStaleGuests(maxAgeHours: number = 24): Promise<number> {
-  try {
-    const cutoff = new Date(Date.now() - maxAgeHours * 60 * 60 * 1000);
-    const stale = await prisma.user.findMany({
-      where: { isGuest: true, lastLogin: { lt: cutoff } },
-      select: { username: true },
-      take: 200,
-    });
-    if (stale.length === 0) return 0;
-    let purged = 0;
-    for (const g of stale) {
-      const result = await purgeGuestUser(g.username);
-      if (result.deleted) purged++;
-    }
-    if (purged > 0) console.log(`[guest] sweeper removed ${purged} abandoned guest account(s)`);
-    return purged;
-  } catch (e: any) {
-    console.error("[guest] sweeper failed:", e.message);
-    return 0;
-  }
 }
