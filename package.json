@@ -3,12 +3,12 @@
   "version": "1.9.2",
   "private": true,
   "description": "WeildBuild platform servers: Main Server (REST API + orchestration), Realtime (presence/chat), Game Host (game instances). Deploys to Render, database on Neon. v1.9.2: GUEST MODE - POST /api/auth {action:guest} creates an ephemeral Guest-NNNN account (random unguessable password, is_guest flag). Guests can join game instances and open profiles, but restricted routes reject them (publish/buy/avatar/friends/DMs/profile settings/votes - the gamehost also drops their in-game chat). Signing out purges the account and every trace of it; an hourly sweeper reaps abandoned guests after 24h. New column users.is_guest, added automatically by the boot-time prisma db push. v1.9.1: the Vote page - admins post update ideas (POST /api/votes), every player votes anonymous Yes/No thumbs (POST /api/votes/vote, one vote per player per idea, toggle on/off; the API only ever returns counts + your own vote). New vote_ideas + vote_votes tables, added automatically by the boot-time prisma db push. v1.9.0: admin role commands (/admin, remove admin, remove ban via /admin/moderate make_admin|remove_admin, top admin only), announcements (POST /admin/announce: letters to one/many/all players with instant Realtime push + inbox copy, notification titles), Notification.title + User.notifyToasts columns, and the shop catalog re-names (Gold Torso, Navy Blue). v1.8.1: any https://*.vercel.app origin is allowed (CORS + origin validation).",
-  "//": "BUILD FIX v1.2.0: prisma, typescript, tsx and @types/* live in dependencies ON PURPOSE. Render builds run with NODE_ENV=production, and npm silently skips devDependencies in that mode \u2014 that is what broke the v1.1 deploy (TS7016: no declaration file for 'express'). Do NOT move them back to devDependencies.",
+  "//": "BUILD FIX v1.2.0: prisma, typescript, tsx and @types/* live in dependencies ON PURPOSE. Render builds run with NODE_ENV=production, and npm silently skips devDependencies in that mode — that is what broke the v1.1 deploy (TS7016: no declaration file for 'express'). Do NOT move them back to devDependencies.",
   "engines": {
     "node": ">=18.0.0"
   },
   "scripts": {
-    "build": "prisma generate && tsc",
+    "build": "prisma generate && tsc && node scripts/build-world-runtime.mjs",
     "start:main": "node dist/main/index.js",
     "start:realtime": "node dist/realtime/index.js",
     "start:gamehost": "node dist/gamehost/index.js",
@@ -18,7 +18,11 @@
     "migrate": "prisma db push",
     "seed": "tsx prisma/seed.ts",
     "setup": "npm run migrate && npm run seed",
-    "test:compat": "tsx tests/compat.ts"
+    "test:compat": "tsx tests/compat.ts",
+    "build:world-runtime": "node scripts/build-world-runtime.mjs",
+    "test:world-runtime": "npm run build:world-runtime && tsx tests/test-world-runtime.ts",
+    "test:wbworld": "tsx tests/test-wbworld-server.ts",
+    "test:all": "npm run test:wbworld && npm run test:world-runtime && npm run test:compat && tsx tests/test-netcode-e2e.ts"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.700.0",
@@ -28,10 +32,12 @@
     "@types/node": "^22.10.0",
     "cors": "^2.8.5",
     "dotenv": "^16.4.5",
+    "esbuild": "^0.28.2",
     "express": "^4.21.2",
     "jose": "^5.9.6",
     "prisma": "^6.5.0",
     "socket.io": "^4.8.3",
+    "socket.io-client": "^4.8.4",
     "tsx": "^4.19.2",
     "typescript": "^5.7.0",
     "zod": "^3.24.2"
@@ -42,5 +48,8 @@
     "@prisma/engines@6.19.3": true,
     "esbuild@0.28.2": true,
     "prisma@6.19.3": true
+  },
+  "devDependencies": {
+    "embedded-postgres": "^18.4.0-beta.17"
   }
 }

@@ -92,10 +92,22 @@ export async function buyItemAtomic(username: string, itemId: string): Promise<
 }
 
 // ─────────────────────────── GAMES ───────────────────────────
-// "Game files": extra_data JSONB holds the whole studio state.
-// Game hosts read this; the root is never modified by hosts.
+// v1.1: a game's full studio state is stored as an ENCRYPTED .wbworld
+// blob in the GameWorld side table (same bytes File > Export writes).
+// extra_data keeps only light metadata: thumbnail, max_players,
+// multiplayer, spawn_point, public flag, ... . Legacy games (plain
+// studioState in extra_data) are migrated at boot (see ensure.ts) and
+// keep working until then via the read fallbacks below.
 
-export function flattenGame(row: any): any {
+import {
+  encryptWbworldPayload,
+  isValidWbworldBuffer,
+  bufferFromBase64,
+  bufferToBase64,
+  WORLD_MAX_BYTES,
+} from "../shared/wbworld";
+
+export function flattenGame(row: any, opts?: { includeWorld?: boolean; worldB64?: string | null }): any {
   if (!row) return null;
   const base = {
     id: row.id,
@@ -110,14 +122,36 @@ export function flattenGame(row: any): any {
   // name/description/creator/plays INSIDE extra_data (leaked there by an old
   // createGameRecord bug). Spreading base last means the real column always
   // wins on read, so renames show up everywhere immediately.
-  return { ...(row.extraData || {}), ...base };
+  const extra = { ...(row.extraData || {}) };
+  // v1.1: LIST views never see the heavy fields. Single-game GETs attach
+  // world_b64 explicitly (below) and keep the legacy studioState fallback
+  // for rows that predate the migration.
+  if (!opts?.includeWorld) {
+    delete extra.studioState;
+    delete extra.primitives;
+  }
+  const game = { ...extra, ...base };
+  if (opts?.includeWorld) {
+    // v1.1: the encrypted world blob (base64). Present on every game
+    // saved after the format switch; the client decrypts it with the
+    // SAME code it uses for File > Import.
+    if (opts.worldB64) game.world_b64 = opts.worldB64;
+  }
+  return game;
 }
 
 export async function getGame(gameId: string) {
   if (!gameId || gameId.includes("..") || gameId.includes("/") || gameId.includes("\\")) return null;
   try {
     const row = await prisma.game.findUnique({ where: { id: gameId } });
-    return row ? flattenGame(row) : null;
+    if (!row) return null;
+    // v1.1: fetch the encrypted world blob for the full single-game view.
+    let worldB64: string | null = null;
+    try {
+      const worldRow = await prisma.gameWorld.findUnique({ where: { gameId }, select: { world: true } });
+      if (worldRow) worldB64 = bufferToBase64(Buffer.from(worldRow.world));
+    } catch { /* table may not exist yet on first boot */ }
+    return flattenGame(row, { includeWorld: true, worldB64 });
   } catch {
     return null;
   }
@@ -126,7 +160,9 @@ export async function getGame(gameId: string) {
 export async function getAllGames() {
   try {
     const rows = await prisma.game.findMany({ orderBy: { created: "desc" } });
-    return rows.map(flattenGame);
+    // v1.1: light list - no world blobs, no studioState, no primitives.
+    // The lobby only needs name/desc/creator/plays/thumbnail/flags.
+    return rows.map((r) => flattenGame(r));
   } catch {
     return [];
   }
@@ -134,11 +170,63 @@ export async function getAllGames() {
 
 const GAME_TOP_LEVEL_FIELDS = ["name", "description", "creator", "plays", "id"];
 
+/**
+ * v1.1: normalize an incoming world into .wbworld bytes.
+ * Accepts either:
+ *   • world_b64 — the client encrypted its own world with the export
+ *     format (preferred: identical bytes to a File > Export)
+ *   • studioState — legacy clients still send plain JSON; the server
+ *     wraps it into the wbworld format itself
+ * Returns { world: Buffer, meta } where meta carries the light metadata
+ * that should live in extra_data (max_players, multiplayer, spawn_point...).
+ */
+function extractWorld(gameData: any): { world: Buffer | null; worldMeta: any } {
+  const meta: any = {};
+  // Light metadata always travels alongside (tiny, used by lobby cards
+  // and the gamehost without decrypting anything).
+  for (const k of ["max_players", "multiplayer", "spawn_point", "public"]) {
+    if (gameData[k] !== undefined) meta[k] = gameData[k];
+  }
+
+  // Preferred path: client-encrypted .wbworld bytes.
+  if (typeof gameData.world_b64 === "string" && gameData.world_b64.length > 0) {
+    const buf = bufferFromBase64(gameData.world_b64);
+    if (!buf || !isValidWbworldBuffer(buf)) return { world: null, worldMeta: meta };
+    if (buf.length > WORLD_MAX_BYTES) return { world: null, worldMeta: meta };
+    return { world: buf, worldMeta: meta };
+  }
+
+  // Legacy path: plain studioState JSON -> server encrypts it into the
+  // same format (payload mirrors the export document).
+  if (gameData.studioState && typeof gameData.studioState === "object") {
+    const payload = {
+      format: "wbworld",
+      version: 1,
+      name: gameData.name || "My World",
+      description: gameData.description || "",
+      multiplayer: gameData.multiplayer ?? (gameData.max_players ?? 10) > 1,
+      max_players: gameData.max_players ?? 10,
+      spawn_point: gameData.spawn_point ?? [0, 0.15, 0],
+      studioState: gameData.studioState,
+      exportedAt: new Date().toISOString(),
+      exportedBy: "server-upgrade",
+    };
+    const buf = encryptWbworldPayload(payload);
+    if (buf.length > WORLD_MAX_BYTES) return { world: null, worldMeta: meta };
+    return { world: buf, worldMeta: meta };
+  }
+
+  return { world: null, worldMeta: meta };
+}
+
 export async function createGameRecord(gameData: any) {
   const id = gameData.id || randomBytes(4).toString("hex");
+  // v1.1: heavy fields never reach extra_data anymore - the world goes
+  // into its own encrypted row, the light metadata stays here.
+  const { world, worldMeta } = extractWorld(gameData);
   const { studioState, primitives, spawn_point, sky_color_top, sky_color_bottom,
     baseplate_color, baseplate_size, max_players, public: isPublic,
-    multiplayer, ...rest } = gameData;
+    multiplayer, world_b64, ...rest } = gameData;
 
   // v1.4 RENAME FIX: strip top-level columns out of the extra-data spread.
   // The old code leaked name/description/creator/plays (and any passed id)
@@ -153,15 +241,20 @@ export async function createGameRecord(gameData: any) {
     creator: gameData.creator || "",
     plays: 0,
     extraData: {
-      studioState, primitives, spawn_point, sky_color_top, sky_color_bottom,
-      baseplate_color, baseplate_size, max_players,
-      public: isPublic, multiplayer, ...rest,
+      ...worldMeta,
+      public: isPublic ?? worldMeta.public,
+      ...rest,
     } as any,
   };
 
   try {
     const created = await prisma.game.create({ data: row });
-    return flattenGame(created);
+    if (world) {
+      await prisma.gameWorld.create({
+        data: { gameId: id, world: world as any, bytesLen: world.length },
+      }).catch(() => {/* best-effort; game row still created */});
+    }
+    return flattenGame(created, { includeWorld: true, worldB64: world ? bufferToBase64(world) : null });
   } catch (e: any) {
     console.error("[db] createGameRecord error:", e.message);
     return { ...row, ...row.extraData };
@@ -174,9 +267,22 @@ export async function updateGameRecord(gameId: string, updates: any) {
 
   const topLevelUpdates: any = { lastUpdate: new Date() };
   const extraDataUpdates: any = {};
+  // v1.1: extract a new world blob if the update carries one.
+  let newWorld: Buffer | null = null;
+  if (updates.world_b64 !== undefined || updates.studioState !== undefined) {
+    const extracted = extractWorld(updates);
+    newWorld = extracted.world;
+    // Light metadata from the world travels with every republish.
+    for (const [k, v] of Object.entries(extracted.worldMeta)) {
+      extraDataUpdates[k] = v;
+    }
+    delete updates.world_b64;
+    delete updates.studioState;
+    delete updates.primitives;
+  }
   for (const [key, value] of Object.entries(updates)) {
     if (GAME_TOP_LEVEL_FIELDS.includes(key)) topLevelUpdates[key] = value;
-    else extraDataUpdates[key] = value;
+    else if (key !== "primitives") extraDataUpdates[key] = value;
   }
 
   const existingRow = await prisma.game.findUnique({ where: { id: gameId }, select: { extraData: true } });
@@ -191,7 +297,14 @@ export async function updateGameRecord(gameId: string, updates: any) {
       where: { id: gameId },
       data: { ...topLevelUpdates, extraData: newExtraData as any },
     });
-    return flattenGame(updated);
+    if (newWorld) {
+      await prisma.gameWorld.upsert({
+        where: { gameId },
+        create: { gameId, world: newWorld as any, bytesLen: newWorld.length },
+        update: { world: newWorld as any, bytesLen: newWorld.length },
+      }).catch(() => {/* best-effort */});
+    }
+    return flattenGame(updated, { includeWorld: true, worldB64: newWorld ? bufferToBase64(newWorld) : (game.world_b64 ?? null) });
   } catch (e: any) {
     console.error("[db] updateGameRecord error:", e.message);
     return { ...game, ...updates };

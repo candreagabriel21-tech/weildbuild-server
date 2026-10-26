@@ -88,7 +88,10 @@ BLK=$(curl -s -w "\n%{http_code}" -X POST http://localhost:8000/api/friends \
   -d '{"action":"block","username":"WeildBuild","target":"Bob"}')
 status_check "admin blocks Bob returns 200" "200" "$(echo "$BLK" | tail -1)"
 check "admin blocks Bob success" '"success":true' "$(echo "$BLK" | head -1)"
-check "admin blocked_users has Bob" '"blocked_users":\["Bob"\]' "$(curl -s "http://localhost:8000/api/friends?username=WeildBuild" -H "X-Session-Token: $ADMIN_TOKEN")"
+# v1.4.5 API shape: GET /api/friends returns friends/requests only; the
+# authoritative blocked_users comes back on the block/unblock action itself
+# (stripSensitiveFields(user)) — that's also what the client store keeps.
+check "admin blocked_users has Bob" '"blocked_users":\["Bob"\]' "$(echo "$BLK" | head -1)"
 
 echo "── 9. ADMIN unblocks Bob ──"
 UBL=$(curl -s -w "\n%{http_code}" -X POST http://localhost:8000/api/friends \

@@ -13,6 +13,11 @@ import { getUser, sanitizeString, isGuestUser } from "../../db/users";
 import { requireRateLimit } from "../../db/ratelimits";
 import { safeHandler, validateBody, clientIp } from "../../shared/http";
 import { attachUser, requireAuth, originOk } from "../middleware";
+import {
+  bufferFromBase64,
+  isValidWbworldBuffer,
+  WORLD_MAX_BYTES,
+} from "../../shared/wbworld";
 
 export const gamesRouter = Router();
 
@@ -40,6 +45,22 @@ function sanitizeThumbnail(value: unknown): string | undefined {
   if (typeof value !== "string") return undefined;
   if (!/^data:image\/(jpeg|png);base64,/.test(value)) return undefined;
   if (value.length > THUMBNAIL_MAX_CHARS) return undefined;
+  return value;
+}
+
+/** v1.1: validate the encrypted .wbworld blob (base64) a publish carries.
+ * Checks: is a string, decodes as strict base64, has the WBWD1 header +
+ * version, and stays under WORLD_MAX_BYTES decoded. Returns the cleaned
+ * string, or undefined to DROP it (the game row is still created - it just
+ * has no world until the next successful publish). */
+const WORLD_B64_MAX_CHARS = 6_000_000; // > 4MB decoded (4/3 inflation)
+function sanitizeWorldB64(value: unknown): string | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (typeof value !== "string" || value.length === 0) return undefined;
+  if (value.length > WORLD_B64_MAX_CHARS) return undefined;
+  const buf = bufferFromBase64(value);
+  if (!buf || !isValidWbworldBuffer(buf)) return undefined;
+  if (buf.length > WORLD_MAX_BYTES) return undefined;
   return value;
 }
 
@@ -93,10 +114,19 @@ gamesRouter.post("/", safeHandler(async (req, res) => {
   // 1.4.6: side-view thumbnail (studio-generated) - validate or drop
   const thumb = sanitizeThumbnail(gameData.thumbnail);
   if (thumb) gameData.thumbnail = thumb; else delete gameData.thumbnail;
+  // v1.1: encrypted .wbworld world blob - validate or drop
+  const world = sanitizeWorldB64(gameData.world_b64);
+  if (world) gameData.world_b64 = world; else delete gameData.world_b64;
 
   // CRITICAL: Creator is ALWAYS from the session, NEVER from request body
   // The server decides who created the game, not the client
   gameData.creator = sessionUser;
+
+  // v1.4: every PUBLISHED game is PUBLIC. Private work lives on the
+  // player's device (the studio's local drafts) and never reaches this
+  // server at all - so the flag is forced true no matter what the client
+  // sent (older clients may still carry the old toggle).
+  gameData.public = true;
 
   const game = await createGameRecord(gameData);
   return res.status(201).json(game);
@@ -149,9 +179,14 @@ gamesRouter.put("/", safeHandler(async (req, res) => {
   // 1.4.6: side-view thumbnail (studio-generated) - validate or drop
   const thumbUpd = sanitizeThumbnail(updates.thumbnail);
   if (thumbUpd) updates.thumbnail = thumbUpd; else delete updates.thumbnail;
+  // v1.1: encrypted .wbworld world blob - validate or drop
+  const worldUpd = sanitizeWorldB64(updates.world_b64);
+  if (worldUpd) updates.world_b64 = worldUpd; else delete updates.world_b64;
 
   // Never allow changing the creator through an update
   delete updates.creator;
+  // v1.4: published games are always public (see POST above).
+  updates.public = true;
 
   const game = await updateGameRecord(id, updates);
   if (!game) return res.status(404).json({ error: "Game not found" });

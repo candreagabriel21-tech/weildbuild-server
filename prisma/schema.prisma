@@ -123,6 +123,25 @@ model Game {
   @@map("games")
 }
 
+// ─────────────────────────────────────────────────────────────
+// v1.1: GAME WORLDS — every game's full studio state is stored as an
+// encrypted .wbworld blob (the exact format File > Export writes:
+// WBWD1 header + deflate-9 + AES-256-GCM). Kept in a 1:1 side table
+// so game LIST queries never drag the (much larger) blob along, and
+// so the JSONB extra_data stays tiny metadata (thumbnail, max_players,
+// multiplayer flag, spawn point, ...). Decryption happens where the
+// world is needed: the client (play/edit) and the gamehost (server-
+// authoritative multiplayer physics) both share the format code.
+// ─────────────────────────────────────────────────────────────
+model GameWorld {
+  gameId    String   @id @map("game_id")
+  world     Bytes    @map("world")
+  bytesLen  Int      @default(0) @map("bytes_len")
+  updatedAt DateTime @default(now()) @updatedAt @map("updated_at")
+
+  @@map("game_worlds")
+}
+
 // ─────────────────────── NOTIFICATIONS ───────────────────────
 model Notification {
   id        String   @id

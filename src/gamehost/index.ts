@@ -22,10 +22,20 @@ import { config, assertSecrets, SERVER_VERSION } from "../shared/config";
 import { verifyTicket } from "../shared/jwt";
 import { corsOrigin } from "../shared/http";
 import { GameInstanceManager, GameInstance } from "./instances";
+import { WorldSimManager } from "./world-sims";
 
 assertSecrets("gamehost");
 
 const manager = new GameInstanceManager();
+// v1.1: server-authoritative simulations - one physics + rules worker
+// per instance, fed by game:input, broadcasting game:state snapshots.
+const worldSims = new WorldSimManager(manager);
+worldSims.onSnapshot((instanceId, snap) => {
+  // Authoritative state for the whole room (players, changed part
+  // transforms, rule-driven part updates, relayed sound cues, screen
+  // messages). Clients reconcile their local prediction against this.
+  io.to(`instance:${instanceId}`).emit("game:state", snap);
+});
 const startedAt = Date.now();
 const MAIN = config.host.mainServerUrl;
 const INTERNAL_HEADERS = {
@@ -138,8 +148,15 @@ async function registerWithMain(): Promise<void> {
   if (!res.ok) throw new Error(`Main Server (${MAIN}) responded ${res.status}`);
 }
 
-/** Keep retrying registration every 15s until Main accepts us. */
+/** Keep retrying registration until Main accepts us.
+ *
+ * Backoff: the first retry comes fast (500ms) because the overwhelmingly
+ * common failure is benign boot ORDER — the gamehost came up before Main's
+ * HTTP listener was ready (separate services, independent startup). Doubling
+ * up to the 15s steady-state keeps a genuinely unreachable/broken Main from
+ * being hammered. Sequence: 0.5s, 1s, 2s, 4s, 8s, then 15s forever. */
 async function registerLoop(): Promise<void> {
+  let retryMs = 500;
   for (;;) {
     try {
       await registerWithMain();
@@ -151,10 +168,11 @@ async function registerLoop(): Promise<void> {
       registered = false;
       lastRegisterError = e instanceof Error ? e.message : String(e);
       console.warn(
-        `[gamehost] registration with ${MAIN} failed: ${lastRegisterError} — retrying in 15s. ` +
+        `[gamehost] registration with ${MAIN} failed: ${lastRegisterError} — retrying in ${Math.round(retryMs / 100) / 10}s. ` +
           `Check MAIN_SERVER_URL (must be the URL of your REAL Main Server) and INTERNAL_TOKEN (must match Main's).`
       );
-      await new Promise((resolve) => setTimeout(resolve, 15000));
+      await new Promise((resolve) => setTimeout(resolve, retryMs));
+      retryMs = Math.min(retryMs * 2, 15000);
     }
   }
 }
@@ -234,11 +252,14 @@ async function cacheGameMaxPlayers(instanceId: string, gameId: string, fallback:
     if (!res.ok) return;
     const data: unknown = await res.json();
     const game = extractGame(data);
-    const extra = (game as
-      | { extra_data?: { max_players?: unknown }; extraData?: { max_players?: unknown } }
+    // v1.1 FIX: the /api/games response is FLATTENED (extra_data spread to
+    // the top level), so max_players lives at game.max_players. The old
+    // nested reads never matched and silently fell back every time.
+    const g = game as
+      | { max_players?: unknown; extra_data?: { max_players?: unknown }; extraData?: { max_players?: unknown } }
       | null
-      | undefined);
-    const value = Number(extra?.extra_data?.max_players ?? extra?.extraData?.max_players);
+      | undefined;
+    const value = Number(g?.max_players ?? g?.extra_data?.max_players ?? g?.extraData?.max_players);
     const instance = manager.getInstance(instanceId);
     if (!instance) return; // already disposed
     instance.gameMaxPlayers = Number.isFinite(value) && value > 0 ? Math.floor(value) : fallback;
@@ -391,9 +412,41 @@ io.on("connection", (socket) => {
     socket.to(`instance:${instanceId}`).emit("game:playerJoined", { socketId: socket.id, username, avatar });
     io.to(`instance:${instanceId}`).emit("game:players", manager.getPlayers(joined));
 
+    // v1.1: boot the server-authoritative simulation for this instance (idempotent;
+    // the world loads from Main once) and register the player. Until the sim is
+    // ready the client's prediction runs alone - snapshots reconcile it after.
+    void worldSims.ensureSim(joined).then(() => {
+      worldSims.playerJoined(instanceId, socket.id, username);
+    });
+
     console.log(
       `[gamehost] ${username} joined instance ${instanceId} (${joined.players.size}/${joined.maxPlayers})`
     );
+  });
+
+  // ── game:input { instanceId, x, z, jump, sprint, yaw } ──
+  // v1.1: THE authority channel. Clients report camera-relative input at
+  // ~20 Hz; the simulation moves every character server-side and the
+  // game:state snapshots carry the truth back. Numbers are sanitized in
+  // the worker (direction clamped to unit length).
+  socket.on("game:input", (payload: unknown) => {
+    const p = asRecord(payload);
+    const instance = resolvePlayerInstance(socket.id, p.instanceId);
+    if (!instance) return;
+    if (!instance.players.has(socket.id)) return;
+    worldSims.input(instance.id, socket.id, p);
+  });
+
+  // ── game:click { instanceId, partId } ──
+  // v1.1: on_click rules run on the authority - a click is a REQUEST,
+  // the worker's engine decides what happens.
+  socket.on("game:click", (payload: unknown) => {
+    const p = asRecord(payload);
+    const instance = resolvePlayerInstance(socket.id, p.instanceId);
+    if (!instance) return;
+    const partId = typeof p.partId === "string" ? p.partId : "";
+    if (!partId || partId.length > 128) return;
+    worldSims.click(instance.id, partId);
   });
 
   // ── game:move { instanceId, position, rotation, anim? } ──
@@ -424,6 +477,12 @@ io.on("connection", (socket) => {
     if (!instance) return;
     const player = instance.players.get(socket.id);
     if (!player) return;
+
+    // v1.1: with a live server-authoritative simulation this legacy
+    // client-position report is IGNORED (the server owns the transform).
+    // It still works for relay-only instances (ancient games with no
+    // loadable world) so old content keeps running.
+    if (worldSims.hasSim(instance.id)) return;
 
     player.position = position;
     player.rotation = rotation;
@@ -456,6 +515,9 @@ io.on("connection", (socket) => {
     const instance = resolvePlayerInstance(socket.id, p.instanceId);
     if (!instance) return;
 
+    // v1.5: the authoritative rules engine fires on_chat_message triggers.
+    worldSims.chat(instance.id, username, message);
+
     const chatMessage = {
       id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
       username, // anti-spoof: authenticated name
@@ -478,6 +540,7 @@ io.on("connection", (socket) => {
     const instanceId = typeof p.instanceId === "string" ? p.instanceId : undefined;
     const removed = manager.removePlayer(socket.id, instanceId);
     if (!removed) return;
+    worldSims.playerLeft(removed.instance.id, socket.id, removed.player.username);
 
     const room = `instance:${removed.instance.id}`;
     socket.leave(room);
@@ -493,6 +556,7 @@ io.on("connection", (socket) => {
     const removed = manager.removePlayer(socket.id);
     console.log(`[gamehost] disconnect ${socket.id} (${authName(socket)})`);
     if (!removed) return;
+    worldSims.playerLeft(removed.instance.id, socket.id, removed.player.username);
     const room = `instance:${removed.instance.id}`;
     socket.leave(room);
     io.to(room).emit("game:playerLeft", { socketId: socket.id, username: removed.player.username });
@@ -549,6 +613,7 @@ function shutdown(signal: string): void {
   if (shuttingDown) return;
   shuttingDown = true;
   console.log(`\n[gamehost] ${signal} received — shutting down...`);
+  worldSims.stopAll();
   manager.stop();
   io.close(() => {
     // io.close() also closes the attached HTTP server; this is the safety net.

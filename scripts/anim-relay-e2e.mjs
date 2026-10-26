@@ -1,6 +1,9 @@
 // E2E: verify game:move anim relay through the gamehost with two real
 // socket.io clients. Boots nothing itself - expects main (8000) and
-// gamehost (3004) already running (boot-gh.sh).
+// gamehost (3004) already running (use scripts/run-anim-relay.sh or an
+// equivalent boot). v1.1: the gamehost handshake now REQUIRES a signed
+// session ticket (the register/login sessionToken works) - bare sockets
+// are rejected with "Invalid session ticket".
 import { io } from "socket.io-client";
 
 const MAIN = "http://localhost:8000";
@@ -40,14 +43,19 @@ async function main() {
   console.log("joined:", instA, urlA, "|", instB, urlB);
   if (!urlA || !urlB) { console.log("JOIN FAILED"); process.exit(1); }
 
-  // 4. Connect both sockets
-  const sockA = io(urlA, { transports: ["websocket"] });
-  const sockB = io(urlB, { transports: ["websocket"] });
+  // 4. Connect both sockets (with signed tickets - the gamehost rejects
+  //    unauthenticated handshakes). reconnection:false so a failure is a
+  //    loud, immediate error instead of a silent hang.
+  const sockA = io(urlA, { transports: ["websocket"], auth: { token: tokA }, reconnection: false });
+  const sockB = io(urlB, { transports: ["websocket"], auth: { token: tokB }, reconnection: false });
+  const failFast = (who) => (err) => { console.error(`✗ ${who} socket failed:`, err?.message || err); process.exit(1); };
+  sockA.on("connect_error", failFast("A"));
+  sockB.on("connect_error", failFast("B"));
   await Promise.all([
     new Promise(res => sockA.on("connect", res)),
     new Promise(res => sockB.on("connect", res)),
   ]);
-  console.log("sockets connected");
+  console.log("sockets connected (ticket-authenticated)");
 
   // 5. Both join the game room
   sockA.emit("game:join", { instanceId: instA, username: A, avatar: {} });
@@ -67,13 +75,18 @@ async function main() {
   sockA.emit("game:move", { instanceId: instA, position: [4, 2, 6], rotation: [0, 2.0, 0], anim: { walking: true, jumping: false, dying: false, sprint: true } });
   await sleep(800);
 
-  // Also check getPlayers snapshot carries anim
+  // Also check the players-roster snapshot carries anim. The gamehost
+  // broadcasts game:players on MEMBERSHIP CHANGES only (no periodic
+  // broadcast), so B re-joins to trigger a fresh roster emit. A's roster
+  // entry is untouched by B's re-join, so A's last relayed anim survives.
   sockA.emit("game:move", { instanceId: instA, position: [4, 2, 6], rotation: [0, 2.0, 0], anim: { walking: true, jumping: false, dying: false, sprint: true } });
   let playersSnapshot = null;
   sockB.on("game:players", (list) => {
     const me = (list || []).find(p => p.username === A);
     if (me) playersSnapshot = me;
   });
+  await sleep(200);
+  sockB.emit("game:join", { instanceId: instB, username: B, avatar: {} }); // roster refresh
   await sleep(700);
 
   // 7. Report
@@ -86,6 +99,7 @@ async function main() {
   const jumpOk = received.some(p => p.anim?.jumping === true);
   const deathOk = received.some(p => p.anim?.dying === true);
   const walkSprintOk = received.some(p => p.anim?.walking === true && p.anim?.sprint === true);
+  const snapshotOk = !!playersSnapshot?.anim;
   console.log("\nJUMP relay:", jumpOk ? "✓ WORKS" : "✗ BROKEN");
   console.log("DEATH relay:", deathOk ? "✓ WORKS" : "✗ BROKEN");
   console.log("WALK+SPRINT relay:", walkSprintOk ? "✓ WORKS" : "✗ BROKEN");

@@ -22,11 +22,14 @@ check() { # name, expected_substr, actual
 jsonval() { node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{try{const o=JSON.parse(d);const p='$2'.split('.');let v=o;for(const k of p)v=v?.[k];console.log(v??'')}catch{console.log('')}})"; }
 
 cleanup() {
-  [ -n "$MAIN_PID" ] && kill $MAIN_PID 2>/dev/null
-  [ -n "$PG_PID" ] && kill $PG_PID 2>/dev/null
-  pkill -f "dist/main/index.js" 2>/dev/null
-  pkill -f "start-pg.mjs" 2>/dev/null
-  true
+  # Every command is guarded: under `set -e`, a FAILING command inside an
+  # EXIT trap overrides the script's real exit status (killing an
+  # already-dead PID or a pkill that matches nothing both "fail"), which
+  # made this suite report exit 1 even when all 29 checks passed.
+  { [ -n "$MAIN_PID" ] && kill $MAIN_PID 2>/dev/null; } || true
+  { [ -n "$PG_PID" ] && kill $PG_PID 2>/dev/null; } || true
+  pkill -f "dist/main/index.js" 2>/dev/null || true
+  pkill -f "start-pg.mjs" 2>/dev/null || true
 }
 trap cleanup EXIT
 

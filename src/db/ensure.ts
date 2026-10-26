@@ -128,10 +128,68 @@ async function syncOfficialItems(): Promise<void> {
   console.log(`[db-setup] Official shop items re-synced (${synced}/${files.length} items).`);
 }
 
+// ─── v1.1: migrate legacy JSONB games to the .wbworld format ───
+// Games published before v1.1 carry their whole studio state as plain
+// JSON inside games.extra_data. This one-time-per-row migration encrypts
+// each into a GameWorld row (same bytes as File > Export) and strips the
+// heavy fields from extra_data, leaving only light metadata. Idempotent:
+// rows without extra_data.studioState are skipped, already-migrated rows
+// have nothing left to do. Runs on every boot (cheap COUNT first).
+async function migrateGamesToWbworld(): Promise<void> {
+  const { encryptWbworldPayload } = await import("../shared/wbworld");
+  // Find candidate rows (extra_data has a studioState key). Prisma can't
+  // query JSON keys portably, so scan with a light select - games tables
+  // are small (hundreds of rows), and only UNMIGRATED rows do work.
+  const rows = await prisma.game.findMany({
+    select: { id: true, name: true, description: true, extraData: true },
+    take: 5000,
+  });
+  let migrated = 0;
+  let freedBytes = 0;
+  for (const row of rows) {
+    const extra = (row.extraData as any) || {};
+    const studioState = extra.studioState;
+    if (!studioState || typeof studioState !== "object") continue;
+    if (extra.primitives) freedBytes += JSON.stringify(extra.primitives).length;
+    freedBytes += JSON.stringify(studioState).length;
+    // Light metadata (already in extra) keeps living there.
+    const payload = {
+      format: "wbworld",
+      version: 1,
+      name: row.name || "My World",
+      description: row.description || "",
+      multiplayer: extra.multiplayer ?? (extra.max_players ?? 10) > 1,
+      max_players: extra.max_players ?? 10,
+      spawn_point: extra.spawn_point ?? [0, 0.15, 0],
+      studioState,
+      exportedAt: new Date().toISOString(),
+      exportedBy: "boot-migration",
+    };
+    const world = encryptWbworldPayload(payload);
+    await prisma.gameWorld.upsert({
+      where: { gameId: row.id },
+      create: { gameId: row.id, world: world as any, bytesLen: world.length },
+      update: { world: world as any, bytesLen: world.length },
+    });
+    // Strip the heavy fields; keep every light key (thumbnail, flags...).
+    const next: any = { ...extra };
+    delete next.studioState;
+    delete next.primitives;
+    await prisma.game.update({ where: { id: row.id }, data: { extraData: next } });
+    migrated++;
+  }
+  if (migrated > 0) {
+    console.log(
+      `[db-setup] wbworld migration: ${migrated} game(s) converted to the encrypted\n` +
+        `    .wbworld format (~${(freedBytes / 1024).toFixed(0)} KB of JSONB set free).`
+    );
+  }
+}
+
 export async function ensureDatabase(): Promise<void> {
   console.log("─".repeat(58));
   console.log("[db-setup] Automatic database setup started (v1.3.1)");
-  console.log("[db-setup] Step 1/3 — syncing database schema…");
+  console.log("[db-setup] Step 1/4 — syncing database schema…");
 
   const pushed = await runWithRetries(
     "npx prisma db push --skip-generate",
@@ -149,7 +207,7 @@ export async function ensureDatabase(): Promise<void> {
     return;
   }
 
-  console.log("[db-setup] Step 2/3 — checking whether seeding is needed…");
+  console.log("[db-setup] Step 2/4 — checking whether seeding is needed…");
   try {
     const users = await prisma.user.count();
     if (users === 0) {
@@ -177,12 +235,22 @@ export async function ensureDatabase(): Promise<void> {
   // v1.8.1: ALWAYS re-sync the official catalog (idempotent upserts).
   // This is what pushes catalog edits (names/descriptions/prices/colors)
   // to an EXISTING database — a redeploy is all it takes.
-  console.log("[db-setup] Step 3/3 — re-syncing the official shop items…");
+  console.log("[db-setup] Step 3/4 — re-syncing the official shop items…");
   try {
     await syncOfficialItems();
   } catch (err: any) {
     const msg = String(err?.message ?? err).split("\n")[0];
     console.warn(`[db-setup] Official item re-sync failed (non-fatal, retried on next boot): ${msg}`);
+  }
+
+  // v1.1: convert legacy plain-JSON games to the encrypted .wbworld
+  // format (idempotent; skips rows that are already migrated).
+  console.log("[db-setup] Step 4/4 — migrating games to the .wbworld format…");
+  try {
+    await migrateGamesToWbworld();
+  } catch (err: any) {
+    const msg = String(err?.message ?? err).split("\n")[0];
+    console.warn(`[db-setup] wbworld migration failed (non-fatal, retried on next boot): ${msg}`);
   }
 
   console.log("─".repeat(58));

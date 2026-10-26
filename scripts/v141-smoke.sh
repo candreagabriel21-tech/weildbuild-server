@@ -52,7 +52,10 @@ for i in $(seq 1 45); do grep -q "registered with Main Server" /tmp/gh.log 2>/de
 grep -q "registered with Main Server" /tmp/gh.log && echo "  OK  gamehost registered" || { echo "  XX  gamehost never registered"; tail -5 /tmp/gh.log; exit 1; }
 
 echo "── 3. Health + version ──"
-check "main health v1.4.1" '"version":"1.4.1"' "$(curl -s http://localhost:8000/health)"
+# Version is read from package.json so this check never drifts again
+# (it used to hardcode "1.4.1" and broke on every release bump).
+SERVER_VERSION=$(node -e "console.log(require('./package.json').version)")
+check "main health reports server version" "\"version\":\"$SERVER_VERSION\"" "$(curl -s http://localhost:8000/health)"
 check "gamehost health" 'weildbuild-gamehost' "$(curl -s http://localhost:3004/health)"
 
 echo "── 4. Logins ──"

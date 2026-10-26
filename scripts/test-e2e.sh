@@ -41,7 +41,9 @@ check "realtime health" '"weildbuild-realtime"' "$(curl -s http://localhost:3003
 check "gamehost health" '"weildbuild-gamehost"' "$(curl -s http://localhost:3004/health)"
 
 echo "── 4. Version gate ──"
-check "version endpoint" '"minimum":"13.0.0"' "$(curl -s http://localhost:8000/version)"
+# Default gate: CLIENT_MIN_VERSION unset -> "1.0.0" (the platform is on
+# 1.0.x now; the old "13.0.0" expectation predated the renumbering).
+check "version endpoint" '"minimum":"1.0.0"' "$(curl -s http://localhost:8000/version)"
 
 echo "── 5. Auth: admin login (password compat!) ──"
 LOGIN=$(curl -s -X POST http://localhost:8000/api/auth -H "Content-Type: application/json" -d '{"action":"login","username":"WeildBuild","password":"WeildBuild2026!"}')
@@ -53,7 +55,7 @@ check "admin is top_admin" '"admin_role":"top_admin"' "$LOGIN"
 echo "── 6. Auth: register a new user ──"
 REG=$(curl -s -X POST http://localhost:8000/api/auth -H "Content-Type: application/json" -d '{"action":"register","username":"TestPlayer1","password":"testpass123"}')
 check "register success" '"success":true' "$REG"
-check "new user starts with 100 webuy" '"webuy":100' "$REG"
+check "new user starts with 20 webuy" '"webuy":20' "$REG"
 check "new user gets user_key" '"user_key"' "$REG"
 PLAYER_TOKEN=$(echo "$REG" | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>console.log(JSON.parse(d).sessionToken||''))")
 
@@ -70,7 +72,7 @@ check "buy FACE-13 (16 webuy)" '"success":true' "$BUY1"
 BUY2=$(curl -s -X POST http://localhost:8000/api/items -H "Content-Type: application/json" -H "X-Session-Token: $PLAYER_TOKEN" -d '{"username":"TestPlayer1","itemId":"FACE-13"}')
 check "double-buy blocked" "Already owned" "$BUY2"
 BUY3=$(curl -s -X POST http://localhost:8000/api/items -H "Content-Type: application/json" -H "X-Session-Token: $PLAYER_TOKEN" -d '{"username":"TestPlayer1","itemId":"SHIRT-5"}')
-check "unaffordable purchase blocked (100-16=84 < 100)" 'Not enough' "$BUY3"
+check "unaffordable purchase blocked (20-16=4 < 100)" 'Not enough' "$BUY3"
 
 echo "── 9. Friend flow ──"
 FR1=$(curl -s -X POST http://localhost:8000/api/friends -H "Content-Type: application/json" -H "X-Session-Token: $PLAYER_TOKEN" -d '{"action":"request","from":"TestPlayer1","to":"WeildBuild"}')
@@ -92,7 +94,15 @@ echo "  game id: $GAME_ID"
 check "game listable" 'E2E Test World' "$(curl -s http://localhost:8000/api/games)"
 
 echo "── 11. Instance placement (the mini-server flow!) ──"
-sleep 2 # let gamehost register + first heartbeat land
+# Deterministically wait for the gamehost to be registered with Main before
+# asking for placement. Registration retries with a fast backoff (0.5s, 1s,
+# 2s...) because the gamehost usually boots before Main's listener is up.
+for i in $(seq 1 60); do
+  GH_HEALTH=$(curl -s http://localhost:3004/health)
+  echo "$GH_HEALTH" | grep -q '"registered":true' && break
+  sleep 0.5
+done
+check "gamehost registered with Main" '"registered":true' "$GH_HEALTH"
 JOIN=$(curl -s -X POST http://localhost:8000/api/instances/join -H "Content-Type: application/json" -H "X-Session-Token: $PLAYER_TOKEN" -d "{\"gameId\":\"$GAME_ID\"}")
 check "placement returns instance + socketUrl" 'socketUrl' "$JOIN"
 INSTANCE_ID=$(echo "$JOIN" | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>console.log(JSON.parse(d).instanceId||''))")

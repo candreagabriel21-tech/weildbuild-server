@@ -34,7 +34,12 @@ const app = express();
 // ── Middleware ──
 app.set("trust proxy", 1); // Render sits in front (x-forwarded-for)
 app.use(cors({ origin: corsOrigin, credentials: true }));
-app.use(express.json({ limit: "2mb" })); // avatar payloads can be chunky
+// v1.1: 8mb — game publishes now carry the world as an encrypted
+// .wbworld blob (base64). Compressed worlds are tiny (a 1 MB JSON world
+// lands ~20-50 KB), but the cap leaves headroom for chunky thumbnails
+// on top; anything beyond 4 MB of decoded world bytes is rejected in
+// the games route itself.
+app.use(express.json({ limit: "8mb" }));
 
 // ── Health check (Render + uptime monitors) ──
 const startedAt = Date.now();

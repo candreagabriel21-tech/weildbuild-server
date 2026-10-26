@@ -56,8 +56,11 @@ curl -s -o /dev/null http://localhost:8000/health || { echo "main never came up"
 echo "  OK  main up"
 
 echo "── 3. v1.4.2: health endpoints ──"
+# Version is read from package.json so this check never drifts again
+# (it used to hardcode "1.4.2" and broke on every release bump).
+SERVER_VERSION=$(node -e "console.log(require('./package.json').version)")
 MH=$(curl -s http://localhost:8000/health)
-check "main health v1.4.2" '"version":"1.4.2"' "$MH"
+check "main health reports server version" "\"version\":\"$SERVER_VERSION\"" "$MH"
 check "main health reports empty host census" '"registered":0' "$MH"
 
 echo "── 4. Logins ──"
@@ -108,7 +111,7 @@ GH_PID=$!
 for i in $(seq 1 45); do grep -q "registered with Main Server" /tmp/gh.log 2>/dev/null && break; sleep 1; done
 grep -q "registered with Main Server" /tmp/gh.log && echo "  OK  gamehost registered" || { echo "  XX  gamehost never registered"; tail -5 /tmp/gh.log; exit 1; }
 GHH=$(curl -s http://localhost:3004/health)
-check "gamehost health v1.4.2" '"version":"1.4.2"' "$GHH"
+check "gamehost health reports server version" "\"version\":\"$SERVER_VERSION\"" "$GHH"
 check "gamehost health registered:true" '"registered":true' "$GHH"
 check "gamehost health exposes mainUrl" '"mainUrl":"http://localhost:8000"' "$GHH"
 check "gamehost health lastRegisterError null" '"lastRegisterError":null' "$GHH"
