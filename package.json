@@ -50,6 +50,10 @@
     "prisma@6.19.3": true
   },
   "devDependencies": {
-    "embedded-postgres": "^18.4.0-beta.17"
+    "embedded-postgres": "^18.4.0-beta.17",
+    "three": "^0.184.0",
+    "cannon-es": "^0.20.0",
+    "zustand": "^5.0.6",
+    "react": "^19.1.0"
   }
 }

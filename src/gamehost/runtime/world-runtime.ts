@@ -1,9 +1,10 @@
 // ═══════════════════════════════════════════════════════════════════
-// WeildBuild — SERVER-AUTHORITATIVE world runtime (v1.1)
+// WeildBuild — SERVER-AUTHORITATIVE world runtime (v1.2)
 // ═══════════════════════════════════════════════════════════════════
 // Runs INSIDE A WORKER THREAD, one per game instance, on the gamehost.
 // It loads the game's studio state, then runs THE SAME ENGINE THE CLIENT
-// RUNS - imported directly from the platform source, bundled by esbuild:
+// RUNS - imported from server/engine (a synced copy of the platform's
+// src/lib, see scripts/build-world-runtime.mjs), bundled by esbuild:
 //
 //   • PhysicsWorld (cannon-es): every unanchored part, terrain, trees,
 //     joints, body movers - simulated for EVERYONE, once.
@@ -32,8 +33,10 @@
 //     { t: 'error', message }
 //
 // This file is NOT compiled by the server's tsc - scripts/build-world-
-// runtime.mjs bundles it (and the platform sources it imports) with
-// esbuild into dist/gamehost/world-runtime.bundle.js.
+// runtime.mjs bundles it (and the engine/ sources it imports) with esbuild
+// into dist/gamehost/world-runtime.bundle.js. The engine/ folder is a copy
+// of platform/src/lib kept in sync by the build script when the monorepo
+// sibling exists, so STANDALONE deploys (server folder alone) still build.
 
 import { parentPort } from 'node:worker_threads';
 
@@ -88,17 +91,17 @@ async function main(): Promise<void> {
 
   // Dynamic import: the polyfills above must be in place first, and this
   // keeps the (heavy) platform module graph out of workers that never init.
-  const { useStudioStore, isPart } = await import('../../../../platform/src/lib/studio-store');
-  const { restoreStudioState } = await import('../../../../platform/src/lib/studio-project');
-  const { weildCodeEngine } = await import('../../../../platform/src/lib/weildcode-engine');
-  const { PhysicsWorld } = await import('../../../../platform/src/lib/game-engine/physics');
-  const { setSoundSink } = await import('../../../../platform/src/lib/sounds');
+  const { useStudioStore, isPart } = await import('../../../engine/studio-store');
+  const { restoreStudioState } = await import('../../../engine/studio-project');
+  const { weildCodeEngine } = await import('../../../engine/weildcode-engine');
+  const { PhysicsWorld } = await import('../../../engine/game-engine/physics');
+  const { setSoundSink } = await import('../../../engine/sounds');
   const {
     stepHorizontalVelocity, applyJump,
     ACCEL_WALK, ACCEL_STOP, AIR_RELEASE_DECAY, AIR_MOVE_FACTOR,
-  } = await import('../../../../platform/src/lib/game-engine/character-constants');
+  } = await import('../../../engine/game-engine/character-constants');
 
-  type StudioPart = import('../../../../platform/src/lib/studio-store').StudioPart;
+  type StudioPart = import('../../../engine/studio-store').StudioPart;
 
   // ─── Load the world ───
   const studioState = init.studioState;

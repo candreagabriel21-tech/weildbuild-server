@@ -62,6 +62,11 @@ Supabase's free tier deletes inactive databases — Neon doesn't. That's why we'
 
 ## 2. Push the server repo to GitHub (5 min)
 
+> **Self-contained since v1.2:** the server repo builds on its own. The
+> game engine sources it shares with the platform client are vendored in
+> `server/engine/` (a synced copy of `platform/src/lib`), so pushing ONLY
+> the server folder is enough. No `platform/` sibling needed on Render.
+
 1. Create a new GitHub repo, e.g. `weildbuild-server` (private is fine — Render reads private repos).
 2. From the `weildbuild-server` folder:
    ```bash
