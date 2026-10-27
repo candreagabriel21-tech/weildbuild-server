@@ -927,6 +927,23 @@ async function main(): Promise<void> {
 
     // Rule-driven full part updates (color/size/transparency/...).
     const objects = useStudioStore.getState().objects;
+    // v6.2.7: part DELETIONS. The delta loop below only iterates what
+    // EXISTS; ids that were in the last snapshot's object map but are gone
+    // now were deleted since (void falls -> removeObject, rule
+    // destroy_part, moderation clears). Clients do not simulate parts
+    // anymore (v6.2.7 netcode), so without this list a deleted part would
+    // freeze mid-air on every screen instead of disappearing. Computed
+    // BEFORE the loop refreshes lastObjectsRef (which only ever adds or
+    // updates entries, so the order is safe either way).
+    const removedOut: string[] = [];
+    if (lastObjectsRef) {
+      for (const id of lastObjectsRef.keys()) {
+        if (!objects.has(id)) removedOut.push(id);
+      }
+      // Drop them from the diff base so each deletion broadcasts EXACTLY
+      // once (a lingering entry would re-fire on every later snapshot).
+      for (const id of removedOut) lastObjectsRef.delete(id);
+    }
     if (lastObjectsRef) {
       let budget = 200; // per-snapshot cap keeps huge rule storms bounded
       objects.forEach((obj: any, id: string) => {
@@ -958,6 +975,7 @@ async function main(): Promise<void> {
       playersOut.length === 0 &&
       parts.length === 0 &&
       partUpdatesOut.length === 0 &&
+      removedOut.length === 0 &&
       fxOut.length === 0 &&
       messagesOut.length === 0
     ) {
@@ -976,6 +994,10 @@ async function main(): Promise<void> {
       players: playersOut,
       parts,
       partUpdates: partUpdatesOut.splice(0, partUpdatesOut.length),
+      // v6.2.7: part ids deleted since the last snapshot (void falls,
+      // rule destroys). Clients drop the part (mesh + collider + its
+      // interpolation history) the moment this arrives.
+      removed: removedOut,
       fx: fxOut.splice(0, fxOut.length),
       messages: messagesOut.splice(0, messagesOut.length),
     };

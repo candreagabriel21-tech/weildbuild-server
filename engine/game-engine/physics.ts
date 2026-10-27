@@ -379,6 +379,19 @@ export class PhysicsWorld {
    * (classic building game behavior). Computed at play start by PhysicsSimulation. */
   voidY: number = -50;
 
+  // ─── v6.2.7: server-driven parts (multiplayer) ───
+  // In server-authoritative multiplayer the client must NOT simulate
+  // physical objects: the local sim + the per-snapshot correction blend
+  // fought each other (parts buzzed, and the ground under the player's
+  // feet kept shifting, so the character pill fell off blocks and through
+  // surfaces mid-jump). While this flag is set, every UNANCHORED part body
+  // is created KINEMATIC instead of DYNAMIC - gravity/contacts stop
+  // applying - and the play viewport drives its transform every frame from
+  // the interpolated server snapshot stream (exactly how remote characters
+  // render). The local character pill stays DYNAMIC: you collide against
+  // the server's version of every object, which is also exactly what you
+  // see. Singleplayer / Test Play keep the classic fully-local sim (false).
+  serverDrivenParts: boolean = false;
   constructor(settings: PhysicsSettings) {
     this.settings = settings;
 
@@ -549,6 +562,13 @@ export class PhysicsWorld {
     // For anchored parts with mass > 0, set to kinematic so they can be moved
     if (isAnchored && cannonMass > 0) {
       cannonBody.type = CANNON.Body.KINEMATIC;
+    }
+    // v6.2.7: in server-authoritative multiplayer, UNANCHORED parts are
+    // kinematic too - the client no longer simulates physical objects at
+    // all; the snapshot interpolation drives them (see the flag up top).
+    if (!isAnchored && cannonMass > 0 && this.serverDrivenParts) {
+      cannonBody.type = CANNON.Body.KINEMATIC;
+      cannonBody.updateMassProperties();
     }
 
     this.world.addBody(cannonBody);
@@ -1167,10 +1187,46 @@ export class PhysicsWorld {
         part.material ?? 'Plastic',
         part.density,
       );
-      cannonBody.type = CANNON.Body.DYNAMIC;
-      cannonBody.mass = effectiveMass(mass);
-      cannonBody.updateMassProperties();
-      cannonBody.wakeUp();
+      if (this.serverDrivenParts) {
+        // v6.2.7: unanchored stays KINEMATIC in server mode (the snapshot
+        // stream owns its motion - no local sim to hand back to).
+        cannonBody.type = CANNON.Body.KINEMATIC;
+        cannonBody.mass = effectiveMass(mass);
+        cannonBody.updateMassProperties();
+        cannonBody.wakeUp();
+      } else {
+        cannonBody.type = CANNON.Body.DYNAMIC;
+        cannonBody.mass = effectiveMass(mass);
+        cannonBody.updateMassProperties();
+        cannonBody.wakeUp();
+      }
+    }
+  }
+
+  /**
+   * v6.2.7: (Re)apply the server-driven part motion type to every existing
+   * unanchored part body. Called when the flag flips (the play viewport
+   * checks the netcode mode every frame, so the conversion happens whether
+   * the mode was known before the world was built or not):
+   *   true  -> KINEMATIC (the snapshot interpolation drives these)
+   *   false -> DYNAMIC   (classic local simulation resumes)
+   */
+  reapplyPartMotionType(): void {
+    for (const [id, body] of this.bodies) {
+      if (body.anchored) continue;
+      const cannonBody = this.cannonBodies.get(id);
+      if (!cannonBody) continue;
+      if (this.serverDrivenParts) {
+        if (cannonBody.type !== CANNON.Body.KINEMATIC) {
+          cannonBody.type = CANNON.Body.KINEMATIC;
+          cannonBody.updateMassProperties();
+          cannonBody.wakeUp();
+        }
+      } else if (cannonBody.type !== CANNON.Body.DYNAMIC) {
+        cannonBody.type = CANNON.Body.DYNAMIC;
+        cannonBody.updateMassProperties();
+        cannonBody.wakeUp();
+      }
     }
   }
 

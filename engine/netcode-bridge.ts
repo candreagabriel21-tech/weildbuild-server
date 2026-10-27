@@ -1,5 +1,5 @@
 // ═══════════════════════════════════════════════════════════════════
-// WeildBuild — netcode bridge (v1.2, client side)
+// WeildBuild — netcode bridge (v1.3, client side)
 // ═══════════════════════════════════════════════════════════════════
 // The channel between the GamePlayer's Socket.IO connection and the
 // play viewport's frame loop, for SERVER-AUTHORITATIVE multiplayer:
@@ -11,11 +11,14 @@
 //     steady state rides the 30 Hz throttle.
 //
 //   STATE FLOW (server → client, 30 Hz delta snapshots):
-//     GamePlayer ("game:state") → selfHistory (timestamped samples) /
-//     partCorrections → the play viewport renders YOUR character purely
-//     from the interpolated snapshot stream (see sampleInterp below).
-//     No local character prediction exists in server mode - what you see
-//     is what the authority decided, smoothed.
+//     GamePlayer ("game:state") → selfHistory (timestamped samples for
+//     the death/respawn/hp events) + partHistories (timestamped samples
+//     per part). v6.2.7: parts are NO LONGER corrected onto a local
+//     simulation - the client does not simulate physical objects in
+//     multiplayer at all. Every unanchored part renders from its
+//     timestamped interpolation buffer (samplePartInterp below), exactly
+//     like every remote character, and its kinematic collider follows the
+//     same sample - what you see is what you stand on.
 //
 // Singleplayer / Test Play never touches this module (netcode.mode stays
 // 'local' and every field stays null/empty).
@@ -85,6 +88,12 @@ export const SELF_INTERP_DELAY_MS = 100;
 /** Remote characters render a bit further back: extra smoothing costs
  * nothing when it is not your own controls paying for it. */
 export const REMOTE_INTERP_DELAY_MS = 150;
+/** v6.2.7: physical objects render this far behind arrival time (ms) -
+ * the same buffered-interpolation contract as the characters. Parts are
+ * usually what you stand on, so they ride the shorter self-class delay
+ * rather than the remote one: less visible lag between your (locally
+ * simulated) character and the plank it lands on. */
+export const PART_INTERP_DELAY_MS = 100;
 /** Consecutive samples farther apart than this are NOT interpolated
  * across (delta snapshots legitimately skip idle players, and a network
  * hole must not become a slow creep between two distant positions): the
@@ -165,6 +174,81 @@ export interface PartCorrection {
   rz: number;
 }
 
+/** v6.2.7: one timestamped part sample (arrival-clock ms + transform). */
+export interface PartSample extends PartCorrection {
+  t: number;
+}
+
+/** The result of sampling a part interpolation buffer at a render time. */
+export interface PartInterpResult {
+  x: number; y: number; z: number;
+  rx: number; ry: number; rz: number;
+  /** Implied velocity across the interpolated pair (studs/s, deg/s). */
+  vx: number; vy: number; vz: number;
+}
+
+/** Shortest signed delta between two angles expressed in DEGREES
+ * (rotation samples are 0..360; a plain lerp would spin the long way
+ * around across the 359 -> 0 boundary). */
+function shortestDeg(diff: number): number {
+  return ((diff + 180) % 360 + 360) % 360 - 180;
+}
+
+/**
+ * v6.2.7: sample a part's timestamped interpolation buffer at
+ * `renderT` (arrival-clock ms). Same contract as sampleInterp for
+ * characters: linear between two samples closer than `gapCapMs` and
+ * nearer than `teleportStuds` (rotation lerps through the shortest arc
+ * per axis); across a hole or a teleport the EARLIER sample is held and
+ * the snap happens when the clock reaches the newer one. Velocity is
+ * implied by the pair being interpolated. Returns null for an empty
+ * buffer.
+ */
+export function samplePartInterp(
+  buf: PartSample[],
+  renderT: number,
+  gapCapMs: number = INTERP_GAP_CAP_MS,
+  teleportStuds: number = INTERP_TELEPORT_STUDS,
+): PartInterpResult | null {
+  const n = buf.length;
+  if (n === 0) return null;
+  if (n === 1 || renderT <= buf[0].t) {
+    const a = buf[0];
+    return { x: a.x, y: a.y, z: a.z, rx: a.rx, ry: a.ry, rz: a.rz, vx: 0, vy: 0, vz: 0 };
+  }
+  const last = buf[n - 1];
+  if (renderT >= last.t) {
+    return { x: last.x, y: last.y, z: last.z, rx: last.rx, ry: last.ry, rz: last.rz, vx: 0, vy: 0, vz: 0 };
+  }
+  let lo = 0, hi = n - 1;
+  while (lo < hi) {
+    const mid = (lo + hi + 1) >> 1;
+    if (buf[mid].t <= renderT) lo = mid; else hi = mid - 1;
+  }
+  const A = buf[lo], B = buf[lo + 1];
+  const span = B.t - A.t;
+  if (span > gapCapMs || span <= 1) {
+    return { x: A.x, y: A.y, z: A.z, rx: A.rx, ry: A.ry, rz: A.rz, vx: 0, vy: 0, vz: 0 };
+  }
+  const dx = B.x - A.x, dy = B.y - A.y, dz = B.z - A.z;
+  if (dx * dx + dy * dy + dz * dz > teleportStuds * teleportStuds) {
+    return { x: A.x, y: A.y, z: A.z, rx: A.rx, ry: A.ry, rz: A.rz, vx: 0, vy: 0, vz: 0 };
+  }
+  const alpha = (renderT - A.t) / span;
+  const secs = span / 1000;
+  return {
+    x: A.x + dx * alpha,
+    y: A.y + dy * alpha,
+    z: A.z + dz * alpha,
+    rx: A.rx + shortestDeg(B.rx - A.rx) * alpha,
+    ry: A.ry + shortestDeg(B.ry - A.ry) * alpha,
+    rz: A.rz + shortestDeg(B.rz - A.rz) * alpha,
+    vx: dx / secs,
+    vy: dy / secs,
+    vz: dz / secs,
+  };
+}
+
 type InputSender = (input: NetcodeInput) => void;
 type ClickSender = (partId: string) => void;
 
@@ -188,7 +272,10 @@ const pendingJump = { value: false };
 
 let selfCorrection: SelfCorrection | null = null;
 let selfHistory: SelfHistoryEntry[] = [];
-let partCorrections: PartCorrection[] = [];
+// v6.2.7: timestamped interpolation history per part id. This replaces
+// the old correction queue: parts are rendered (and collimated) from the
+// interpolated stream instead of being nudged onto a local simulation.
+let partHistories: Map<string, PartSample[]> = new Map();
 let fxQueue: Array<{ name: string; volume: number }> = [];
 // v6.2.3: ms timestamp of the LAST game:state snapshot (any content). The
 // server re-broadcasts everyone as a keyframe at least every 2s while a
@@ -252,12 +339,11 @@ export function clearSelfHistory(): void {
   selfHistory = [];
 }
 
-/** Queue of authoritative part transforms not yet applied by the local sim. */
-export function drainPartCorrections(): PartCorrection[] {
-  if (partCorrections.length === 0) return [];
-  const out = partCorrections;
-  partCorrections = [];
-  return out;
+/** v6.2.7: the timestamped snapshot history per part (what the play
+ * viewport samples at now - PART_INTERP_DELAY_MS to render AND collide
+ * physical objects). */
+export function getPartHistories(): Map<string, PartSample[]> {
+  return partHistories;
 }
 
 /** Drain queued sound cues the server relayed (played locally). */
@@ -272,6 +358,10 @@ export function drainFx(): Array<{ name: string; volume: number }> {
 export function pushSnapshot(data: {
   self?: { socketId: string; x: number; y: number; z: number; yaw: number; hp: number; dying: boolean; seq: number; anim?: { walking?: boolean; jumping?: boolean; sprint?: boolean } };
   parts?: PartCorrection[];
+  /** v6.2.7: part ids the authority deleted (void falls, rule
+   * destroy_part, ...) - their histories die here and GamePlayer removes
+   * them from the store, so nothing lingers or freezes mid-air. */
+  removed?: string[];
   fx?: Array<{ name: string; volume: number }>;
 }): void {
   lastSnapshotAt = typeof performance !== 'undefined' ? performance.now() : Date.now();
@@ -302,11 +392,34 @@ export function pushSnapshot(data: {
     if (selfHistory.length > 48) selfHistory.splice(0, selfHistory.length - 48);
   }
   if (data.parts && data.parts.length > 0) {
-    // Cap the queue: if the local sim stalled (tab hidden), drop the oldest.
-    partCorrections.push(...data.parts);
-    if (partCorrections.length > 6000) {
-      partCorrections = partCorrections.slice(-3000);
+    // v6.2.7: append to the part's interpolation history. A gap larger
+    // than the cap means the delta stream went idle for this part (it
+    // settled) or the part left everyone's interest radius - the stale
+    // samples are dropped so the next live sample lands FRESH instead of
+    // slowly creeping between two distant positions.
+    for (const p of data.parts) {
+      let hist = partHistories.get(p.id);
+      if (!hist) {
+        hist = [];
+        partHistories.set(p.id, hist);
+      } else if (lastSnapshotAt - hist[hist.length - 1].t > INTERP_GAP_CAP_MS) {
+        hist.length = 0;
+      }
+      hist.push({ ...p, t: lastSnapshotAt });
+      // 24 samples = 800 ms of 30 Hz stream - far beyond the render
+      // delay; enough margin for a packet hole, cheap to scan.
+      if (hist.length > 24) hist.splice(0, hist.length - 24);
     }
+    // Memory cap for huge worlds (stale ids cost memory, not CPU - the
+    // driver skips bodies that no longer exist).
+    if (partHistories.size > 8192) {
+      const entries = Array.from(partHistories.entries());
+      entries.sort((a, b) => a[1][a[1].length - 1].t - b[1][b[1].length - 1].t);
+      for (let i = 0; i < 2048; i++) partHistories.delete(entries[i][0]);
+    }
+  }
+  if (data.removed && data.removed.length > 0) {
+    for (const id of data.removed) partHistories.delete(id);
   }
   if (data.fx && data.fx.length > 0) fxQueue.push(...data.fx);
 }
@@ -316,7 +429,7 @@ export function resetNetcodeBridge(): void {
   inputSender = null;
   selfCorrection = null;
   selfHistory = [];
-  partCorrections = [];
+  partHistories = new Map();
   fxQueue = [];
   pendingJump.value = false;
   lastInputSentAt = 0;
