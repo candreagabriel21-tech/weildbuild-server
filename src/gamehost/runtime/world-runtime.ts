@@ -65,6 +65,17 @@ interface RuntimePlayer {
   hp: number;
   dyingTimer: number;   // > 0 while the death animation plays
   jumpCooldown: number;
+  /** v6.2.4: latched "airborne because of a jump" flag. The old
+   * velocity-y-threshold jumping flag flipped false at the apex and (much
+   * worse) flipped TRUE again for a tick when the landing impact resolved
+   * with a small upward velocity spike - every client rendered the jump
+   * animation and played the jump sound TWICE (once at the jump, once at
+   * landing). The latch is set by the actual jump impulse and cleared by
+   * the first grounded tick after a short grace, so its rising edge IS the
+   * jump and its falling edge IS the landing. */
+  airborneFromJump: boolean;
+  /** Seconds since the jump impulse set airborneFromJump (grace timer). */
+  jumpAge: number;
   velX: number;         // smoothed horizontal velocity (prediction mirror)
   velZ: number;
   yaw: number;
@@ -241,6 +252,8 @@ async function main(): Promise<void> {
       hp: useStudioStore.getState().playState.characterMaxHealth || 100,
       dyingTimer: 0,
       jumpCooldown: 0,
+      airborneFromJump: false,
+      jumpAge: 0,
       velX: 0,
       velZ: 0,
       yaw: rootRot?.y ? (rootRot.y * Math.PI) / 180 : 0,
@@ -512,6 +525,18 @@ async function main(): Promise<void> {
       const coyote = grounded || (p.lastGroundedAt += dt) <= JUMP_COYOTE_SECONDS;
       world.setNamedCharacterStanding(p.socketId, grounded && p.input.x === 0 && p.input.z === 0);
 
+      // v6.2.4: age the jump latch and clear it on the first grounded tick
+      // past a short grace (the impulse lands after this ground check in the
+      // same tick, and the body needs a tick or two to actually leave the
+      // ground, so a fresh jump must not clear itself immediately).
+      if (p.airborneFromJump) {
+        p.jumpAge += dt;
+        if (grounded && p.jumpAge > 0.15) {
+          p.airborneFromJump = false;
+          p.jumpAge = 0;
+        }
+      }
+
       // Smoothed target velocity (the client's two-stage ramp).
       const stepped = stepHorizontalVelocity(p.velX, p.velZ, p.input.x, p.input.z, p.input.sprint, grounded, dt);
       p.velX = stepped.velX;
@@ -530,6 +555,11 @@ async function main(): Promise<void> {
             body.velocity.set(j.x, j.y, j.z);
             p.jumpCooldown = 0.5;
             p.lastGroundedAt = JUMP_COYOTE_SECONDS + 1; // jump consumed the grace
+            // v6.2.4: the ONE rising edge of the jump animation. It stays
+            // latched until the landing clears it - no more apex dips or
+            // landing-impact re-triggers.
+            p.airborneFromJump = true;
+            p.jumpAge = 0;
           }
         }
       }
@@ -655,15 +685,19 @@ async function main(): Promise<void> {
       });
     }
 
-    // 5b. v6.2.2 SLOW BODY SYNC (0.5 s, mirrors the client's PhysicsSimulation
-    //     slow path): parts CREATED by rules during play (when_created /
-    //     create_part) never had a physics body on the server - players
-    //     walked straight through rule-spawned walls while their own client
-    //     showed a collision (a major rubber-band source). Also removes
-    //     bodies whose store part was deleted and pushes rule-moved
-    //     anchored positions into the physics world.
+    // 5b. v6.2.2 SLOW BODY SYNC (v6.2.4: 0.15 s, mirrors the client's
+    //     PhysicsSimulation slow path): parts CREATED by rules during play
+    //     (when_created / create_part) never had a physics body on the server
+    //     - players walked straight through rule-spawned walls while their own
+    //     client showed a collision (a major rubber-band source). Also removes
+    //     bodies whose store part was deleted and pushes rule-moved anchored
+    //     positions into the physics world. The pass used to run every 0.5 s:
+    //     a freshly spawned part spent up to half a second as a ghost the
+    //     character (and other parts) passed straight through - "characters
+    //     sometimes pass through unanchored parts". 0.15 s shrinks that ghost
+    //     window to a blink while keeping the pass cheap (one light forEach).
     slowPassAccum += dt;
-    if (slowPassAccum >= 0.5) {
+    if (slowPassAccum >= 0.15) {
       slowPassAccum = 0;
       const objectsNow = useStudioStore.getState().objects;
       objectsNow.forEach((obj: any) => {
@@ -680,6 +714,9 @@ async function main(): Promise<void> {
         if (pb.anchored !== obj.anchored) {
           pb.anchored = obj.anchored;
           pb._anchoredDirty = true;
+          // v6.2.4: push the flip into the CANNON body too (type + mass) -
+          // the mirror flag alone left the boot-time body type in place.
+          try { world.refreshBodyAnchored(obj); } catch { /* never kill the pass */ }
           if (obj.anchored) activeIds.delete(obj.id);
           else { activeIds.add(obj.id); pb.isAwake = true; }
         }
@@ -767,7 +804,11 @@ async function main(): Promise<void> {
       const z = body.position.z;
       const anim = {
         walking: isWalking && p.dyingTimer <= 0,
-        jumping: p.dyingTimer <= 0 && body.velocity.y > 0.5,
+        // v6.2.4: the LATCHED flag (see RuntimePlayer.airborneFromJump). The
+        // old velocity-y > 0.5 test flipped false at the apex (landing cues
+        // fired mid-air) and true again on the landing impact spike (the
+        // "jump animation and sound play twice" bug).
+        jumping: p.dyingTimer <= 0 && p.airborneFromJump,
         dying: p.dyingTimer > 0,
         sprint: isWalking && p.input.sprint,
       };

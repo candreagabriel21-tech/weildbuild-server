@@ -361,6 +361,20 @@ export class PhysicsWorld {
    *  frictionless one while moving (slides along walls/ramps freely). */
   private characterStandingMaterial: CANNON.Material | null = null;
 
+  // ─── v6.2.4: adaptive substepping (anti-tunneling) ───
+  // User report: "characters sometimes pass through unanchored parts".
+  // cannon-es has no CCD, and a fast body (a brick flung by an explosion at
+  // the 120 u/s part speed cap = 2 studs per 60 Hz step, a character at
+  // terminal fall = 0.83) can skip a thin part's whole overlap band in ONE
+  // integration step (the character pill's spheres are ~0.4 radius, so a
+  // 0.2-thick brick is passed through whenever a step moves ~1 stud).
+  // FIX: keep the per-step displacement budgeted at ~0.5 studs by raising
+  // the fixed-step frequency while anything dynamic is fast. The speeds are
+  // read from the PREVIOUS step (capVelocities already computes them for
+  // free) plus an impulse kick estimate, so the check costs nothing extra.
+  private _lastPartSpeed = 0;
+  private _impulseSpeedKick = 0;
+
   /** v13.6: the void line - unanchored parts that fall below it are deleted
    * (classic building game behavior). Computed at play start by PhysicsSimulation. */
   voidY: number = -50;
@@ -1121,6 +1135,45 @@ export class PhysicsWorld {
     };
   }
 
+  /**
+   * v6.2.4: a part's anchored flag flipped during play (properties panel,
+   * WeildCode rules, the server's slow body sync). The PhysicsBody MIRROR
+   * was already flipped by the caller; this pushes the change into the
+   * CANNON body itself (type + mass). Before, the cannon body kept its
+   * boot-time type forever: a part unanchored mid-play stayed STATIC
+   * (froze mid-air, unpushable) and a part anchored mid-play kept falling -
+   * and character contact behavior against it was wrong in both cases.
+   */
+  refreshBodyAnchored(part: {
+    id: string;
+    type?: string;
+    size: { x: number; y: number; z: number };
+    material?: string;
+    density?: number;
+  }): void {
+    const body = this.bodies.get(part.id);
+    const cannonBody = this.cannonBodies.get(part.id);
+    if (!body || !cannonBody) return;
+    if (body.anchored) {
+      cannonBody.type = CANNON.Body.STATIC;
+      cannonBody.mass = 0;
+      cannonBody.updateMassProperties();
+      cannonBody.velocity.set(0, 0, 0);
+      cannonBody.angularVelocity.set(0, 0, 0);
+    } else {
+      const mass = calculateMass(
+        part.type ?? 'Block',
+        part.size,
+        part.material ?? 'Plastic',
+        part.density,
+      );
+      cannonBody.type = CANNON.Body.DYNAMIC;
+      cannonBody.mass = effectiveMass(mass);
+      cannonBody.updateMassProperties();
+      cannonBody.wakeUp();
+    }
+  }
+
   // ─── Simulation Step ───
 
   step(deltaTime: number): void {
@@ -1137,8 +1190,32 @@ export class PhysicsWorld {
     // 2. Update gravity from settings (may have changed)
     this.world.gravity.set(0, this.settings.gravity, 0);
 
-    // 3. Step the cannon-es world
-    this.world.step(1 / 60, dt, 3);
+    // 3. Step the cannon-es world. v6.2.4 ADAPTIVE SUBSTEPS: while any
+    //    dynamic body (part or character pill) is fast, the fixed-step
+    //    frequency rises so every integration step moves at most ~0.5
+    //    studs - fast parts can no longer tunnel through characters (and
+    //    fast-falling characters can no longer tunnel through thin parts).
+    //    Speeds come from the previous step's scan + this step's impulse
+    //    kicks, so the tier check itself is free.
+    let charSpeed = 0;
+    if (this.characterBody) {
+      const v = this.characterBody.velocity;
+      charSpeed = Math.sqrt(v.x * v.x + v.y * v.y + v.z * v.z);
+    }
+    for (const entry of this.namedCharacters.values()) {
+      const v = entry.body.velocity;
+      const s = Math.sqrt(v.x * v.x + v.y * v.y + v.z * v.z);
+      if (s > charSpeed) charSpeed = s;
+    }
+    const peakSpeed = Math.max(this._lastPartSpeed, charSpeed, this._impulseSpeedKick);
+    this._impulseSpeedKick = 0;
+    // ~0.5 studs of travel per integration step at every tier.
+    const fixedStep = peakSpeed > 120 ? 1 / 480
+      : peakSpeed > 60 ? 1 / 240
+      : peakSpeed > 30 ? 1 / 120
+      : 1 / 60;
+    const maxSubSteps = fixedStep >= 1 / 60 ? 3 : Math.ceil(dt / fixedStep) + 2;
+    this.world.step(fixedStep, dt, maxSubSteps);
 
     // 4. Sync cannon body positions back to PhysicsBody entries
     this.syncCannonToPhysicsBodies();
@@ -1205,6 +1282,11 @@ export class PhysicsWorld {
             cannonBody.applyImpulse(
               new CANNON.Vec3(impulse.force.x, impulse.force.y, impulse.force.z)
             );
+            // v6.2.4: an impulse about to launch this body - feed the
+            // substep picker right away (the velocity scan only sees it
+            // AFTER this step has already run).
+            const kick = Math.hypot(impulse.force.x, impulse.force.y, impulse.force.z) / effMass;
+            if (kick > this._impulseSpeedKick) this._impulseSpeedKick = kick;
           } else {
             body.velocity.x += impulse.force.x / effMass;
             body.velocity.y += impulse.force.y / effMass;
@@ -1454,6 +1536,7 @@ export class PhysicsWorld {
   }
 
   private capVelocities(): void {
+    let maxSpeed = 0;
     for (const body of this.bodies.values()) {
       if (body.anchored) continue;
       const speed = Math.sqrt(
@@ -1461,6 +1544,7 @@ export class PhysicsWorld {
         body.velocity.y * body.velocity.y +
         body.velocity.z * body.velocity.z
       );
+      if (speed > maxSpeed) maxSpeed = speed; // v6.2.4: feeds the substep picker
       // v13.7: PART_SPEED_CAP - the solver can slingshot a resting part to
       // 200+ u/s when a heavy body (the character) lands hard on a pile with
       // the stronger gravity; whole stacks would visibly explode. 120 u/s is
@@ -1489,6 +1573,8 @@ export class PhysicsWorld {
         }
       }
     }
+    // v6.2.4: pre-cap top speed feeds next step's substep picker.
+    this._lastPartSpeed = maxSpeed;
   }
 
   // ─── Impulse Tracking ───
