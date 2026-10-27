@@ -392,6 +392,7 @@ export class PhysicsWorld {
   // the server's version of every object, which is also exactly what you
   // see. Singleplayer / Test Play keep the classic fully-local sim (false).
   serverDrivenParts: boolean = false;
+
   constructor(settings: PhysicsSettings) {
     this.settings = settings;
 
