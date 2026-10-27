@@ -17,6 +17,10 @@
 // the recorder off mid-test re-delivered stale flight snapshots and
 // produced phantom edges in an earlier version of this test.
 //
+// v6.2.8: runs in SAVED server-sim mode (PLAYER_NETCODE_MODE=server-sim) -
+// the instant-fire input path is the SAVED v6.2.5 behavior; this test
+// proves that path still works behind the flag.
+//
 // Usage: npx tsx tests/test-instant-jump.ts
 // (run `node scripts/build-world-runtime.mjs` first)
 
@@ -24,6 +28,9 @@ import assert from "node:assert";
 import { Worker } from "node:worker_threads";
 import { join } from "node:path";
 import { existsSync } from "node:fs";
+
+// SAVED MODE: the worker inherits this env at spawn.
+process.env.PLAYER_NETCODE_MODE = "server-sim";
 
 const bundle = join(__dirname, "..", "dist", "gamehost", "world-runtime.bundle.js");
 if (!existsSync(bundle)) {

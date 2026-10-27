@@ -488,6 +488,9 @@ io.on("connection", (socket) => {
   // the simulation moves every character server-side and the game:state
   // snapshots carry the truth back. Numbers are sanitized in the worker
   // (direction clamped to unit length).
+  // v6.2.8: SAVED path - consumed only while the worker runs
+  // PLAYER_NETCODE_MODE=server-sim. The client still streams it so the
+  // server can flip back without a client redeploy.
   socket.on("game:input", (payload: unknown) => {
     const p = asRecord(payload);
     const instance = resolvePlayerInstance(socket.id, p.instanceId);
@@ -495,6 +498,25 @@ io.on("connection", (socket) => {
     if (!instance.players.has(socket.id)) return;
     socket.data.lastSeen = Date.now(); // duplicate guard liveness
     worldSims.input(instance.id, socket.id, p);
+  });
+
+  // ── game:report { instanceId, x, y, z, vx, vy, vz, yaw, walking, sprint,
+  //                 jumping, grounded } ──
+  // v6.2.8: the Roblox-style client-authoritative channel (DEFAULT mode).
+  // Each client simulates its OWN character locally (the singleplayer feel)
+  // and streams its state to the server every 0.25 s. The server applies
+  // tiny light checks (a 500-stud teleport cap + an implied-speed cap),
+  // keeps a kinematic ghost pill so characters still push world physics,
+  // and relays the state to everyone else (whose clients interpolate).
+  // hp / death / respawn / rules remain fully server-owned.
+  socket.on("game:report", (payload: unknown) => {
+    const p = asRecord(payload);
+    if (typeof p.x !== "number" || typeof p.y !== "number" || typeof p.z !== "number") return;
+    const instance = resolvePlayerInstance(socket.id, p.instanceId);
+    if (!instance) return;
+    if (!instance.players.has(socket.id)) return;
+    socket.data.lastSeen = Date.now(); // duplicate guard liveness
+    worldSims.report(instance.id, socket.id, p);
   });
 
   // ── game:click { instanceId, partId } ──

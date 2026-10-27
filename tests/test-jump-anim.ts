@@ -16,6 +16,10 @@
 //   falling edge = the landing. Exactly one of each, and the falling edge
 //   happens AT THE GROUND, not at the apex.
 //
+// v6.2.8: runs in SAVED server-sim mode (PLAYER_NETCODE_MODE=server-sim) -
+// the jump latch is computed by the SAVED server-side character simulation;
+// this test proves that path still works behind the flag.
+//
 // Usage: npx tsx tests/test-jump-anim.ts
 // (run `node scripts/build-world-runtime.mjs` first)
 
@@ -23,6 +27,9 @@ import assert from "node:assert";
 import { Worker } from "node:worker_threads";
 import { join } from "node:path";
 import { existsSync } from "node:fs";
+
+// SAVED MODE: the worker inherits this env at spawn.
+process.env.PLAYER_NETCODE_MODE = "server-sim";
 
 const bundle = join(__dirname, "..", "dist", "gamehost", "world-runtime.bundle.js");
 if (!existsSync(bundle)) {

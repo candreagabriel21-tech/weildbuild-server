@@ -183,14 +183,21 @@ async function main(): Promise<void> {
     // prune logic would drop them - verify at least once more here)
 
     // ── 5. Movement resumes the delta stream ──
+    // v6.2.8: movement is now CLIENT REPORTS (the Roblox-style relay): the
+    // test acts as the owning client, simulating a walk at ~10.8 studs/s and
+    // shipping its position every 250 ms (the real client cadence). The
+    // relay broadcasts one delta per accepted report (~4/s) + keyframes -
+    // a far cry from the old 30 Hz simulated stream, which is the point.
+    let walkX = 0;
     const walk = setInterval(() => {
-      worker.postMessage({ t: 'input', socketId: 's-alice', x: 1, z: 0, jump: false, sprint: false, yaw: 0 });
-    }, 50);
-    const movingCount = await countSnapshots(worker, 1000);
+      walkX += 2.7; // 10.8 studs/s * 0.25 s
+      worker.postMessage({ t: 'report', socketId: 's-alice', x: walkX, y: 0, z: 0, vx: 10.8, vy: 0, vz: 0, yaw: Math.PI / 2, walking: true, sprint: false, jumping: false, grounded: true });
+    }, 250);
+    const movingCount = await countSnapshots(worker, 1100);
     clearInterval(walk);
-    worker.postMessage({ t: 'input', socketId: 's-alice', x: 0, z: 0, jump: false, sprint: false, yaw: 0 });
-    assert.ok(movingCount >= 5, `moving player streams deltas (got ${movingCount}/s)`);
-    console.log(`✓ movement resumes the delta stream: ${movingCount} snapshots in 1s`);
+    worker.postMessage({ t: 'report', socketId: 's-alice', x: walkX, y: 0, z: 0, vx: 0, vy: 0, vz: 0, yaw: Math.PI / 2, walking: false, sprint: false, jumping: false, grounded: true });
+    assert.ok(movingCount >= 3, `moving player streams deltas (got ${movingCount} in 1.1s at the 4 Hz report cadence)`);
+    console.log(`✓ movement resumes the delta stream: ${movingCount} snapshots in 1.1s (report cadence)`);
 
     // ── 6. Leave -> full silence again ──
     worker.postMessage({ t: 'playerLeave', socketId: 's-alice' });

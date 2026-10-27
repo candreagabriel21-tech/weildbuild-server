@@ -40,6 +40,39 @@ export const SERVER_SNAPSHOT_HZ = 30;
  * netcode-bridge) so the authority reacts the moment a key changes. */
 export const CLIENT_INPUT_HZ = 30;
 
+// ─── v6.2.8: PLAYER NETCODE MODE (the Roblox-style relay) ───
+//
+// How the gamehost treats PLAYER CHARACTERS:
+//
+//   'client-report' (DEFAULT, the Roblox model)
+//     The owning client simulates its own character (the full local
+//     singleplayer controller) and REPORTS its state to the server on a
+//     fixed heartbeat. The server accepts the report (after tiny light
+//     sanity checks - a hard per-report teleport cap and an implied-speed
+//     cap), keeps a KINEMATIC ghost pill for world interactions (your
+//     character still shoves crates server-side), and relays the state to
+//     everyone else, whose clients interpolate between the 4 Hz samples.
+//     hp / death / respawn / rules stay 100% server-owned. Exploit-prone
+//     by design (client-authoritative positions) - the light checks are
+//     sanity rails, not security.
+//
+//   'server-sim' (SAVED v6.2.5-v6.2.7 behavior)
+//     The server simulates every character itself from the 30 Hz game:input
+//     stream (input -> velocity -> cannon body, coyote-time jumps fired on
+//     message arrival) and broadcasts the simulated transforms. Restore by
+//     running the gamehost with PLAYER_NETCODE_MODE=server-sim - the client
+//     still sends the input stream alongside the reports, so flipping back
+//     needs NO client change (remote characters just render with some extra
+//     interpolation delay until clients catch up).
+export type PlayerNetcodeMode = 'client-report' | 'server-sim';
+export const PLAYER_NETCODE_MODE: PlayerNetcodeMode = 'client-report';
+
+/** How often each client reports its own character state to the server
+ * (ms) in client-report mode - "the server reads client data every 0.25
+ * seconds". Other players' screens interpolate between these samples, so
+ * this is the smoothness/bandwidth dial for REMOTE characters. */
+export const CLIENT_REPORT_INTERVAL_MS = 250;
+
 /**
  * The shared velocity-integration core. Given the previous horizontal
  * velocity, the desired input direction (camera-relative, unit length or

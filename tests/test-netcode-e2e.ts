@@ -201,18 +201,26 @@ async function main() {
     assert.ok(fell, 'the boulder fell in the authoritative physics');
     console.log('✓ world physics simulated server-side (boulder fell)');
 
-    // ── 7. Alice walks: input -> server movement -> snapshots ──
+    // ── 7. Alice walks: client reports -> relay -> snapshots ──
+    // v6.2.8 (Roblox-style relay): the client simulates its OWN character
+    // and streams its state every 0.25 s; the server relays it (with the
+    // light sanity checks) to everyone. This test plays the owning client.
     const startX = a.position[0];
+    let clientX = startX;
     const walk = setInterval(() => {
-      alice.emit('game:input', { instanceId, x: 1, z: 0, jump: false, sprint: false, yaw: 0 });
-    }, 50);
+      clientX += 2.7; // 10.8 studs/s * 0.25 s (the real client cadence)
+      alice.emit('game:report', { instanceId, x: clientX, y: 0, z: 0, vx: 10.8, vy: 0, vz: 0, yaw: Math.PI / 2, walking: true, sprint: false, jumping: false, grounded: true });
+    }, 250);
     const moved = await waitEvent(alice, 'game:state',
       (m: any) => m.players?.some((p: any) => p.username === 'Alice' && p.position[0] > startX + 1), 8000).catch(() => null);
     clearInterval(walk);
-    alice.emit('game:input', { instanceId, x: 0, z: 0, jump: false, sprint: false, yaw: 0 });
-    assert.ok(moved, `alice moved +X server-side (${startX.toFixed(2)} -> ?)`);
+    alice.emit('game:report', { instanceId, x: clientX, y: 0, z: 0, vx: 0, vy: 0, vz: 0, yaw: Math.PI / 2, walking: false, sprint: false, jumping: false, grounded: true });
+    assert.ok(moved, `alice moved +X via her own reports (${startX.toFixed(2)} -> ?)`);
     const aMoved = moved.players.find((p: any) => p.username === 'Alice');
-    console.log(`✓ movement authority: Alice ${startX.toFixed(2)} -> ${aMoved.position[0].toFixed(2)}`);
+    console.log(`✓ client-report relay: Alice ${startX.toFixed(2)} -> ${aMoved.position[0].toFixed(2)}`);
+    // The relayed velocity rides along (the client's own, echoed back).
+    assert.ok(Array.isArray(aMoved.velocity) && aMoved.velocity.length === 3, 'the report velocity is relayed with the transform');
+    assert.ok(Math.abs(aMoved.velocity[0] - 10.8) < 0.01, `relayed velocity matches the report (${aMoved.velocity[0]})`);
 
     // Bob sees Alice move in HIS snapshots too
     const bobSees = await waitEvent(bob, 'game:state',
@@ -220,12 +228,44 @@ async function main() {
     assert.ok(bobSees, 'bob observed alice moving');
     console.log('✓ bob observed alice moving');
 
-    // ── 8. Alice jumps ──
-    alice.emit('game:input', { instanceId, x: 0, z: 0, jump: true, sprint: false, yaw: 0 });
+    // ── 8. Alice jumps (her client simulates it; the relay just carries it) ──
+    await sleep(250); // clear the flood guard from the walk-stop report
+    alice.emit('game:report', { instanceId, x: clientX, y: 1.4, z: 0, vx: 0, vy: 9.5, vz: 0, yaw: Math.PI / 2, walking: false, sprint: false, jumping: true, grounded: false });
     const jumped = await waitEvent(alice, 'game:state',
-      (m: any) => m.players?.some((p: any) => p.username === 'Alice' && p.position[1] > 0.8), 8000).catch(() => null);
-    assert.ok(jumped, 'jump went airborne');
-    console.log('✓ jump authority');
+      (m: any) => m.players?.some((p: any) => p.username === 'Alice' && p.position[1] > 0.8 && p.anim?.jumping === true), 8000).catch(() => null);
+    assert.ok(jumped, 'the relayed jump arc + jumping pose arrived');
+    console.log('✓ jump relayed (position + anim flags)');
+
+    // ── 8b. v6.2.8 light checks: the 500-stud teleport is rejected ──
+    // (see the next frame that carries Alice: her position stays put)
+    const beforeCheat: any = await waitEvent(alice, 'game:state', (m: any) => Array.isArray(m.players) && m.players.some((p: any) => p.username === 'Alice'), 5000);
+    const axCheat = beforeCheat.players.find((p: any) => p.username === 'Alice').position[0];
+    for (let i = 0; i < 3; i++) {
+      alice.emit('game:report', { instanceId, x: axCheat + 800, y: 0, z: 0, vx: 0, vy: 0, vz: 0, yaw: 0, walking: false, sprint: false, jumping: false, grounded: true });
+      await sleep(200); // over the flood-guard interval so each hits the check
+    }
+    const afterCheat: any = await waitEvent(alice, 'game:state', (m: any) => Array.isArray(m.players) && m.players.some((p: any) => p.username === 'Alice'), 5000);
+    const axAfterCheat = afterCheat.players.find((p: any) => p.username === 'Alice').position[0];
+    assert.ok(Math.abs(axAfterCheat - axCheat) < 10, `500-stud teleport report rejected (x ${axCheat.toFixed(1)} -> ${axAfterCheat.toFixed(1)})`);
+    console.log('✓ light check: a 500-stud jump in one report is rejected');
+
+    // ── 8c. light checks: sustained speed hacking is rejected (and never
+    //      adopted inside a short burst - the streak needs 8+ rejections) ──
+    // A clean report first, so the hack burst's implied speeds are measured
+    // against a fresh baseline clock (a long stall legitimately covers more
+    // ground - the checks must not reject a resumed honest client).
+    alice.emit('game:report', { instanceId, x: axAfterCheat, y: 0, z: 0, vx: 0, vy: 0, vz: 0, yaw: 0, walking: false, sprint: false, jumping: false, grounded: true });
+    let hackX = axAfterCheat;
+    const hack = setInterval(() => {
+      hackX += 150; // 600 studs/s implied - far over the 120 cap
+      alice.emit('game:report', { instanceId, x: hackX, y: 0, z: 0, vx: 0, vy: 0, vz: 0, yaw: 0, walking: true, sprint: false, jumping: false, grounded: true });
+    }, 250);
+    await sleep(1600); // ~6 rejected reports - below the adopt threshold of 8
+    clearInterval(hack);
+    const afterHack: any = await waitEvent(alice, 'game:state', (m: any) => Array.isArray(m.players) && m.players.some((p: any) => p.username === 'Alice'), 5000);
+    const axAfterHack = afterHack.players.find((p: any) => p.username === 'Alice').position[0];
+    assert.ok(Math.abs(axAfterHack - axAfterCheat) < 10, `speed-hack reports rejected (x ${axAfterCheat.toFixed(1)} -> ${axAfterHack.toFixed(1)})`);
+    console.log('✓ light check: sustained 600 studs/s reports are rejected');
 
     // ── 9. Legacy game:move is IGNORED while a sim lives (anti-cheat) ──
     // v6.2.2: snapshots are DELTAS (Alice idle = not listed), so wait for

@@ -926,6 +926,28 @@ export class PhysicsWorld {
     if (target && entry.body.material !== target) entry.body.material = target;
   }
 
+  /**
+   * v6.2.8: flip a named character pill between DYNAMIC (the classic
+   * server-side simulation target - gravity, contacts, being pushed) and
+   * KINEMATIC (a client-report GHOST: the owning client streams its state,
+   * so the pill just dead-reckons the reported velocity and acts as an
+   * immovable pusher for world physics - characters still shove crates,
+   * but nothing server-side can ever fight the owning client for the
+   * character's transform). cannon-es zeroes a kinematic body's solve mass,
+   * so dynamic parts get pushed by it while it stays perfectly still
+   * against them; gravity and forces are only applied to DYNAMIC bodies.
+   */
+  setNamedCharacterKinematic(id: string, kinematic: boolean) {
+    const entry = this.namedCharacters.get(id);
+    if (!entry) return;
+    const want = kinematic ? CANNON.Body.KINEMATIC : CANNON.Body.DYNAMIC;
+    if (entry.body.type !== want) {
+      entry.body.type = want;
+      entry.body.updateMassProperties();
+      entry.body.wakeUp();
+    }
+  }
+
   /** Ground check for a named character (same multi-probe edge logic). */
   namedCharacterGroundCheck(id: string): boolean {
     const entry = this.namedCharacters.get(id);

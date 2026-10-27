@@ -222,7 +222,10 @@ export class WorldSimManager {
   }
 
   /** One input tick from a player (~20 Hz). Payload already sanitized by
-   * the worker; here we only validate the basics to keep it cheap. */
+   * the worker; here we only validate the basics to keep it cheap.
+   * v6.2.8: SAVED path - only consumed while the worker runs
+   * PLAYER_NETCODE_MODE=server-sim (the client still streams it so the
+   * server can flip modes without a client redeploy). */
   input(instanceId: string, socketId: string, payload: Record<string, unknown>): void {
     const sim = this.sims.get(instanceId);
     if (!sim || !sim.ready || sim.disposed) return;
@@ -234,6 +237,30 @@ export class WorldSimManager {
       jump: !!payload.jump,
       sprint: !!payload.sprint,
       yaw: Number(payload.yaw) || 0,
+    });
+  }
+
+  /** v6.2.8: one CLIENT STATE REPORT (the Roblox-style relay, default
+   * mode) - the owning client's own simulation of its character, arriving
+   * every CLIENT_REPORT_INTERVAL_MS. Numbers are coerced here; the
+   * worker runs the actual sanity checks (teleport + speed caps). */
+  report(instanceId: string, socketId: string, payload: Record<string, unknown>): void {
+    const sim = this.sims.get(instanceId);
+    if (!sim || !sim.ready || sim.disposed) return;
+    sim.worker.postMessage({
+      t: "report",
+      socketId,
+      x: Number(payload.x),
+      y: Number(payload.y),
+      z: Number(payload.z),
+      vx: Number(payload.vx) || 0,
+      vy: Number(payload.vy) || 0,
+      vz: Number(payload.vz) || 0,
+      yaw: Number(payload.yaw) || 0,
+      walking: !!payload.walking,
+      sprint: !!payload.sprint,
+      jumping: !!payload.jumping,
+      grounded: !!payload.grounded,
     });
   }
 

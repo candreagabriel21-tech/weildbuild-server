@@ -32,6 +32,8 @@ import {
   setInputSender,
   SELF_INTERP_DELAY_MS,
   INTERP_GAP_CAP_MS,
+  CHAR_INTERP_GAP_CAP_MS,
+  REMOTE_INTERP_DELAY_MS,
   INTERP_TELEPORT_STUDS,
   type InterpSample,
 } from "../engine/netcode-bridge";
@@ -117,10 +119,12 @@ function main(): void {
     assert.strictEqual(getSelfHistory().length, 2, "back-to-back pushes both land in the history");
     // Idle gap: delta snapshots skip unchanged players, so the next self
     // entry arrives seconds later - the stale history must be dropped.
-    await sleep(INTERP_GAP_CAP_MS + 80);
+    // v6.2.8: the self history clears on the CHARACTER gap cap (report
+    // cadence), not the part-class one.
+    await sleep(CHAR_INTERP_GAP_CAP_MS + 80);
     pushSnapshot({ self: { socketId: 's', x: 5, y: 0, z: 0, yaw: 0, hp: 100, dying: false, seq: 3 } });
     assert.strictEqual(getSelfHistory().length, 1,
-      `after a ${(INTERP_GAP_CAP_MS + 80).toFixed(0)}ms idle gap the history restarts at the fresh sample`);
+      `after a ${(CHAR_INTERP_GAP_CAP_MS + 80).toFixed(0)}ms idle gap the history restarts at the fresh sample`);
     assert.strictEqual(getSelfHistory()[0].x, 5, "the surviving sample is the FRESH one");
     clearSelfHistory();
     assert.strictEqual(getSelfHistory().length, 0, "clearSelfHistory empties the buffer");
@@ -145,7 +149,7 @@ function main(): void {
     setInputSender(null);
 
     console.log('✓ entity interpolation: ALL PASS');
-    console.log(`  (self delay ${SELF_INTERP_DELAY_MS}ms, gap cap ${INTERP_GAP_CAP_MS}ms, teleport ${INTERP_TELEPORT_STUDS} studs)`);
+    console.log(`  (self delay ${SELF_INTERP_DELAY_MS}ms, char gap cap ${CHAR_INTERP_GAP_CAP_MS}ms, part gap cap ${INTERP_GAP_CAP_MS}ms, remote delay ${REMOTE_INTERP_DELAY_MS}ms, teleport ${INTERP_TELEPORT_STUDS} studs)`);
   })().catch((e) => {
     console.error('✗ interp test FAILED:', e?.message || e);
     process.exit(1);

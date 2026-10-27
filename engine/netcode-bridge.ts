@@ -1,14 +1,23 @@
 // ═══════════════════════════════════════════════════════════════════
-// WeildBuild — netcode bridge (v1.3, client side)
-// ═══════════════════════════════════════════════════════════════════
+// WeildBuild — netcode bridge (v1.4, client side)
+// ═════════════════════════════════════════════════════════════════
 // The channel between the GamePlayer's Socket.IO connection and the
-// play viewport's frame loop, for SERVER-AUTHORITATIVE multiplayer:
+// play viewport's frame loop, for SERVER-HOSTED multiplayer:
 //
-//   INPUT FLOW (client → server, 30 Hz + instant edge flushes):
+//   SELF STATE FLOW (client → server, v6.2.8 Roblox-style relay):
+//     The local controller simulates YOUR character (the singleplayer
+//     feel) and reportState() ships its transform/velocity/anim to the
+//     authority every CLIENT_REPORT_INTERVAL_MS (0.25 s) - game:report.
+//     The server sanity-checks it lightly and relays it to the room.
+//
+//   INPUT FLOW (client → server, 30 Hz + instant edge flushes - SAVED):
 //     GamePlayerCharacter → reportInput() → the sender GamePlayer
 //     installed → socket.emit("game:input", ...). Direction changes,
-//     sprint flips and jump presses flush the FRAME they happen; only the
-//     steady state rides the 30 Hz throttle.
+//     sprint flips and jump presses flush the FRAME they happen. The
+//     server only consumes this while PLAYER_NETCODE_MODE=server-sim
+//     (the saved pre-v6.2.8 authority); in client-report mode it rides
+//     along harmlessly so the server can flip modes without a client
+//     redeploy.
 //
 //   STATE FLOW (server → client, 30 Hz delta snapshots):
 //     GamePlayer ("game:state") → selfHistory (timestamped samples for
@@ -18,12 +27,18 @@
 //     multiplayer at all. Every unanchored part renders from its
 //     timestamped interpolation buffer (samplePartInterp below), exactly
 //     like every remote character, and its kinematic collider follows the
-//     same sample - what you see is what you stand on.
+//     same sample - what you see is what you stand on. Remote CHARACTERS
+//     render the same way from the server's relay of each owner's 4 Hz
+//     reports (sampleInterp at REMOTE_INTERP_DELAY_MS).
 //
 // Singleplayer / Test Play never touches this module (netcode.mode stays
 // 'local' and every field stays null/empty).
 
-import { CLIENT_INPUT_HZ } from './game-engine/character-constants';
+import { CLIENT_INPUT_HZ, CLIENT_REPORT_INTERVAL_MS, PLAYER_NETCODE_MODE } from './game-engine/character-constants';
+
+// Re-exported for consumers - the report cadence is part of the netcode
+// contract (the play viewport sizes its drift-valve lead horizon from it).
+export { CLIENT_REPORT_INTERVAL_MS };
 
 /** Camera-relative input the client reports to the authority. */
 export interface NetcodeInput {
@@ -36,6 +51,35 @@ export interface NetcodeInput {
   sprint: boolean;
   /** The character's yaw (radians) so the server can orient the hitbox. */
   yaw: number;
+}
+
+// ─── v6.2.8: client-authoritative SELF STATE REPORT (the Roblox relay) ───
+// In client-report mode the owning client simulates its own character and
+// streams its state to the server on the CLIENT_REPORT_INTERVAL_MS heartbeat;
+// the server sanity-checks it lightly and relays it to everyone else (whose
+// clients interpolate). This is the client -> server half of that channel.
+
+/** The local character's state, reported to the server every 0.25 s. */
+export interface NetcodeSelfReport {
+  /** FEET position of the local character body (the visible body root). */
+  x: number;
+  y: number;
+  z: number;
+  /** The local body's velocity (studs/s) - lets the server dead-reckon its
+   * ghost pill between reports and lets YOUR OWN drift valve dead-reckon
+   * the echoed self entry back to now. */
+  vx: number;
+  vy: number;
+  vz: number;
+  /** Body yaw (radians). */
+  yaw: number;
+  /** Animation state, so other screens render the same walk cycle. */
+  walking: boolean;
+  sprint: boolean;
+  /** Airborne flag (jump or falling off a ledge) - the jump POSE. */
+  jumping: boolean;
+  /** The local controller's ground check (gates the server ghost's gravity). */
+  grounded: boolean;
 }
 
 /** Authoritative state for the LOCAL player inside a snapshot. */
@@ -54,6 +98,11 @@ export interface SelfCorrection {
   /** v6.2.3: the server's animation flags for this player (walk/jump/sprint
    * feel now comes from the same broadcast everyone else renders). */
   anim?: { walking?: boolean; jumping?: boolean; sprint?: boolean };
+  /** v6.2.8: the velocity the server attached to this entry (client-report
+   * mode: YOUR OWN reported velocity echoed back; server-sim mode: the
+   * simulated body's). Used for dead-reckoning in the drift valve; absent
+   * on older hosts (the finite-difference estimate is the fallback). */
+  vel?: [number, number, number];
   /** v6.2.3: performance.now() ms when this correction arrived (landing
    * speed + authority-liveness bookkeeping for the server-driven character). */
   receivedAt: number;
@@ -85,9 +134,25 @@ export interface InterpResult {
  * small - it is pure view latency for the player - but big enough to
  * always sit on 2+ live samples of the 30 Hz stream. */
 export const SELF_INTERP_DELAY_MS = 100;
-/** Remote characters render a bit further back: extra smoothing costs
- * nothing when it is not your own controls paying for it. */
-export const REMOTE_INTERP_DELAY_MS = 150;
+/** Remote characters render this far behind arrival time (ms): extra
+ * smoothing costs nothing when it is not your own controls paying for it.
+ * v6.2.8: in client-report mode remote characters arrive at the report
+ * cadence (250 ms), so the buffer must lag at least one interval plus a
+ * jitter margin - otherwise the renderer sits past the newest sample and
+ * holds instead of interpolating. In server-sim mode (30 Hz stream) the
+ * classic tight delay applies. */
+export const REMOTE_INTERP_DELAY_MS = PLAYER_NETCODE_MODE === 'client-report'
+  ? CLIENT_REPORT_INTERVAL_MS + 150
+  : 150;
+/** v6.2.8: consecutive CHARACTER samples farther apart than this are not
+ * interpolated across (the earlier sample is held). A SEPARATE, larger
+ * cap than INTERP_GAP_CAP_MS (parts): remote characters update at the
+ * 0.25 s report cadence in client-report mode, so the part-class 130 ms
+ * cap would false-fire on every sample and reduce every stream to a hold.
+ * ~2 intervals absorbs report jitter without ever creeping. */
+export const CHAR_INTERP_GAP_CAP_MS = PLAYER_NETCODE_MODE === 'client-report'
+  ? CLIENT_REPORT_INTERVAL_MS * 2
+  : 130;
 /** v6.2.7: physical objects render this far behind arrival time (ms) -
  * the same buffered-interpolation contract as the characters. Parts are
  * usually what you stand on, so they ride the shorter self-class delay
@@ -251,8 +316,13 @@ export function samplePartInterp(
 
 type InputSender = (input: NetcodeInput) => void;
 type ClickSender = (partId: string) => void;
+/** v6.2.8: ships the local character's state to the server (Roblox-style
+ * client-authoritative positions, 4 Hz heartbeat). */
+type StateSender = (report: NetcodeSelfReport) => void;
 
 let clickSender: ClickSender | null = null;
+let stateSender: StateSender | null = null;
+let lastStateSentAt = 0;
 
 /** Installed by GamePlayer: routes on_click rule requests to the authority. */
 export function setClickSender(sender: ClickSender | null): void {
@@ -295,6 +365,30 @@ export function serverSnapshotAgeMs(): number {
 /** Installed by GamePlayer while a server-hosted session is live. */
 export function setInputSender(sender: InputSender | null): void {
   inputSender = sender;
+}
+
+/** v6.2.8: installed by GamePlayer - routes self state reports to the
+ * authority (game:report). NULL in singleplayer / Test Play, exactly like
+ * the input sender. */
+export function setStateSender(sender: StateSender | null): void {
+  stateSender = sender;
+  lastStateSentAt = 0;
+}
+
+/**
+ * v6.2.8: called by the play viewport every frame. The local character's
+ * state ships to the server on a fixed CLIENT_REPORT_INTERVAL_MS heartbeat
+ * - the server "reads client data every 0.25 seconds". Unlike the old
+ * input stream there are NO edge flushes: a report is a full snapshot of
+ * where you already are, so a quarter-second of latency on the relay is
+ * exactly what other screens' interpolation is built to hide.
+ */
+export function reportState(report: NetcodeSelfReport): void {
+  if (!stateSender) return;
+  const now = typeof performance !== 'undefined' ? performance.now() : Date.now();
+  if (now - lastStateSentAt < CLIENT_REPORT_INTERVAL_MS - 10) return;
+  lastStateSentAt = now;
+  stateSender(report);
 }
 
 /**
@@ -356,7 +450,7 @@ export function drainFx(): Array<{ name: string; volume: number }> {
 
 /** Called by GamePlayer on every server snapshot. */
 export function pushSnapshot(data: {
-  self?: { socketId: string; x: number; y: number; z: number; yaw: number; hp: number; dying: boolean; seq: number; anim?: { walking?: boolean; jumping?: boolean; sprint?: boolean } };
+  self?: { socketId: string; x: number; y: number; z: number; yaw: number; hp: number; dying: boolean; seq: number; anim?: { walking?: boolean; jumping?: boolean; sprint?: boolean }; velocity?: number[] | [number, number, number] };
   parts?: PartCorrection[];
   /** v6.2.7: part ids the authority deleted (void falls, rule
    * destroy_part, ...) - their histories die here and GamePlayer removes
@@ -366,15 +460,21 @@ export function pushSnapshot(data: {
 }): void {
   lastSnapshotAt = typeof performance !== 'undefined' ? performance.now() : Date.now();
   if (data.self) {
-    selfCorrection = { ...data.self, receivedAt: lastSnapshotAt };
+    selfCorrection = {
+      ...data.self,
+      vel: Array.isArray(data.self.velocity) && data.self.velocity.length === 3
+        ? [Number(data.self.velocity[0]) || 0, Number(data.self.velocity[1]) || 0, Number(data.self.velocity[2]) || 0]
+        : undefined,
+      receivedAt: lastSnapshotAt,
+    };
     // v6.2.5: append to the interpolation history. A gap larger than the
-    // cap means the stream went idle (delta snapshots skip unchanged
-    // players) or a packet hole - the stale samples are dropped so the
-    // renderer picks up the FRESH position immediately instead of slowly
-    // creeping between two distant points.
+    // CHARACTER cap means the stream went idle (delta snapshots skip
+    // unchanged players) or a packet hole - the stale samples are dropped
+    // so the renderer picks up the FRESH position immediately instead of
+    // slowly creeping between two distant points.
     if (
       selfHistory.length > 0 &&
-      lastSnapshotAt - selfHistory[selfHistory.length - 1].t > INTERP_GAP_CAP_MS
+      lastSnapshotAt - selfHistory[selfHistory.length - 1].t > CHAR_INTERP_GAP_CAP_MS
     ) {
       selfHistory = [];
     }
@@ -427,6 +527,8 @@ export function pushSnapshot(data: {
 /** Reset everything (session start/end). */
 export function resetNetcodeBridge(): void {
   inputSender = null;
+  stateSender = null;
+  lastStateSentAt = 0;
   selfCorrection = null;
   selfHistory = [];
   partHistories = new Map();
