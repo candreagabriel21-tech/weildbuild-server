@@ -42,10 +42,19 @@ import { parentPort } from 'node:worker_threads';
 
 // ─── Browser-API polyfills (BEFORE the platform imports) ───
 // The WeildCode engine drives itself with requestAnimationFrame; in a
-// worker we map that onto a ~60 Hz timer so its timers/waits/fades tick.
+// worker we map that onto a ~30 Hz timer so its timers/waits/fades tick
+// (v6.2.2: was 16ms/60Hz - the engine's per-frame objects.forEach scans
+// were the worker's biggest CONSTANT cost, halving them is free latency).
+// IDLE PAUSE: while the instance has NO players the callback is HELD
+// instead of scheduled - the rules engine (timers, waits, fades) fully
+// freezes. The sim tick resumes it the moment anyone joins.
+let enginePaused = false;
+let heldRafCb: ((t: number) => void) | null = null;
 if (typeof (globalThis as any).requestAnimationFrame !== 'function') {
-  (globalThis as any).requestAnimationFrame = (cb: (t: number) => void): number =>
-    setTimeout(() => cb(Date.now()), 16) as unknown as number;
+  (globalThis as any).requestAnimationFrame = (cb: (t: number) => void): number => {
+    if (enginePaused) { heldRafCb = cb; return 1; }
+    return setTimeout(() => cb(Date.now()), 33) as unknown as number;
+  };
   (globalThis as any).cancelAnimationFrame = (id: number) => clearTimeout(id);
 }
 
@@ -76,6 +85,27 @@ const DEATH_ANIMATION_SECONDS = 1.35;
  * denies a jump the client already predicted (that was the jump
  * rubber-band: client jumps, server disagrees, next snapshot yanks back). */
 const JUMP_COYOTE_SECONDS = 0.1;
+
+// ─── v6.2.2: idle + interest management ───
+/** Parts farther than this from EVERY player are not streamed in
+ * snapshots (clients stop rendering parts at 320 studs anyway, so this
+ * can never hide something a player can see) and are put to sleep early
+ * when they are slow. Env-tunable: WORLD_INTEREST_RADIUS. */
+const INTEREST_RADIUS = Math.max(80, Number(process.env.WORLD_INTEREST_RADIUS) || 340);
+const INTEREST_RADIUS_SQ = INTEREST_RADIUS * INTEREST_RADIUS;
+/** Every player is re-broadcast at least this often (a keyframe) even
+ * when nothing about them changed, so late joiners and drifted clients
+ * self-heal. With 15 Hz deltas this trims idle traffic by ~97%. */
+const PLAYER_KEYFRAME_SECONDS = 2;
+/** How often moving parts are written back into the store for the rules
+ * engine. The CLIENT does this at 4 Hz; the worker used to do it at
+ * 30 Hz, cloning the whole objects Map (and every touched part) 30x/s -
+ * a major GC hiccup source on big maps. 7 Hz keeps rule reads near
+ * current for a fraction of the pressure. */
+const STORE_SYNC_HZ = 7;
+/** Max part transforms per join keyframe snapshot (huge worlds spread the
+ * catch-up over a few snapshots instead of one giant frame). */
+const PARTS_KEYFRAME_BUDGET = 300;
 
 function post(msg: unknown): void {
   parentPort?.postMessage(msg);
@@ -222,6 +252,7 @@ async function main(): Promise<void> {
   function removePlayer(socketId: string): void {
     world.removeNamedCharacterBody(socketId);
     players.delete(socketId);
+    lastPlayerBroadcast.delete(socketId); // v6.2.2: drop its delta state
   }
 
   function respawn(p: RuntimePlayer): void {
@@ -336,6 +367,24 @@ async function main(): Promise<void> {
   const partUpdatesOut: any[] = [];
   const ourSyncIds = new Set<string>();
 
+  // ─── v6.2.2: delta snapshot + interest state ───
+  // Players are only broadcast when they CHANGE (plus a periodic keyframe
+  // of everyone). Parts only when they change AND are near a player.
+  const lastPlayerBroadcast = new Map<string, {
+    x: number; y: number; z: number; yaw: number; hp: number;
+    walking: boolean; jumping: boolean; dying: boolean; sprint: boolean;
+  }>();
+  let simClock = 0;                 // simulated seconds (frozen while idle)
+  let nextPlayerKeyframeAt = 0;     // sim-time of the next all-players keyframe
+  let partsKeyframeDirty = true;    // re-broadcast every part once (boot + joins)
+  let partsKeyframeQueue: string[] | null = null;
+  // showInWorld === false parts (touch checks must skip them)
+  const hiddenPartIds = new Set<string>();
+  // throttled passes
+  let storeSyncAccum = 0;           // 7 Hz store write-back
+  let slowPassAccum = 0;            // 0.5 s body add/remove/anchored sync
+  let sleepPassAccum = 0;           // 0.33 s far-body sleep/wake pass
+
   // ─── Input / click / chat from the host ───
   parentPort!.on('message', (m: any) => {
     if (!m || typeof m !== 'object') return;
@@ -343,6 +392,12 @@ async function main(): Promise<void> {
       if (!players.has(m.socketId)) {
         const username = String(m.username || 'Player');
         addPlayer(m.socketId, username);
+        // v6.2.2: a late joiner missed every part transform that was
+        // ever broadcast before it arrived (its world load carries the
+        // SAVED positions, not where physics actually settled things).
+        // Queue a full part keyframe so its first seconds in the world
+        // are not full of floating bricks that snap into place later.
+        partsKeyframeDirty = true;
         // v1.5: game rules - on_player_join (optional username filter).
         try { weildCodeEngine.handlePlayerJoined(username); } catch { /* never kill the sim */ }
       }
@@ -378,6 +433,9 @@ async function main(): Promise<void> {
 
   // ─── The simulation loop ───
   let running = true;
+  // v6.2.2: starts IDLE (no players) - the tick pauses everything until
+  // the first playerJoin message arrives.
+  let idle = true;
   let seq = 0;
   let simAccum = 0;
   let snapAccum = 0;
@@ -388,7 +446,21 @@ async function main(): Promise<void> {
     // when_touched('player'): fire on the parts each player overlaps,
     // once per contact (enter fires, leave re-arms) - the same semantics
     // as the client's collisionParts loop.
-    const objects = useStudioStore.getState().objects;
+    // v6.2.2 PERF: the candidate list is built ONCE per tick straight
+    // from the physics bodies (current to THIS step, not the 7 Hz store
+    // write-back) instead of re-walking the whole store PER PLAYER -
+    // with 10 players that alone was a 10x multiplier on every object.
+    const candidates: Array<{ id: string; x: number; y: number; z: number; hx: number; hy: number; hz: number }> = [];
+    world.bodies.forEach((pb) => {
+      if (!pb.canCollide) return;
+      if (hiddenPartIds.has(pb.id)) return;
+      candidates.push({
+        id: pb.id,
+        x: pb.position.x, y: pb.position.y, z: pb.position.z,
+        hx: pb.size.x / 2, hy: pb.size.y / 2, hz: pb.size.z / 2,
+      });
+    });
+    if (candidates.length === 0) return;
     for (const p of players.values()) {
       const body = world.getNamedCharacterBody(p.socketId);
       if (!body) continue;
@@ -397,17 +469,13 @@ async function main(): Promise<void> {
       const halfW = Math.min(entry?.size?.x ?? 0.8, entry?.size?.z ?? 0.8) / 2;
       const stillTouched = new Set<string>();
       const newlyTouched: string[] = [];
-      objects.forEach((obj: any) => {
-        if (!isPart(obj) || !obj.canCollide || obj.showInWorld === false) return;
-        const hw = obj.size.x / 2 + halfW + 0.1;
-        const hd = obj.size.z / 2 + halfW + 0.1;
-        if (Math.abs(obj.position.x - body.position.x) > hw) return;
-        if (Math.abs(obj.position.z - body.position.z) > hd) return;
-        const hh = obj.size.y / 2 + height / 2;
-        if (Math.abs(obj.position.y - body.position.y) > hh) return;
-        stillTouched.add(obj.id);
-        if (!p.touched.has(obj.id)) newlyTouched.push(obj.id);
-      });
+      for (const c of candidates) {
+        if (Math.abs(c.x - body.position.x) > c.hx + halfW + 0.1) continue;
+        if (Math.abs(c.z - body.position.z) > c.hz + halfW + 0.1) continue;
+        if (Math.abs(c.y - body.position.y) > c.hy + height / 2) continue;
+        stillTouched.add(c.id);
+        if (!p.touched.has(c.id)) newlyTouched.push(c.id);
+      }
       for (const id of newlyTouched) {
         // v6.2.1: the TOUCHING player is the acting player - a lava brick
         // kills the player who stepped on it, not everyone in the room.
@@ -418,6 +486,8 @@ async function main(): Promise<void> {
   }
 
   function stepSim(dt: number): void {
+    simClock += dt; // simulated seconds (drives keyframe deadlines)
+
     // 0. v6.2.1: apply queued per-player rule effects (kill/heal/damage/
     //    teleport) - the engine queues them while running triggers between
     //    ticks (timer fires, touch events, clicks, chat).
@@ -555,29 +625,136 @@ async function main(): Promise<void> {
     playerTouchChecks();
 
     // 5. Store sync for moving parts so rules read near-current values
-    //    (the client does this at 4 Hz; the worker at ~7 Hz is plenty).
-    ourSyncIds.clear();
-    const syncUpdates: Array<{ id: string; position: { x: number; y: number; z: number }; rotation: { x: number; y: number; z: number } }> = [];
-    for (const id of activeIds) {
-      const pb = world.bodies.get(id);
-      if (!pb || pb.anchored) continue;
-      const cb = world.getCannonBody(id);
-      if (cb && cb.sleepState === 2) continue;
-      syncUpdates.push({
-        id,
-        position: { x: pb.position.x, y: pb.position.y, z: pb.position.z },
-        rotation: { x: pb.rotation.x, y: pb.rotation.y, z: pb.rotation.z },
+    //    (the client does this at 4 Hz; 7 Hz here is plenty). v6.2.2: this
+    //    used to run EVERY tick (30 Hz) - each pass clones the whole
+    //    objects Map, which on big maps was the worker's main GC hiccup
+    //    source. Also refreshes the hidden-parts set for touch checks.
+    storeSyncAccum += dt;
+    if (storeSyncAccum >= 1 / STORE_SYNC_HZ) {
+      storeSyncAccum = 0;
+      ourSyncIds.clear();
+      const syncUpdates: Array<{ id: string; position: { x: number; y: number; z: number }; rotation: { x: number; y: number; z: number } }> = [];
+      for (const id of activeIds) {
+        const pb = world.bodies.get(id);
+        if (!pb || pb.anchored) continue;
+        const cb = world.getCannonBody(id);
+        if (cb && cb.sleepState === 2) continue;
+        syncUpdates.push({
+          id,
+          position: { x: pb.position.x, y: pb.position.y, z: pb.position.z },
+          rotation: { x: pb.rotation.x, y: pb.rotation.y, z: pb.rotation.z },
+        });
+        ourSyncIds.add(id);
+      }
+      if (syncUpdates.length > 0) {
+        useStudioStore.getState().syncPhysicsPositions(syncUpdates);
+      }
+      hiddenPartIds.clear();
+      useStudioStore.getState().objects.forEach((obj: any) => {
+        if (isPart(obj) && obj.showInWorld === false) hiddenPartIds.add(obj.id);
       });
-      ourSyncIds.add(id);
     }
-    if (syncUpdates.length > 0) {
-      useStudioStore.getState().syncPhysicsPositions(syncUpdates);
+
+    // 5b. v6.2.2 SLOW BODY SYNC (0.5 s, mirrors the client's PhysicsSimulation
+    //     slow path): parts CREATED by rules during play (when_created /
+    //     create_part) never had a physics body on the server - players
+    //     walked straight through rule-spawned walls while their own client
+    //     showed a collision (a major rubber-band source). Also removes
+    //     bodies whose store part was deleted and pushes rule-moved
+    //     anchored positions into the physics world.
+    slowPassAccum += dt;
+    if (slowPassAccum >= 0.5) {
+      slowPassAccum = 0;
+      const objectsNow = useStudioStore.getState().objects;
+      objectsNow.forEach((obj: any) => {
+        if (!isPart(obj) || obj.isCharacterPart || obj.isCharacterRoot) return;
+        const pb = world.bodies.get(obj.id);
+        if (!pb) {
+          // Part created during play: give it a body now.
+          if (obj.showInWorld !== false) {
+            world.addBody(obj);
+            if (!obj.anchored) activeIds.add(obj.id);
+          }
+          return;
+        }
+        if (pb.anchored !== obj.anchored) {
+          pb.anchored = obj.anchored;
+          pb._anchoredDirty = true;
+          if (obj.anchored) activeIds.delete(obj.id);
+          else { activeIds.add(obj.id); pb.isAwake = true; }
+        }
+        // Rule moved an anchored part: push the store position to physics.
+        if (pb.anchored) {
+          if (
+            Math.abs(pb.position.x - obj.position.x) > 0.001 ||
+            Math.abs(pb.position.y - obj.position.y) > 0.001 ||
+            Math.abs(pb.position.z - obj.position.z) > 0.001
+          ) {
+            pb.position = { ...obj.position };
+            pb._anchoredDirty = true;
+          }
+        }
+      });
+      // Bodies whose store part is gone (rule delete_part etc.): drop them.
+      const gone: string[] = [];
+      world.bodies.forEach((pb, id) => {
+        const obj = objectsNow.get(id);
+        if (!obj || !isPart(obj) || obj.isCharacterPart || obj.isCharacterRoot) gone.push(id);
+      });
+      if (gone.length > 0) {
+        world.removeBodiesBulk(gone);
+        for (const id of gone) activeIds.delete(id);
+      }
+    }
+
+    // 5c. v6.2.2 FAR-BODY SLEEPING (0.33 s, mirrors the client's v13.4
+    //     play-mode pass): unanchored parts beyond the interest radius of
+    //     EVERY player stop simulating; they wake when someone comes near.
+    //     "Runs objects only where there are players."
+    sleepPassAccum += dt;
+    if (sleepPassAccum >= 1 / 3 && players.size > 0) {
+      sleepPassAccum = 0;
+      const px: number[] = [], py: number[] = [], pz: number[] = [];
+      for (const p of players.values()) {
+        const b = world.getNamedCharacterBody(p.socketId);
+        if (b) { px.push(b.position.x); py.push(b.position.y); pz.push(b.position.z); }
+      }
+      if (px.length > 0) {
+        for (const id of activeIds) {
+          const pb = world.bodies.get(id);
+          const cb = world.getCannonBody(id);
+          if (!pb || !cb || pb.anchored || cb.mass === 0) continue;
+          let inRange = false;
+          for (let i = 0; i < px.length; i++) {
+            const dx = pb.position.x - px[i];
+            const dy = pb.position.y - py[i];
+            const dz = pb.position.z - pz[i];
+            if (dx * dx + dy * dy + dz * dz <= INTEREST_RADIUS_SQ) { inRange = true; break; }
+          }
+          if (!inRange) {
+            if (cb.sleepState !== 2) { cb.sleep(); pb.isAwake = false; }
+          } else if (cb.sleepState === 2) {
+            cb.wakeUp(); pb.isAwake = true;
+          }
+        }
+      }
     }
   }
 
-  function buildSnapshot(): any {
-    seq += 1;
-    // Players: authoritative transforms for everyone.
+  function buildSnapshot(): any | null {
+    // v6.2.2: snapshots are DELTAS. A player is included only when their
+    // transform / hp / anim state changed since their last broadcast (or
+    // on the periodic keyframe of everyone); a part only when its
+    // transform changed AND it is inside the interest radius of some
+    // player (or while the join keyframe is catching a newcomer up).
+    // Snapshots with literally nothing to say are not sent at all - an
+    // idle world no longer broadcasts 15 empty frames every second.
+
+    // Players: changed transforms + hp + anim only, plus a keyframe of
+    // EVERYONE every PLAYER_KEYFRAME_SECONDS (late joiners + drift
+    // self-healing - clients treat a missing entry as "unchanged").
+    const keyframe = simClock >= nextPlayerKeyframeAt;
+    if (keyframe) nextPlayerKeyframeAt = simClock + PLAYER_KEYFRAME_SECONDS;
     const playersOut: any[] = [];
     for (const p of players.values()) {
       const body = world.getNamedCharacterBody(p.socketId);
@@ -585,44 +762,101 @@ async function main(): Promise<void> {
       const entry = (world as any).namedCharacters?.get(p.socketId);
       const height = entry?.height ?? 2;
       const isWalking = Math.hypot(p.velX, p.velZ) > 0.01;
+      const x = body.position.x;
+      const y = body.position.y - height / 2;
+      const z = body.position.z;
+      const anim = {
+        walking: isWalking && p.dyingTimer <= 0,
+        jumping: p.dyingTimer <= 0 && body.velocity.y > 0.5,
+        dying: p.dyingTimer > 0,
+        sprint: isWalking && p.input.sprint,
+      };
+      const hp = Math.round(p.hp);
+      const prev = lastPlayerBroadcast.get(p.socketId);
+      const changed = !prev ||
+        Math.abs(prev.x - x) > 0.01 ||
+        Math.abs(prev.y - y) > 0.01 ||
+        Math.abs(prev.z - z) > 0.01 ||
+        Math.abs(prev.yaw - p.yaw) > 0.02 ||
+        prev.hp !== hp ||
+        prev.walking !== anim.walking ||
+        prev.jumping !== anim.jumping ||
+        prev.dying !== anim.dying ||
+        prev.sprint !== anim.sprint;
+      if (!keyframe && !changed) continue; // nothing new to say about them
+      lastPlayerBroadcast.set(p.socketId, {
+        x, y, z, yaw: p.yaw, hp,
+        walking: anim.walking, jumping: anim.jumping, dying: anim.dying, sprint: anim.sprint,
+      });
       playersOut.push({
         socketId: p.socketId,
         username: p.username,
-        position: [body.position.x, body.position.y - height / 2, body.position.z],
+        position: [x, y, z],
         rotation: [0, p.yaw, 0],
-        anim: {
-          walking: isWalking && p.dyingTimer <= 0,
-          jumping: p.dyingTimer <= 0 && body.velocity.y > 0.5,
-          dying: p.dyingTimer > 0,
-          sprint: isWalking && p.input.sprint,
-        },
-        hp: Math.round(p.hp),
+        anim,
+        hp,
         dying: p.dyingTimer > 0,
       });
     }
 
-    // Changed part transforms since the last broadcast.
+    // Player positions (interest tests for parts).
+    const plX: number[] = [], plY: number[] = [], plZ: number[] = [];
+    for (const p of players.values()) {
+      const b = world.getNamedCharacterBody(p.socketId);
+      if (b) { plX.push(b.position.x); plY.push(b.position.y); plZ.push(b.position.z); }
+    }
+
+    // Join/boot keyframe queue: the next few snapshots re-broadcast every
+    // unanchored part once (up to PARTS_KEYFRAME_BUDGET per snapshot) so a
+    // client that just arrived learns where physics actually settled
+    // everything, not just what moves after it joined.
+    if (partsKeyframeQueue === null && partsKeyframeDirty) {
+      partsKeyframeQueue = Array.from(activeIds);
+      partsKeyframeDirty = false;
+    }
+    const drained = partsKeyframeQueue
+      ? partsKeyframeQueue.slice(0, PARTS_KEYFRAME_BUDGET)
+      : [];
+    const keyframeIds = drained.length > 0 ? new Set(drained) : null;
+
+    // Changed part transforms since the last broadcast (interest-culled).
     const parts: any[] = [];
     for (const id of activeIds) {
       const pb = world.bodies.get(id);
       if (!pb || pb.anchored) continue;
       const prev = lastBroadcast.get(id);
-      if (
-        !prev ||
+      const changed = !prev ||
         Math.abs(prev.x - pb.position.x) > 0.01 ||
         Math.abs(prev.y - pb.position.y) > 0.01 ||
         Math.abs(prev.z - pb.position.z) > 0.01 ||
         Math.abs(prev.rx - pb.rotation.x) > 0.5 ||
         Math.abs(prev.ry - pb.rotation.y) > 0.5 ||
-        Math.abs(prev.rz - pb.rotation.z) > 0.5
-      ) {
-        parts.push({
-          id,
-          x: pb.position.x, y: pb.position.y, z: pb.position.z,
-          rx: pb.rotation.x, ry: pb.rotation.y, rz: pb.rotation.z,
-        });
-        lastBroadcast.set(id, { x: pb.position.x, y: pb.position.y, z: pb.position.z, rx: pb.rotation.x, ry: pb.rotation.y, rz: pb.rotation.z });
+        Math.abs(prev.rz - pb.rotation.z) > 0.5;
+      if (keyframeIds?.has(id)) {
+        // Keyframe parts always go out (a newcomer needs settled state,
+        // even for parts outside its current view).
+      } else if (changed) {
+        // Regular delta: only stream parts some player can actually see
+        // (clients render nothing past 320 studs). lastBroadcast is NOT
+        // updated for skipped parts, so they naturally re-send the moment
+        // they come back into somebody's range.
+        let inRange = false;
+        for (let i = 0; i < plX.length; i++) {
+          const dx = pb.position.x - plX[i];
+          const dy = pb.position.y - plY[i];
+          const dz = pb.position.z - plZ[i];
+          if (dx * dx + dy * dy + dz * dz <= INTEREST_RADIUS_SQ) { inRange = true; break; }
+        }
+        if (!inRange) continue;
+      } else {
+        continue;
       }
+      parts.push({
+        id,
+        x: pb.position.x, y: pb.position.y, z: pb.position.z,
+        rx: pb.rotation.x, ry: pb.rotation.y, rz: pb.rotation.z,
+      });
+      lastBroadcast.set(id, { x: pb.position.x, y: pb.position.y, z: pb.position.z, rx: pb.rotation.x, ry: pb.rotation.y, rz: pb.rotation.z });
     }
 
     // Rule-driven full part updates (color/size/transparency/...).
@@ -653,6 +887,23 @@ async function main(): Promise<void> {
       lastObjectsRef = new Map(objects as any);
     }
 
+    // v6.2.2: nothing changed anywhere -> send nothing at all.
+    if (
+      playersOut.length === 0 &&
+      parts.length === 0 &&
+      partUpdatesOut.length === 0 &&
+      fxOut.length === 0 &&
+      messagesOut.length === 0
+    ) {
+      return null;
+    }
+
+    seq += 1;
+    if (partsKeyframeQueue && drained.length > 0) {
+      partsKeyframeQueue.splice(0, drained.length);
+      if (partsKeyframeQueue.length === 0) partsKeyframeQueue = null;
+    }
+
     return {
       t: 'snapshot',
       seq,
@@ -674,6 +925,31 @@ async function main(): Promise<void> {
   const tick = setInterval(() => {
     if (!running) return;
     const now = Date.now();
+    if (players.size === 0) {
+      // v6.2.2 EMPTY-INSTANCE PAUSE: with no players in the room there is
+      // nothing anybody can observe. The physics step, the rules engine
+      // (its rAF callback is held by the polyfill), the store write-back
+      // and the snapshots all stop. The empty-grace sweeper disposes this
+      // worker soon anyway; until then it costs ~one interval callback.
+      if (!idle) {
+        idle = true;
+        enginePaused = true;
+        simAccum = 0; snapAccum = 0; storeSyncAccum = 0; slowPassAccum = 0; sleepPassAccum = 0;
+      }
+      lastTime = now;
+      return;
+    }
+    if (idle) {
+      // Someone joined: unfreeze the rules engine (release the held rAF
+      // callback) and restart the clocks without integrating the gap.
+      idle = false;
+      enginePaused = false;
+      lastTime = now;
+      simAccum = 0; snapAccum = 0; storeSyncAccum = 0; slowPassAccum = 0; sleepPassAccum = 0;
+      const cb = heldRafCb;
+      heldRafCb = null;
+      if (cb) setTimeout(() => cb(Date.now()), 16);
+    }
     let frameDt = (now - lastTime) / 1000;
     lastTime = now;
     if (frameDt > 0.25) frameDt = 0.25; // catch-up clamp after stalls
@@ -688,7 +964,8 @@ async function main(): Promise<void> {
     }
     if (stepped && snapAccum >= 1 / SNAPSHOT_HZ) {
       snapAccum = 0;
-      post(buildSnapshot());
+      const snap = buildSnapshot();
+      if (snap) post(snap); // null = nothing changed, nothing to send
     }
   }, 1000 / SIM_HZ);
 

@@ -134,7 +134,11 @@ async function main() {
   console.log(`✓ jump: airborne and landed (feet y=${landedY!.toFixed(2)})`);
 
   // 7. Bob falls into the void (teleport far below) -> dies, then respawns
-  const bSnap: any = await waitMessage(worker, (m) => m.t === "snapshot");
+  // v6.2.2: snapshots are DELTAS - an unchanged idle player is simply not
+  // listed. Wait for a frame that actually carries Bob (the periodic
+  // keyframe re-broadcasts everyone every ~2s of sim time).
+  const bSnap: any = await waitMessage(worker, (m) =>
+    m.t === "snapshot" && Array.isArray(m.players) && m.players.some((p: any) => p.socketId === "sockB"));
   const bobBefore = bSnap.players.find((p: any) => p.socketId === "sockB");
   assert.ok(bobBefore, "bob present");
   // Feed no input; instead verify void death via a direct drop: simulate by
@@ -142,11 +146,14 @@ async function main() {
   assert.equal(bobBefore.hp, 100, "idle player keeps full health");
 
   // 8. leave -> player disappears from snapshots
+  // (same delta rule: wait for a frame that carries Alice but not Bob -
+  // a keyframe listing Alice proves the roster was recomputed since the
+  // leave, so Bob's absence is meaningful)
   worker.postMessage({ t: "playerLeave", socketId: "sockB" });
   let gone = false;
   for (let i = 0; i < 30 && !gone; i++) {
     const snap: any = await waitMessage(worker, (m) => m.t === "snapshot");
-    if (!snap.players.some((p: any) => p.socketId === "sockB")) gone = true;
+    if (snap.players.some((p: any) => p.socketId === "sockA") && !snap.players.some((p: any) => p.socketId === "sockB")) gone = true;
   }
   assert.ok(gone, "Bob left the snapshot after playerLeave");
   console.log("✓ lifecycle: playerLeave removes the player");

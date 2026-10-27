@@ -345,6 +345,10 @@ function resolvePlayerInstance(socketId: string, instanceId: unknown): GameInsta
 // ── Connection handler ──
 io.on("connection", (socket) => {
   console.log(`[gamehost] connect ${socket.id} (${authName(socket)})`);
+  // v6.2.2: last gameplay activity (input/chat/click/move). The duplicate
+  // session guard uses it to tell an ACTIVE second window (reject the
+  // newcomer) from a parked/background one (let the newcomer take over).
+  socket.data.lastSeen = Date.now();
 
   // ── game:join { instanceId, gameId, username, avatar } ──
   socket.on("game:join", (payload: unknown) => {
@@ -377,6 +381,60 @@ io.on("connection", (socket) => {
         message: "This game instance is full. Join the game again to get a new one.",
       });
       return;
+    }
+
+    // ── v6.2.2: DUPLICATE SESSION GUARD ──
+    // The same account joining the same instance twice used to produce TWO
+    // bodies in the room (the second one often stuck with a default avatar,
+    // the "naked clone" report). One account, one body, per instance:
+    //   • old session gone (refresh race, dead transport) -> evict the
+    //     stale entry silently and let this join through
+    //   • old session parked (socket alive but no gameplay packets for a
+    //     while, e.g. a background tab) -> the newcomer TAKES OVER, the
+    //     parked socket is kicked with a warning
+    //   • old session actively playing -> the NEWCOMER is rejected with a
+    //     warning and disconnected (the literal "joined twice, get kicked"
+    //     request)
+    const DUPLICATE_SILENCE_MS = 5000;
+    let duplicate: { socketId: string; live: boolean; active: boolean } | null = null;
+    for (const [sid, p] of instance.players) {
+      if (p.username !== username || sid === socket.id) continue;
+      const oldSocket = io.sockets.sockets.get(sid);
+      const live = !!oldSocket && oldSocket.connected;
+      const lastSeen = typeof oldSocket?.data?.lastSeen === "number" ? oldSocket.data.lastSeen : 0;
+      duplicate = { socketId: sid, live, active: live && Date.now() - lastSeen <= DUPLICATE_SILENCE_MS };
+      break;
+    }
+    if (duplicate) {
+      if (duplicate.active) {
+        // Genuinely playing in another window right now: kick the newcomer.
+        socket.emit("game:error", {
+          code: "duplicate_session",
+          message:
+            "You are already playing this game in another window or on another device. Close that one, then join again.",
+        });
+        socket.disconnect(true);
+        console.log(
+          `[gamehost] duplicate join rejected: ${username} (already active on socket ${duplicate.socketId})`
+        );
+        return;
+      }
+      // Stale or parked: evict the old entry, then continue with this join.
+      manager.removePlayer(duplicate.socketId, instance.id);
+      worldSims.playerLeft(instance.id, duplicate.socketId, username);
+      io.to(`instance:${instance.id}`).emit("game:playerLeft", { socketId: duplicate.socketId, username });
+      io.to(`instance:${instance.id}`).emit("game:players", manager.getPlayers(instance));
+      if (duplicate.live) {
+        const oldSocket = io.sockets.sockets.get(duplicate.socketId);
+        oldSocket?.emit("game:error", {
+          code: "duplicate_session",
+          message: "This game was opened again with your account in another window. Only one window can play at a time.",
+        });
+        oldSocket?.disconnect(true);
+        console.log(`[gamehost] parked session taken over: ${username} (${duplicate.socketId} -> ${socket.id})`);
+      } else {
+        console.log(`[gamehost] stale session evicted: ${username} (${duplicate.socketId})`);
+      }
     }
 
     // Leave any previous instance first (same pattern as the old socket server).
@@ -434,6 +492,7 @@ io.on("connection", (socket) => {
     const instance = resolvePlayerInstance(socket.id, p.instanceId);
     if (!instance) return;
     if (!instance.players.has(socket.id)) return;
+    socket.data.lastSeen = Date.now(); // duplicate guard liveness
     worldSims.input(instance.id, socket.id, p);
   });
 
@@ -444,6 +503,7 @@ io.on("connection", (socket) => {
   // (kill/heal/damage/teleport) hit the player who clicked, not everyone.
   socket.on("game:click", (payload: unknown) => {
     const p = asRecord(payload);
+    socket.data.lastSeen = Date.now(); // duplicate guard liveness
     const instance = resolvePlayerInstance(socket.id, p.instanceId);
     if (!instance) return;
     const partId = typeof p.partId === "string" ? p.partId : "";
@@ -480,6 +540,7 @@ io.on("connection", (socket) => {
     if (!instance) return;
     const player = instance.players.get(socket.id);
     if (!player) return;
+    socket.data.lastSeen = Date.now(); // duplicate guard liveness
 
     // v1.1: with a live server-authoritative simulation this legacy
     // client-position report is IGNORED (the server owns the transform).
@@ -514,6 +575,7 @@ io.on("connection", (socket) => {
       console.log(`[gamehost] dropped chat from guest ${username}`);
       return;
     }
+    socket.data.lastSeen = Date.now(); // duplicate guard liveness
 
     const instance = resolvePlayerInstance(socket.id, p.instanceId);
     if (!instance) return;

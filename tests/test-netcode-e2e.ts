@@ -228,11 +228,13 @@ async function main() {
     console.log('✓ jump authority');
 
     // ── 9. Legacy game:move is IGNORED while a sim lives (anti-cheat) ──
-    const beforeMove: any = await waitEvent(alice, 'game:state', (m: any) => true, 5000);
+    // v6.2.2: snapshots are DELTAS (Alice idle = not listed), so wait for
+    // frames that actually carry Alice before comparing her position.
+    const beforeMove: any = await waitEvent(alice, 'game:state', (m: any) => Array.isArray(m.players) && m.players.some((p: any) => p.username === 'Alice'), 5000);
     const axBefore = beforeMove.players.find((p: any) => p.username === 'Alice').position[0];
     alice.emit('game:move', { instanceId, position: [axBefore + 500, 0, 0], rotation: [0, 0, 0] });
     await sleep(400);
-    const afterMove: any = await waitEvent(alice, 'game:state', (m: any) => true, 5000);
+    const afterMove: any = await waitEvent(alice, 'game:state', (m: any) => Array.isArray(m.players) && m.players.some((p: any) => p.username === 'Alice'), 5000);
     const axAfter = afterMove.players.find((p: any) => p.username === 'Alice').position[0];
     assert.ok(Math.abs(axAfter - axBefore) < 50, `game:move ignored (x ${axBefore.toFixed(1)} -> ${axAfter.toFixed(1)})`);
     console.log('✓ legacy game:move (client-claimed position) rejected by the authority');
@@ -241,8 +243,10 @@ async function main() {
     bob.emit('game:leave', { instanceId });
     const left = await waitEvent(alice, 'game:playerLeft', (m: any) => m.username === 'Bob', 8000).catch(() => null);
     assert.ok(left, 'game:playerLeft fired');
+    // Delta-aware: wait for a frame that still carries Alice (a keyframe)
+    // but no longer Bob - that proves the roster was recomputed post-leave.
     const noBob = await waitEvent(alice, 'game:state',
-      (m: any) => Array.isArray(m.players) && !m.players.some((p: any) => p.username === 'Bob'), 8000).catch(() => null);
+      (m: any) => Array.isArray(m.players) && m.players.some((p: any) => p.username === 'Alice') && !m.players.some((p: any) => p.username === 'Bob'), 8000).catch(() => null);
     assert.ok(noBob, 'bob gone from snapshots');
     console.log('✓ leave lifecycle');
 

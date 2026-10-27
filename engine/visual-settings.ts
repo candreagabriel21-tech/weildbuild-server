@@ -27,6 +27,10 @@ export interface VisualSettings {
    *  on   = always start with them on
    *  off  = always start with them off */
   mobile_controls_default: "auto" | "on" | "off";
+  /** v6.2.2: show the HP bar above OTHER players' heads in multiplayer.
+   * Your own HP is always visible in the HUD; this is only about the
+   * floating bars over everyone else. */
+  show_player_hp_bars: boolean;
 }
 
 // v1.9.3: applying the volume needs the shared audio context (sounds.ts).
@@ -45,6 +49,7 @@ export const DEFAULT_VISUAL_SETTINGS: VisualSettings = {
   volume: 100,
   mobile_controls: "joystick",
   mobile_controls_default: "auto",
+  show_player_hp_bars: true,
 };
 
 /** 1.0: read just the mobile control style (used by the game HUD every frame-free render). */

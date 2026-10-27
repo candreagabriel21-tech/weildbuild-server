@@ -117,10 +117,13 @@ async function main(): Promise<void> {
     assert.strictEqual(deadAlice.dying, true, 'Alice should be dying (server-side death cycle started)');
 
     // ── BUG 1 regression: Bob must be COMPLETELY unaffected ──
-    console.log(`✓ Bob untouched by Alice's death: hp=${aliveBob?.hp} dying=${aliveBob?.dying}`);
-    assert.strictEqual(aliveBob?.hp, 100, 'BUG 1 REGRESSION: everyone would have died before the fix');
-    assert.strictEqual(aliveBob?.dying, false, 'Bob must not be dying');
-    assert.strictEqual(aliveBob?.anim?.dying ?? false, false, 'Bob must not show the death anim');
+    // v6.2.2: snapshots are DELTAS - Bob standing still unchanged simply
+    // is not listed. Absence IS the proof he was untouched (if he had
+    // died, his hp/dying/anim changes would put him right back in).
+    console.log(`✓ Bob untouched by Alice's death: hp=${aliveBob?.hp} dying=${aliveBob?.dying} (absent = unchanged)`);
+    assert.ok(!aliveBob || (aliveBob.hp === 100 && aliveBob.dying === false),
+      'BUG 1 REGRESSION: everyone would have died before the fix');
+    assert.ok(!aliveBob || (aliveBob.anim?.dying ?? false) === false, 'Bob must not show the death anim');
 
     // ── BUG 2 regression: Alice must RESPAWN (hp back to 100, at spawn) ──
     const respawnSnap = await waitMessage(worker, (m) => {
@@ -138,7 +141,7 @@ async function main(): Promise<void> {
     assert.strictEqual(respawnedAlice.hp, 100, 'BUG 2 REGRESSION: hp never came back before the fix');
     assert.strictEqual(respawnedAlice.dying, false, 'dying flag must clear after respawn');
     assert.ok(dist < 3, `Alice should be back near the spawn point (got ${dist.toFixed(2)})`);
-    assert.strictEqual(stillFineBob?.hp, 100, 'Bob must STILL be at full hp after Alice respawned');
+    assert.ok(!stillFineBob || stillFineBob.hp === 100, 'Bob must STILL be at full hp after Alice respawned');
 
     // ── The kill brick must keep working: Alice spawns ON it again ──
     const death2 = await waitMessage(worker, (m) => {
