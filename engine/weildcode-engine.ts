@@ -29,6 +29,9 @@ interface TimerState {
   fired: boolean; // for 'once' mode
   maxRepeats: number; // for repeat_every (0 = infinity)
   fireCount: number;
+  /** v6.2.1: the player whose event scheduled this timer (kills/heals
+   * scheduled by a touch keep targeting the toucher). */
+  actor?: string;
 }
 
 interface PendingWait {
@@ -38,6 +41,29 @@ interface PendingWait {
   remainingSeconds: number;
   /** v1.5: the wait belongs to a GAME rule (no part context). */
   gameRule?: boolean;
+  /** v6.2.1: the player whose event started this wait. */
+  actor?: string;
+}
+
+// ─── v6.2.1: per-player rule effects (multiplayer) ───
+// The engine's health/teleport model predates multiplayer: there is ONE
+// shared playState.characterHealth. In SERVER-AUTHORITATIVE mode that means
+// "kill the player who touched the lava" used to kill EVERYONE (the store
+// is shared by all players). Now, in server mode, player-targeting actions
+// (kill / heal / set_health / modify_player_health / teleport) push an
+// effect onto this queue instead of writing the shared store. The gamehost
+// worker drains the queue and applies each effect to the ACTING player only
+// (or to everyone when the rule had no player context, e.g. timers).
+// Singleplayer / Test Play keeps the old store-writing behavior exactly.
+export interface PlayerEffect {
+  kind: 'kill' | 'heal' | 'set_health' | 'damage' | 'teleport';
+  /** The acting player (trigger source). Undefined = apply to ALL players
+   * (timer/global rules - the classic shared semantics). */
+  username?: string;
+  /** For set_health / damage: the hp value or delta. */
+  value?: number;
+  /** For teleport: the target feet position. */
+  position?: { x: number; y: number; z: number };
 }
 
 class WeildCodeEngine {
@@ -46,6 +72,13 @@ class WeildCodeEngine {
   private lastTime: number = 0;
   private animFrameId: number | null = null;
   private isRunning: boolean = false;
+
+  // ─── v6.2.1: per-player effects + acting-player context ───
+  /** Pending player-targeting effects (server mode only). */
+  private playerEffects: PlayerEffect[] = [];
+  private static MAX_PLAYER_EFFECTS = 256; // bound rule storms
+  /** The player whose trigger is currently executing (undefined = global). */
+  private currentActor: string | undefined = undefined;
 
   // ─── v1.7: performance guards (no lag machines) ───
   /** Actions executed during the current frame; reset in update(). */
@@ -104,6 +137,38 @@ class WeildCodeEngine {
   private fadingEffects: Map<string, { partId: string; fadeDuration: number; elapsed: number; startOpacity: number; startSize: number; startBrightness?: number; startRange?: number }> = new Map();
 
   // ─── Start / Stop ───
+
+  /** v6.2.1: True while the SERVER-AUTHORITATIVE authority runs this engine
+   * (the gamehost worker). Player-targeting actions then queue per-player
+   * effects instead of writing the single shared playState. */
+  private isServerAuthority(): boolean {
+    return useStudioStore.getState().netcode?.mode === 'server';
+  }
+
+  /** v6.2.1: queue a per-player effect (server mode). No-op in singleplayer. */
+  private pushPlayerEffect(effect: PlayerEffect): void {
+    if (this.playerEffects.length >= WeildCodeEngine.MAX_PLAYER_EFFECTS) return; // drop the storm, keep the sim alive
+    this.playerEffects.push({ ...effect, username: this.currentActor || effect.username });
+  }
+
+  /** v6.2.1: hand the queued per-player effects to the authority. The
+   * gamehost worker calls this every sim tick and applies each effect to
+   * its target player. */
+  drainPlayerEffects(): PlayerEffect[] {
+    if (this.playerEffects.length === 0) return [];
+    return this.playerEffects.splice(0, this.playerEffects.length);
+  }
+
+  /** Run `fn` with the given acting player (trigger source). */
+  private withActor<T>(actor: string | undefined, fn: () => T): T {
+    const prev = this.currentActor;
+    this.currentActor = actor;
+    try {
+      return fn();
+    } finally {
+      this.currentActor = prev;
+    }
+  }
 
   start() {
     if (this.isRunning) return;
@@ -411,6 +476,7 @@ class WeildCodeEngine {
       fired: false,
       maxRepeats: 0,
       fireCount: 0,
+      actor: this.currentActor, // v6.2.1: keep the triggering player
     });
   }
 
@@ -426,7 +492,7 @@ class WeildCodeEngine {
           if (timer.repeat === 'once' && timer.fired) continue;
           const gameRule = (state.gameRules || []).find((r) => r.id === timer.ruleId);
           if (gameRule && gameRule.enabled) {
-            this.executeGameActions(gameRule.actions, gameRule.id);
+            this.withActor(timer.actor, () => this.executeGameActions(gameRule.actions, gameRule.id));
           }
           timer.fired = true;
           timer.fireCount++;
@@ -454,7 +520,7 @@ class WeildCodeEngine {
         if (obj && isPart(obj)) {
           const rule = (obj.rules || []).find((r) => r.id === timer.ruleId);
           if (rule && rule.enabled) {
-            this.executeActions(timer.partId, rule.actions, rule.id);
+            this.withActor(timer.actor, () => this.executeActions(timer.partId, rule.actions, rule.id));
           }
         }
 
@@ -484,7 +550,7 @@ class WeildCodeEngine {
           const rule = (state.gameRules || []).find((r) => r.id === wait.ruleId);
           if (rule && rule.enabled) {
             const remainingActions = rule.actions.slice(wait.actionIndex + 1);
-            this.executeGameActions(remainingActions, rule.id);
+            this.withActor(wait.actor, () => this.executeGameActions(remainingActions, rule.id));
           }
           continue;
         }
@@ -494,7 +560,7 @@ class WeildCodeEngine {
           if (rule && rule.enabled) {
             // Execute remaining actions after the wait
             const remainingActions = rule.actions.slice(wait.actionIndex + 1);
-            this.executeActions(wait.partId, remainingActions, rule.id);
+            this.withActor(wait.actor, () => this.executeActions(wait.partId, remainingActions, rule.id));
           }
         }
       }
@@ -538,12 +604,17 @@ class WeildCodeEngine {
   fireGameTrigger(triggerType: TriggerType, eventData?: Record<string, any>): void {
     if (!this.isRunning) return;
     const state = useStudioStore.getState();
-    for (const rule of state.gameRules || []) {
-      if (!rule.enabled) continue;
-      if (rule.trigger.type !== triggerType) continue;
-      if (!this.checkGameTriggerConditions(rule, triggerType, eventData)) continue;
-      this.executeGameActions(rule.actions, rule.id);
-    }
+    // v6.2.1: game events that name a player (join/leave/chat) run with that
+    // player as the acting context, so player-targeting actions hit the
+    // right person in multiplayer.
+    this.withActor(typeof eventData?.username === 'string' ? eventData.username : undefined, () => {
+      for (const rule of state.gameRules || []) {
+        if (!rule.enabled) continue;
+        if (rule.trigger.type !== triggerType) continue;
+        if (!this.checkGameTriggerConditions(rule, triggerType, eventData)) continue;
+        this.executeGameActions(rule.actions, rule.id);
+      }
+    });
   }
 
   private checkGameTriggerConditions(
@@ -578,6 +649,7 @@ class WeildCodeEngine {
           actionIndex: i,
           remainingSeconds: Math.max(WeildCodeEngine.MIN_INTERVAL, this.paramNumber('', action.params.seconds, 1)),
           gameRule: true,
+          actor: this.currentActor, // v6.2.1: keep the triggering player
         });
         return; // resume after the wait
       }
@@ -628,26 +700,62 @@ class WeildCodeEngine {
         break;
       }
       case 'teleport_player': {
+        // v6.2.1: server mode queues a per-player teleport (the acting
+        // player only); singleplayer keeps the shared-store behavior.
+        if (this.isServerAuthority()) {
+          const pos = this.paramVec3('', action.params.position, { x: 0, y: 5, z: 0 });
+          const p = action.params.position || {};
+          const cur = useStudioStore.getState().playState.characterPosition;
+          this.pushPlayerEffect({
+            kind: 'teleport',
+            position: {
+              x: p.relativeX ? cur.x + (pos.x || 0) : (pos.x || 0),
+              y: p.relativeY ? cur.y + (pos.y || 0) : (pos.y || 0),
+              z: p.relativeZ ? cur.z + (pos.z || 0) : (pos.z || 0),
+            },
+          });
+          break;
+        }
         this.executeTeleportPlayer(action);
         break;
       }
       case 'modify_player_health': {
+        // v6.2.1: server mode queues a per-player effect (the acting player
+        // only); singleplayer keeps the shared-store behavior.
+        if (this.isServerAuthority()) {
+          const amount = this.paramNumber('', action.params.health, 0);
+          if (action.params.relative !== false) this.pushPlayerEffect({ kind: 'damage', value: amount });
+          else this.pushPlayerEffect({ kind: 'set_health', value: amount });
+          break;
+        }
         this.executeModifyPlayerHealth(action);
         break;
       }
       case 'set_health': {
         const maxHp = useStudioStore.getState().playState.characterMaxHealth;
         const hp = Math.max(0, Math.min(maxHp, this.paramNumber('', action.params.health, 100)));
+        if (this.isServerAuthority()) {
+          this.pushPlayerEffect({ kind: 'set_health', value: hp });
+          break;
+        }
         useStudioStore.getState().setPlayState({ characterHealth: hp });
         useStudioStore.getState().addConsoleMessage('info', `[WeildCode] Player health set to ${hp}`);
         break;
       }
       case 'kill_player': {
+        if (this.isServerAuthority()) {
+          this.pushPlayerEffect({ kind: 'kill' });
+          break;
+        }
         useStudioStore.getState().setPlayState({ characterHealth: 0 });
         useStudioStore.getState().addConsoleMessage('info', `[WeildCode] Player killed (game rule)`);
         break;
       }
       case 'heal_player': {
+        if (this.isServerAuthority()) {
+          this.pushPlayerEffect({ kind: 'heal' });
+          break;
+        }
         const maxHp = useStudioStore.getState().playState.characterMaxHealth;
         useStudioStore.getState().setPlayState({ characterHealth: maxHp });
         useStudioStore.getState().addConsoleMessage('info', `[WeildCode] Player healed to full (${maxHp} HP)`);
@@ -696,6 +804,7 @@ class WeildCodeEngine {
           fired: true,
           maxRepeats,
           fireCount: 1,
+          actor: this.currentActor, // v6.2.1: keep the triggering player
         });
         break;
       }
@@ -749,6 +858,7 @@ class WeildCodeEngine {
           partId,
           actionIndex: i,
           remainingSeconds: seconds,
+          actor: this.currentActor, // v6.2.1: keep the triggering player
         });
         return; // Stop executing further actions; will resume after wait
       }
@@ -920,23 +1030,48 @@ class WeildCodeEngine {
         break;
       }
       case 'teleport_player_to_part': {
+        // v6.2.1: server mode resolves the target position, then queues a
+        // per-player teleport (the acting player only).
+        if (this.isServerAuthority()) {
+          const pos = this.resolveTeleportToPartPosition(partId, action);
+          if (pos) this.pushPlayerEffect({ kind: 'teleport', position: pos });
+          break;
+        }
         this.executeTeleportPlayerToPart(partId, action);
         break;
       }
       case 'teleport_player': {
+        if (this.isServerAuthority()) {
+          const pos = this.paramVec3('', action.params.position, { x: 0, y: 5, z: 0 });
+          const p = action.params.position || {};
+          const cur = useStudioStore.getState().playState.characterPosition;
+          this.pushPlayerEffect({
+            kind: 'teleport',
+            position: {
+              x: p.relativeX ? cur.x + (pos.x || 0) : (pos.x || 0),
+              y: p.relativeY ? cur.y + (pos.y || 0) : (pos.y || 0),
+              z: p.relativeZ ? cur.z + (pos.z || 0) : (pos.z || 0),
+            },
+          });
+          break;
+        }
         this.executeTeleportPlayer(action);
         break;
       }
-      case 'modify_player_health': {
-        this.executeModifyPlayerHealth(action);
-        break;
-      }
       case 'kill_player': {
+        if (this.isServerAuthority()) {
+          this.pushPlayerEffect({ kind: 'kill' });
+          break;
+        }
         useStudioStore.getState().setPlayState({ characterHealth: 0 });
         useStudioStore.getState().addConsoleMessage('info', `[WeildCode] Player killed`);
         break;
       }
       case 'heal_player': {
+        if (this.isServerAuthority()) {
+          this.pushPlayerEffect({ kind: 'heal' });
+          break;
+        }
         const maxHp = useStudioStore.getState().playState.characterMaxHealth;
         useStudioStore.getState().setPlayState({ characterHealth: maxHp });
         useStudioStore.getState().addConsoleMessage('info', `[WeildCode] Player healed to full (${maxHp} HP)`);
@@ -976,6 +1111,7 @@ class WeildCodeEngine {
           fired: true, // Already fired once
           maxRepeats,
           fireCount: 1,
+          actor: this.currentActor, // v6.2.1: keep the triggering player
         });
         break;
       }
@@ -1191,9 +1327,25 @@ class WeildCodeEngine {
         useStudioStore.getState().addConsoleMessage('info', `[WeildCode] Removed all body movers from "${part.name}"`);
         break;
       }
+      case 'modify_player_health': {
+        // v6.2.1: server mode queues a per-player effect (the acting player
+        // only); singleplayer keeps the shared-store behavior.
+        if (this.isServerAuthority()) {
+          const amount = this.paramNumber(partId, action.params.health, 0);
+          if (action.params.relative !== false) this.pushPlayerEffect({ kind: 'damage', value: amount });
+          else this.pushPlayerEffect({ kind: 'set_health', value: amount });
+          break;
+        }
+        this.executeModifyPlayerHealth(action);
+        break;
+      }
       case 'set_health': {
         const maxHp = useStudioStore.getState().playState.characterMaxHealth;
         const hp = Math.max(0, Math.min(maxHp, this.paramNumber(partId, action.params.health, 100)));
+        if (this.isServerAuthority()) {
+          this.pushPlayerEffect({ kind: 'set_health', value: hp });
+          break;
+        }
         useStudioStore.getState().setPlayState({ characterHealth: hp });
         useStudioStore.getState().addConsoleMessage('info', `[WeildCode] Player health set to ${hp}`);
         break;
@@ -1373,13 +1525,23 @@ class WeildCodeEngine {
   // Find the named part, compute a position on the chosen face, and set
   // playState.teleportPosition. PlayCharacter picks this up on the next frame.
   private executeTeleportPlayerToPart(sourcePartId: string, action: WeildCodeAction) {
+    const teleportPos = this.resolveTeleportToPartPosition(sourcePartId, action);
+    if (!teleportPos) return;
+    useStudioStore.getState().setPlayState({ teleportPosition: teleportPos });
+    useStudioStore.getState().addConsoleMessage('info', `[WeildCode] Teleported player to ${this.paramString(sourcePartId, action.params.targetName, '?')} (${action.params.face || 'top'})`);
+  }
+
+  /** v6.2.1: resolve a teleport_player_to_part action to a concrete feet
+   * position (null when the target part is missing). Shared by the local
+   * store path and the multiplayer per-player effect path. */
+  private resolveTeleportToPartPosition(sourcePartId: string, action: WeildCodeAction): { x: number; y: number; z: number } | null {
     const targetName = this.paramString(sourcePartId, action.params.targetName, '');
     const face = action.params.face || 'top';
     const offset = this.paramVec3(sourcePartId, action.params.offset, { x: 0, y: 0, z: 0 });
 
     if (!targetName) {
       useStudioStore.getState().addConsoleMessage('warn', `[WeildCode] teleport_player_to_part: no target name specified`);
-      return;
+      return null;
     }
 
     const state = useStudioStore.getState();
@@ -1392,7 +1554,7 @@ class WeildCodeEngine {
 
     if (!targetPart) {
       useStudioStore.getState().addConsoleMessage('warn', `[WeildCode] teleport_player_to_part: part "${targetName}" not found`);
-      return;
+      return null;
     }
 
     // After the null check, TypeScript still narrows targetPart to `never`
@@ -1441,9 +1603,7 @@ class WeildCodeEngine {
     teleportPos.x += offset.x || 0;
     teleportPos.y += offset.y || 0;
     teleportPos.z += offset.z || 0;
-
-    useStudioStore.getState().setPlayState({ teleportPosition: teleportPos });
-    useStudioStore.getState().addConsoleMessage('info', `[WeildCode] Teleported player to ${targetName} (${face})`);
+    return teleportPos;
   }
 
   // ─── Teleport Player ───
@@ -2084,20 +2244,29 @@ class WeildCodeEngine {
 
   // ─── Event Handlers (called from Viewport3D + the store) ───
 
-  handleClick(partId: string) {
-    this.fireTrigger(partId, 'when_clicked');
+  /** v6.2.1: `actor` is the player who clicked (multiplayer authority
+   * passes the clicker's username so kill/heal/damage/teleport actions hit
+   * THEM, not everyone). */
+  handleClick(partId: string, actor?: string) {
+    this.withActor(actor, () => this.fireTrigger(partId, 'when_clicked'));
   }
 
-  handleTouch(partId: string, touchType: 'player' | 'parts' | 'any' = 'any') {
+  /** v6.2.1: `actor` is the player whose character touched the part (same
+   * multiplayer semantics as handleClick). */
+  handleTouch(partId: string, touchType: 'player' | 'parts' | 'any' = 'any', actor?: string) {
     // v1.7 PERF: standing on a part fires the physics contact EVERY frame
     // (~60 Hz). A 100 ms debounce per part + touch type keeps touch rules
     // responsive (10 fires/sec max) while killing the rule storm.
-    const key = `${partId}::${touchType}`;
+    // v6.2.1: the debounce key now includes the ACTING PLAYER - with the old
+    // part-only key, one player's touch ate the NEXT player's touch event
+    // within the 100 ms window (two players hitting the same lava brick =
+    // only the first one died until they stepped off and back on).
+    const key = `${partId}::${touchType}::${actor ?? ''}`;
     const now = performance.now();
     const last = this.touchFiredAt.get(key) ?? -Infinity;
     if (now - last < WeildCodeEngine.TOUCH_DEBOUNCE_MS) return;
     this.touchFiredAt.set(key, now);
-    this.fireTrigger(partId, 'when_touched', { touchType });
+    this.withActor(actor, () => this.fireTrigger(partId, 'when_touched', { touchType }));
   }
 
   // v13.4: re-entrancy guard - a when_destroyed rule that deletes parts

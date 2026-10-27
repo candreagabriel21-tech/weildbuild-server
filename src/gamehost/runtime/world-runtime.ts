@@ -59,12 +59,23 @@ interface RuntimePlayer {
   velX: number;         // smoothed horizontal velocity (prediction mirror)
   velZ: number;
   yaw: number;
+  /** Sim-time when grounded last held true (coyote-time jumps). */
+  lastGroundedAt: number;
   touched: Set<string>; // part ids currently touched (when_touched re-arm)
 }
 
 const SIM_HZ = 30;
 const SNAPSHOT_HZ = 15;
-const DEATH_ANIMATION_SECONDS = 0.9;
+// v6.2.1: aligned with the client's DEATH_DURATION (StudioPlayViewport
+// startDeath) - the local and remote death animations now end together with
+// the server-side respawn, so the body reappears exactly at the spawn point
+// instead of 0.45s of dead air.
+const DEATH_ANIMATION_SECONDS = 1.35;
+/** Coyote time: a jump still counts this long after leaving the ground.
+ * Matches the client's prediction (coyoteTimer 0.1s) so the authority never
+ * denies a jump the client already predicted (that was the jump
+ * rubber-band: client jumps, server disagrees, next snapshot yanks back). */
+const JUMP_COYOTE_SECONDS = 0.1;
 
 function post(msg: unknown): void {
   parentPort?.postMessage(msg);
@@ -203,6 +214,7 @@ async function main(): Promise<void> {
       velX: 0,
       velZ: 0,
       yaw: rootRot?.y ? (rootRot.y * Math.PI) / 180 : 0,
+      lastGroundedAt: 0,
       touched: new Set(),
     });
   }
@@ -218,6 +230,68 @@ async function main(): Promise<void> {
     p.velX = 0;
     p.velZ = 0;
     p.dyingTimer = 0;
+  }
+
+  // ─── v6.2.1: per-player rule effects ───
+  // The engine (in server mode) queues kill/heal/damage/set/teleport
+  // effects with the ACTING player's username instead of writing the single
+  // shared playState (which used to make "one player steps on lava" kill
+  // EVERYONE). Effects without an actor (timer/global rules) keep the
+  // classic applies-to-everyone semantics.
+  function killPlayer(p: RuntimePlayer): void {
+    if (p.dyingTimer <= 0 && p.hp > 0) {
+      p.hp = 0;
+      p.dyingTimer = DEATH_ANIMATION_SECONDS; // respawn fires when it expires
+    }
+  }
+
+  function healPlayer(p: RuntimePlayer): void {
+    p.hp = useStudioStore.getState().playState.characterMaxHealth || 100;
+    p.dyingTimer = 0; // a heal cancels an in-progress death
+  }
+
+  function applyPlayerEffects(): void {
+    const effects = weildCodeEngine.drainPlayerEffects();
+    for (const e of effects) {
+      const targets = e.username ? players : null;
+      if (targets) {
+        // Named actor: only that player.
+        for (const p of targets.values()) {
+          if (p.username !== e.username) continue;
+          applyEffectToPlayer(p, e);
+        }
+      } else {
+        // Global rule (timer etc.): everyone - the classic semantics.
+        for (const p of players.values()) applyEffectToPlayer(p, e);
+      }
+    }
+  }
+
+  function applyEffectToPlayer(p: RuntimePlayer, e: import('../../../engine/weildcode-engine').PlayerEffect): void {
+    const maxHp = useStudioStore.getState().playState.characterMaxHealth || 100;
+    switch (e.kind) {
+      case 'kill':
+        killPlayer(p);
+        break;
+      case 'heal':
+        healPlayer(p);
+        break;
+      case 'damage':
+        p.hp = Math.max(0, Math.min(maxHp, p.hp + (e.value ?? 0)));
+        if (p.hp <= 0) killPlayer(p);
+        break;
+      case 'set_health':
+        p.hp = Math.max(0, Math.min(maxHp, e.value ?? 0));
+        if (p.hp <= 0) killPlayer(p);
+        break;
+      case 'teleport':
+        if (e.position) {
+          world.teleportNamedCharacterBody(p.socketId, { x: e.position.x, y: e.position.y, z: e.position.z });
+          p.velX = 0;
+          p.velZ = 0;
+        }
+        break;
+    }
   }
 
   // ─── Rules engine: sound relay + screen message relay ───
@@ -244,23 +318,12 @@ async function main(): Promise<void> {
         }
       }
     }
-    // Rule-driven player health (modify_player_health / kill_player /
-    // heal_player) applies to every player in this MVP: the engine's
-    // health model predates multiplayer.
-    if (state.playState.characterHealth !== prev.playState.characterHealth) {
-      const hp = Math.max(0, Math.min(state.playState.characterMaxHealth || 100, state.playState.characterHealth));
-      for (const p of players.values()) p.hp = hp;
-    }
-    // Rule-driven teleports (teleport_player) move every player (same
-    // MVP semantics as health).
-    if (state.playState.teleportPosition && state.playState.teleportPosition !== prev.playState.teleportPosition) {
-      const tp = state.playState.teleportPosition;
-      for (const p of players.values()) {
-        world.teleportNamedCharacterBody(p.socketId, { x: tp.x, y: tp.y, z: tp.z });
-        p.velX = 0;
-        p.velZ = 0;
-      }
-    }
+    // v6.2.1: health + teleport rules no longer flow through the shared
+    // playState here. In server mode the engine queues per-player effects
+    // (see applyPlayerEffects) that target the ACTING player only - the old
+    // "copy characterHealth/teleportPosition onto every player" mirror was
+    // the root cause of "one player dies, everyone dies (and nobody
+    // respawns)".
   });
 
   // ─── Part change tracking for snapshots ───
@@ -302,7 +365,9 @@ async function main(): Promise<void> {
         p.input = { x, z, jump: !!m.jump, sprint: !!m.sprint, yaw: Number(m.yaw) || 0 };
       }
     } else if (m.t === 'click' && typeof m.partId === 'string') {
-      try { weildCodeEngine.handleClick(m.partId); } catch { /* rules must never kill the sim */ }
+      // v6.2.1: the clicker's username rides along so player-targeting
+      // rules (kill/heal/damage/teleport) hit THEM, not the whole room.
+      try { weildCodeEngine.handleClick(m.partId, typeof m.username === 'string' ? m.username : undefined); } catch { /* rules must never kill the sim */ }
     } else if (m.t === 'chat' && typeof m.message === 'string') {
       // v1.5: game rules - on_chat_message (optional username/contains filters).
       try { weildCodeEngine.handleChatMessage(String(m.username || 'Player'), String(m.message)); } catch { /* never kill the sim */ }
@@ -344,13 +409,20 @@ async function main(): Promise<void> {
         if (!p.touched.has(obj.id)) newlyTouched.push(obj.id);
       });
       for (const id of newlyTouched) {
-        try { weildCodeEngine.handleTouch(id, 'player'); } catch { /* never kill the sim */ }
+        // v6.2.1: the TOUCHING player is the acting player - a lava brick
+        // kills the player who stepped on it, not everyone in the room.
+        try { weildCodeEngine.handleTouch(id, 'player', p.username); } catch { /* never kill the sim */ }
       }
       p.touched = stillTouched;
     }
   }
 
   function stepSim(dt: number): void {
+    // 0. v6.2.1: apply queued per-player rule effects (kill/heal/damage/
+    //    teleport) - the engine queues them while running triggers between
+    //    ticks (timer fires, touch events, clicks, chat).
+    try { applyPlayerEffects(); } catch { /* never kill the sim */ }
+
     // 1. Characters: input -> velocity -> cannon bodies (the client's
     //    movement math, from character-constants.ts).
     for (const p of players.values()) {
@@ -366,6 +438,8 @@ async function main(): Promise<void> {
       p.jumpCooldown = Math.max(0, p.jumpCooldown - dt);
 
       const grounded = world.namedCharacterGroundCheck(p.socketId);
+      if (grounded) p.lastGroundedAt = 0; // relative to now
+      const coyote = grounded || (p.lastGroundedAt += dt) <= JUMP_COYOTE_SECONDS;
       world.setNamedCharacterStanding(p.socketId, grounded && p.input.x === 0 && p.input.z === 0);
 
       // Smoothed target velocity (the client's two-stage ramp).
@@ -374,13 +448,18 @@ async function main(): Promise<void> {
       p.velZ = stepped.velZ;
 
       // Jump: honor the cooldown, scale horizontal (a hop, not a launch).
+      // v6.2.1: COYOTE TIME - the client predicts jumps with a 0.1s grace
+      // after leaving the ground; the authority used to deny those (the
+      // input arrived at a tick where grounded had just flipped false), and
+      // the next snapshot yanked the player back down = jump rubber-band.
       if (p.input.jump) {
         p.input.jump = false;
-        if (grounded && p.jumpCooldown <= 0) {
+        if (coyote && p.jumpCooldown <= 0) {
           const j = applyJump(body.velocity.x, body.velocity.y, body.velocity.z, p.jumpCooldown);
           if (j) {
             body.velocity.set(j.x, j.y, j.z);
             p.jumpCooldown = 0.5;
+            p.lastGroundedAt = JUMP_COYOTE_SECONDS + 1; // jump consumed the grace
           }
         }
       }

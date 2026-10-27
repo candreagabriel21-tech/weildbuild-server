@@ -237,11 +237,13 @@ export class WorldSimManager {
     });
   }
 
-  /** A rule click from a player (on_click triggers run on the authority). */
-  click(instanceId: string, partId: string): void {
+  /** A rule click from a player (on_click triggers run on the authority).
+   * v6.2.1: carries the clicker's username so player-targeting rules hit
+   * them, not the whole room. */
+  click(instanceId: string, partId: string, username?: string): void {
     const sim = this.sims.get(instanceId);
     if (sim && sim.ready && !sim.disposed) {
-      sim.worker.postMessage({ t: "click", partId });
+      sim.worker.postMessage({ t: "click", partId, username: username || "" });
     }
   }
 

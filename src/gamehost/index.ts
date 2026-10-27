@@ -440,13 +440,16 @@ io.on("connection", (socket) => {
   // ── game:click { instanceId, partId } ──
   // v1.1: on_click rules run on the authority - a click is a REQUEST,
   // the worker's engine decides what happens.
+  // v6.2.1: the clicker's username rides along so player-targeting rules
+  // (kill/heal/damage/teleport) hit the player who clicked, not everyone.
   socket.on("game:click", (payload: unknown) => {
     const p = asRecord(payload);
     const instance = resolvePlayerInstance(socket.id, p.instanceId);
     if (!instance) return;
     const partId = typeof p.partId === "string" ? p.partId : "";
     if (!partId || partId.length > 128) return;
-    worldSims.click(instance.id, partId);
+    const player = instance.players.get(socket.id);
+    worldSims.click(instance.id, partId, player?.username);
   });
 
   // ── game:move { instanceId, position, rotation, anim? } ──
