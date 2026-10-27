@@ -79,13 +79,21 @@ interface RuntimePlayer {
   velX: number;         // smoothed horizontal velocity (prediction mirror)
   velZ: number;
   yaw: number;
-  /** Sim-time when grounded last held true (coyote-time jumps). */
-  lastGroundedAt: number;
+  /** v6.2.5: simClock when grounded last held (coyote-time jumps). The
+   * old relative accumulator (lastGroundedAt += dt) only worked inside
+   * stepSim; the absolute clock lets the input handler honor coyote time
+   * the instant a jump message arrives, not one tick later. */
+  lastGroundedClock: number;
   touched: Set<string>; // part ids currently touched (when_touched re-arm)
 }
 
 const SIM_HZ = 30;
-const SNAPSHOT_HZ = 15;
+// v6.2.5: 15 -> 30. Clients render every character (your own included)
+// purely from interpolated snapshot samples, so the stream density IS the
+// smoothness: 33 ms spacing with a 100-150 ms render delay always spans
+// 3+ live samples. Delta filtering keeps the idle cost at the old 15 Hz
+// level (unchanged players are simply not listed).
+const SNAPSHOT_HZ = 30;
 // v6.2.1: aligned with the client's DEATH_DURATION (StudioPlayViewport
 // startDeath) - the local and remote death animations now end together with
 // the server-side respawn, so the body reappears exactly at the spawn point
@@ -257,7 +265,7 @@ async function main(): Promise<void> {
       velX: 0,
       velZ: 0,
       yaw: rootRot?.y ? (rootRot.y * Math.PI) / 180 : 0,
-      lastGroundedAt: 0,
+      lastGroundedClock: 0,
       touched: new Set(),
     });
   }
@@ -431,6 +439,12 @@ async function main(): Promise<void> {
       if (len > 1) { x /= len; z /= len; }
       if (p.dyingTimer <= 0) {
         p.input = { x, z, jump: !!m.jump, sprint: !!m.sprint, yaw: Number(m.yaw) || 0 };
+        // v6.2.5: "the server takes input almost instantly" - a jump press
+        // fires THE MOMENT the message arrives instead of waiting for the
+        // next simulation tick (up to 33 ms). Steering input is consumed by
+        // stepSim at the next tick (<= 33 ms), which is the physics cadence
+        // anyway.
+        if (m.jump) tryJump(p);
       }
     } else if (m.t === 'click' && typeof m.partId === 'string') {
       // v6.2.1: the clicker's username rides along so player-targeting
@@ -498,6 +512,34 @@ async function main(): Promise<void> {
     }
   }
 
+  /**
+   * v6.2.5: fire a jump press the moment it is known - called from the
+   * input message handler (instant) AND from stepSim (the safety net).
+   * Honors the 0.5 s cooldown and coyote time (a jump still counts this
+   * long after leaving the ground, matching the client feel); sets the
+   * v6.2.4 airborneFromJump latch whose rising edge IS the jump and whose
+   * falling edge IS the landing (exactly one of each per hop, everywhere).
+   * A jump that cannot fire is consumed and dropped - identical to the old
+   * tick-only semantics.
+   */
+  function tryJump(p: RuntimePlayer): void {
+    if (p.dyingTimer > 0) return;
+    if (!p.input.jump) return;
+    p.input.jump = false; // consumed either way (never buffered mid-air)
+    const body = world.getNamedCharacterBody(p.socketId);
+    if (!body) return;
+    const grounded = world.namedCharacterGroundCheck(p.socketId);
+    const coyote = grounded || simClock - p.lastGroundedClock <= JUMP_COYOTE_SECONDS;
+    if (!(coyote && p.jumpCooldown <= 0)) return;
+    const j = applyJump(body.velocity.x, body.velocity.y, body.velocity.z, p.jumpCooldown);
+    if (!j) return;
+    body.velocity.set(j.x, j.y, j.z);
+    p.jumpCooldown = 0.5;
+    p.lastGroundedClock = -1e9; // the jump consumed the coyote grace
+    p.airborneFromJump = true;
+    p.jumpAge = 0;
+  }
+
   function stepSim(dt: number): void {
     simClock += dt; // simulated seconds (drives keyframe deadlines)
 
@@ -521,8 +563,7 @@ async function main(): Promise<void> {
       p.jumpCooldown = Math.max(0, p.jumpCooldown - dt);
 
       const grounded = world.namedCharacterGroundCheck(p.socketId);
-      if (grounded) p.lastGroundedAt = 0; // relative to now
-      const coyote = grounded || (p.lastGroundedAt += dt) <= JUMP_COYOTE_SECONDS;
+      if (grounded) p.lastGroundedClock = simClock;
       world.setNamedCharacterStanding(p.socketId, grounded && p.input.x === 0 && p.input.z === 0);
 
       // v6.2.4: age the jump latch and clear it on the first grounded tick
@@ -542,27 +583,11 @@ async function main(): Promise<void> {
       p.velX = stepped.velX;
       p.velZ = stepped.velZ;
 
-      // Jump: honor the cooldown, scale horizontal (a hop, not a launch).
-      // v6.2.1: COYOTE TIME - the client predicts jumps with a 0.1s grace
-      // after leaving the ground; the authority used to deny those (the
-      // input arrived at a tick where grounded had just flipped false), and
-      // the next snapshot yanked the player back down = jump rubber-band.
-      if (p.input.jump) {
-        p.input.jump = false;
-        if (coyote && p.jumpCooldown <= 0) {
-          const j = applyJump(body.velocity.x, body.velocity.y, body.velocity.z, p.jumpCooldown);
-          if (j) {
-            body.velocity.set(j.x, j.y, j.z);
-            p.jumpCooldown = 0.5;
-            p.lastGroundedAt = JUMP_COYOTE_SECONDS + 1; // jump consumed the grace
-            // v6.2.4: the ONE rising edge of the jump animation. It stays
-            // latched until the landing clears it - no more apex dips or
-            // landing-impact re-triggers.
-            p.airborneFromJump = true;
-            p.jumpAge = 0;
-          }
-        }
-      }
+      // Jump: v6.2.5 the input handler fires presses the instant they
+      // arrive (see the 'input' message case); this tick-path call remains
+      // as the safety net for any jump that lands between handler and tick
+      // (identical logic, idempotent under the 0.5 s cooldown).
+      tryJump(p);
 
       // Steer the REAL body velocity toward the target (physics owns the
       // outcome - walls/ramps/pushed parts behave physically).

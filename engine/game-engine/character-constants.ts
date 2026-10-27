@@ -29,10 +29,16 @@ export const ACCEL_WALK = 0.28;
 export const ACCEL_STOP = 3.5;
 /** Tick rate of the authoritative server sim (Hz). */
 export const SERVER_SIM_HZ = 30;
-/** Snapshot broadcast rate to clients (Hz). */
-export const SERVER_SNAPSHOT_HZ = 15;
-/** Client input send rate (Hz). */
-export const CLIENT_INPUT_HZ = 20;
+/** Snapshot broadcast rate to clients (Hz). v6.2.5: 15 -> 30 - the
+ * denser stream is what client-side entity interpolation runs on (the
+ * render clock lags ~100-150 ms behind arrival, so more samples per
+ * second = smoother motion and fresher data). Delta filtering keeps the
+ * bandwidth close to the old 15 Hz idle cost. */
+export const SERVER_SNAPSHOT_HZ = 30;
+/** Client input send rate (Hz). v6.2.5: 20 -> 30 steady state; direction
+ * changes and jump presses flush IMMEDIATELY (see reportInput in
+ * netcode-bridge) so the authority reacts the moment a key changes. */
+export const CLIENT_INPUT_HZ = 30;
 
 /**
  * The shared velocity-integration core. Given the previous horizontal

@@ -484,9 +484,10 @@ io.on("connection", (socket) => {
 
   // ── game:input { instanceId, x, z, jump, sprint, yaw } ──
   // v1.1: THE authority channel. Clients report camera-relative input at
-  // ~20 Hz; the simulation moves every character server-side and the
-  // game:state snapshots carry the truth back. Numbers are sanitized in
-  // the worker (direction clamped to unit length).
+  // 30 Hz with instant flushes on direction/jump/sprint changes (v6.2.5);
+  // the simulation moves every character server-side and the game:state
+  // snapshots carry the truth back. Numbers are sanitized in the worker
+  // (direction clamped to unit length).
   socket.on("game:input", (payload: unknown) => {
     const p = asRecord(payload);
     const instance = resolvePlayerInstance(socket.id, p.instanceId);
