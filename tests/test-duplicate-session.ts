@@ -70,6 +70,21 @@ function waitEvent<T = any>(emitter: any, event: string, predicate: (m: any) => 
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
+/** Pre-attachable disconnect promise: the gamehost emits game:error and
+ * disconnects back-to-back, so both events can arrive in the SAME frame -
+ * a waitEvent-style listener attached only AFTER awaiting the error would
+ * miss the disconnect entirely (the race that made this test flake). */
+function recordDisconnect(s: Socket): Promise<void> {
+  return new Promise((resolve) => { s.once('disconnect', () => resolve()); });
+}
+
+function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
+  return Promise.race([
+    p,
+    new Promise<never>((_, reject) => setTimeout(() => reject(new Error(`timeout waiting for ${label}`)), ms)),
+  ]);
+}
+
 async function main() {
   ({ signSessionToken } = await import("../src/shared/jwt"));
 
@@ -159,6 +174,8 @@ async function main() {
     const alice2: Socket = io(`http://localhost:${GAMEHOST_PORT}`, {
       transports: ['websocket'], auth: { token: await signSessionToken('Alice') }, reconnection: false,
     });
+    // Pre-attach BEFORE the join lands (see recordDisconnect).
+    const alice2Gone = recordDisconnect(alice2);
     alice2.emit('game:join', { instanceId, gameId: 'dupgame1', username: 'Alice', avatar: {} });
     const dupErr: any = await waitEvent(alice2, 'game:error', (m: any) => m?.code === 'duplicate_session', 10000);
     assert.ok(
@@ -167,7 +184,7 @@ async function main() {
     );
     // No hyphens or em dashes in any UI-facing message (user requirement).
     assert.ok(!/[-—–]/.test(dupErr.message), `warning must not contain dashes (got "${dupErr.message}")`);
-    await waitEvent(alice2, 'disconnect', () => true, 8000);
+    await withTimeout(alice2Gone, 8000, 'disconnect');
     console.log(`✓ duplicate join REJECTED + kicked: "${dupErr.message}"`);
 
     // ── 6. The FIRST Alice keeps playing ──
@@ -192,6 +209,8 @@ async function main() {
     });
     const alice3Error: any[] = [];
     alice3.on('game:error', (e: any) => { alice3Error.push(e); });
+    // Pre-attach BEFORE the join lands (see recordDisconnect).
+    const alice1Gone = recordDisconnect(alice1);
     alice3.emit('game:join', { instanceId, gameId: 'dupgame1', username: 'Alice', avatar: {} });
 
     // The parked session gets the takeover warning + kick...
@@ -201,7 +220,7 @@ async function main() {
       'the takeover warning carries a readable message',
     );
     assert.ok(!/[-—–]/.test(takeoverErr.message), `takeover warning must not contain dashes (got "${takeoverErr.message}")`);
-    await waitEvent(alice1, 'disconnect', () => true, 8000);
+    await withTimeout(alice1Gone, 8000, 'disconnect');
     console.log(`✓ parked session taken over + warned: "${takeoverErr.message}"`);
 
     // ...and the newcomer plays in her place.

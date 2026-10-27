@@ -44,6 +44,12 @@ export interface SelfCorrection {
   hp: number;
   /** True during the server-side death animation. */
   dying: boolean;
+  /** v6.2.3: the server's animation flags for this player (walk/jump/sprint
+   * feel now comes from the same broadcast everyone else renders). */
+  anim?: { walking?: boolean; jumping?: boolean; sprint?: boolean };
+  /** v6.2.3: performance.now() ms when this correction arrived (landing
+   * speed + authority-liveness bookkeeping for the server-driven character). */
+  receivedAt: number;
 }
 
 /** Authoritative transform for one world part. */
@@ -81,6 +87,20 @@ const pendingJump = { value: false };
 let selfCorrection: SelfCorrection | null = null;
 let partCorrections: PartCorrection[] = [];
 let fxQueue: Array<{ name: string; volume: number }> = [];
+// v6.2.3: ms timestamp of the LAST game:state snapshot (any content). The
+// server re-broadcasts everyone as a keyframe at least every 2s while a
+// single player is in the instance, so a fresh stamp = the authority is
+// alive. The play viewport uses this to decide between server-driven
+// rendering (authority alive) and local prediction (boot grace, relay-only
+// legacy instances, or the authority died mid-session).
+let lastSnapshotAt = 0;
+
+/** How long ago the last server snapshot arrived (ms). Infinity = never. */
+export function serverSnapshotAgeMs(): number {
+  if (lastSnapshotAt === 0) return Infinity;
+  const now = typeof performance !== 'undefined' ? performance.now() : Date.now();
+  return now - lastSnapshotAt;
+}
 
 /** Installed by GamePlayer while a server-hosted session is live. */
 export function setInputSender(sender: InputSender | null): void {
@@ -124,11 +144,12 @@ export function drainFx(): Array<{ name: string; volume: number }> {
 
 /** Called by GamePlayer on every server snapshot. */
 export function pushSnapshot(data: {
-  self?: { socketId: string; x: number; y: number; z: number; yaw: number; hp: number; dying: boolean; seq: number };
+  self?: { socketId: string; x: number; y: number; z: number; yaw: number; hp: number; dying: boolean; seq: number; anim?: { walking?: boolean; jumping?: boolean; sprint?: boolean } };
   parts?: PartCorrection[];
   fx?: Array<{ name: string; volume: number }>;
 }): void {
-  if (data.self) selfCorrection = data.self;
+  lastSnapshotAt = typeof performance !== 'undefined' ? performance.now() : Date.now();
+  if (data.self) selfCorrection = { ...data.self, receivedAt: lastSnapshotAt };
   if (data.parts && data.parts.length > 0) {
     // Cap the queue: if the local sim stalled (tab hidden), drop the oldest.
     partCorrections.push(...data.parts);
@@ -147,4 +168,5 @@ export function resetNetcodeBridge(): void {
   fxQueue = [];
   pendingJump.value = false;
   lastInputSentAt = 0;
+  lastSnapshotAt = 0;
 }
