@@ -47,6 +47,32 @@ class WeildCodeEngine {
   private animFrameId: number | null = null;
   private isRunning: boolean = false;
 
+  // ─── v1.7: performance guards (no lag machines) ───
+  /** Actions executed during the current frame; reset in update(). */
+  private frameActionCount: number = 0;
+  private static MAX_ACTIONS_PER_FRAME = 2000;
+  private lastBudgetWarnAt: number = 0;
+  /** Smallest allowed timer/wait interval (10 fires per second per rule). */
+  private static MIN_INTERVAL = 0.1;
+  /** Hard cap on one `repeat` activation. */
+  private static MAX_REPEAT_COUNT = 1000;
+  /** when_touched refire debounce per part + touch type. */
+  private touchFiredAt: Map<string, number> = new Map();
+  private static TOUCH_DEBOUNCE_MS = 100;
+  private touchPruneAt: number = 0;
+  /** when_time_is: fire once per window ENTRY (was: every frame inside
+   * the window = a 60 Hz machine gun while the clock crossed the target). */
+  private timeInWindow: Map<string, boolean> = new Map();
+  /** Parts/movers/effects caps. */
+  private static MAX_BODY_MOVERS = 16;
+  private static MAX_EFFECTS = 16;
+  /** Cached list of parts that actually have polled rules
+   * (when_variable_* / when_condition / when_coinflip); rebuilt when
+   * objectsVersion changes so big worlds without such rules skip the
+   * per-frame scan entirely. */
+  private polledPartsCache: { part: StudioPart; rules: WeildCodeRule[] }[] = [];
+  private polledPartsVersion: number = -1;
+
   // Track which parts have already fired their when_created trigger
   private createdParts: Set<string> = new Set();
 
@@ -95,6 +121,10 @@ class WeildCodeEngine {
     this.coinFlipFired.clear();
     this.nameLabels.clear();
     this.fadingEffects.clear();
+    this.frameActionCount = 0;
+    this.touchFiredAt.clear();
+    this.timeInWindow.clear();
+    this.polledPartsVersion = -1;
 
     // Snapshot current global variables
     const vars = useStudioStore.getState().globalVariables;
@@ -135,6 +165,8 @@ class WeildCodeEngine {
     this.pendingWaits.clear();
     this.createdParts.clear();
     this.fadingEffects.clear();
+    this.touchFiredAt.clear();
+    this.timeInWindow.clear();
     // Clear any on-screen messages
     useStudioStore.getState().clearScreenMessages();
   }
@@ -145,10 +177,19 @@ class WeildCodeEngine {
     if (!this.isRunning) return;
 
     const now = performance.now();
-    const dt = (now - this.lastTime) / 1000; // delta in seconds
+    const dt = Math.min((now - this.lastTime) / 1000, 0.25); // delta in seconds (clamped: tab-switch jumps can't burst-fire timers)
     this.lastTime = now;
 
+    // v1.7: fresh per-frame action budget.
+    this.frameActionCount = 0;
+
     const state = useStudioStore.getState();
+
+    // v1.7: prune the touched-debounce map now and then (deleted parts).
+    if (now - this.touchPruneAt > 5000) {
+      this.touchPruneAt = now;
+      if (this.touchFiredAt.size > 64) this.touchFiredAt.clear();
+    }
 
     // Check for newly created parts (when_created trigger)
     state.objects.forEach((obj) => {
@@ -305,17 +346,18 @@ class WeildCodeEngine {
         const state = useStudioStore.getState();
         const timeOfDay = state.worldSettings.timeOfDay;
 
-        if (timeMode === 'exact') {
-          const target = params.timeValue || '12:00';
-          const [h, m] = target.split(':').map(Number);
-          const targetHours = h + m / 60;
-          // Check if current time is within 0.5 hours of target
-          return Math.abs(timeOfDay - targetHours) < 0.5;
-        } else {
-          // Period-based
-          const period = params.period || 'noon';
-          return this.isTimeInPeriod(timeOfDay, period);
-        }
+        // v1.7 PERF FIX: this check used to return true for EVERY frame the
+        // clock was inside the target window, so a rule fired ~60 times per
+        // second for the whole window (a lag machine + duplicate effects).
+        // Now the rule fires ONCE per window ENTRY and re-arms only after
+        // the clock leaves the window again.
+        const key = `${(part as StudioPart | undefined)?.id ?? ''}_${rule.id}`;
+        const inWindow = timeMode === 'exact'
+          ? Math.abs(timeOfDay - this.timeValueToHours(params.timeValue)) < 0.5
+          : this.isTimeInPeriod(timeOfDay, params.period || 'noon');
+        const wasInWindow = this.timeInWindow.get(key) ?? false;
+        this.timeInWindow.set(key, inWindow);
+        return inWindow && !wasInWindow;
       }
       case 'when_weather_is': {
         const state = useStudioStore.getState();
@@ -324,6 +366,13 @@ class WeildCodeEngine {
       default:
         return true;
     }
+  }
+
+  /** "16:45" -> 16.75 hours (invalid values fall back to noon). */
+  private timeValueToHours(v: unknown): number {
+    const [h, m] = String(v ?? '12:00').split(':').map(Number);
+    if (!isFinite(h)) return 12;
+    return h + (isFinite(m) ? m / 60 : 0);
   }
 
   private isTimeInPeriod(time: number, period: string): boolean {
@@ -345,7 +394,12 @@ class WeildCodeEngine {
     const key = `${partId}_${rule.id}`;
     if (this.timers.has(key)) return;
 
-    const intervalSeconds = rule.trigger.params.intervalSeconds || 1;
+    // v1.7: intervals are clamped (a 0.01 s timer would fire 100 times per
+    // second per rule = a lag machine). 0.1 s is the floor.
+    const intervalSeconds = Math.max(
+      WeildCodeEngine.MIN_INTERVAL,
+      this.paramNumber(partId, rule.trigger.params.intervalSeconds, 1),
+    );
     const repeat = rule.trigger.params.repeat || 'every';
 
     this.timers.set(key, {
@@ -499,13 +553,13 @@ class WeildCodeEngine {
   ): boolean {
     const params = rule.trigger.params || {};
     if (triggerType === 'on_player_join' || triggerType === 'on_player_leave') {
-      const filter = String(params.username || '').trim().toLowerCase();
+      const filter = this.paramString('', params.username, '').trim().toLowerCase();
       if (filter && String(eventData?.username || '').toLowerCase() !== filter) return false;
     }
     if (triggerType === 'on_chat_message') {
-      const user = String(params.username || '').trim().toLowerCase();
+      const user = this.paramString('', params.username, '').trim().toLowerCase();
       if (user && String(eventData?.username || '').toLowerCase() !== user) return false;
-      const contains = String(params.contains || '').trim().toLowerCase();
+      const contains = this.paramString('', params.contains, '').trim().toLowerCase();
       if (contains && !String(eventData?.message || '').toLowerCase().includes(contains)) return false;
     }
     return true;
@@ -522,7 +576,7 @@ class WeildCodeEngine {
           ruleId,
           partId: '',
           actionIndex: i,
-          remainingSeconds: Number(action.params.seconds) || 1,
+          remainingSeconds: Math.max(WeildCodeEngine.MIN_INTERVAL, this.paramNumber('', action.params.seconds, 1)),
           gameRule: true,
         });
         return; // resume after the wait
@@ -532,24 +586,29 @@ class WeildCodeEngine {
   }
 
   private executeGameAction(action: WeildCodeAction, ruleId: string, depth: number): void {
+    // v1.7: per-frame action budget. A repeat storm (nested repeats,
+    // 0.1 s timers, touched spam) can no longer freeze the frame; the
+    // rest of the actions are simply dropped for this tick.
+    if (!this.spendActionBudget()) return;
+
     switch (action.type) {
       case 'print_message': {
-        const message = action.params.message || 'Hello, world!';
+        const message = this.paramString('', action.params.message, 'Hello, world!');
         useStudioStore.getState().addScreenMessage({
           message,
           position: (action.params.position || 'bottom') as 'top' | 'bottom',
           textColor: action.params.textColor || '#ffffff',
           fontStyle: (action.params.fontStyle || 'normal') as 'normal' | 'bold' | 'italic' | 'bold-italic',
-          fontSize: Number(action.params.fontSize) || 24,
+          fontSize: this.paramNumber('', action.params.fontSize, 24),
           backgroundColor: action.params.backgroundColor || '#000000',
-          duration: Number(action.params.duration ?? 3),
+          duration: this.paramNumber('', action.params.duration, 3),
         });
         useStudioStore.getState().addConsoleMessage('info', `[WeildCode] Print: "${message}" (game rule)`);
         break;
       }
       case 'play_sound': {
         const sound = action.params.sound || 'click';
-        const volume = Math.max(0, Math.min(1, Number(action.params.volume ?? 0.5)));
+        const volume = Math.max(0, Math.min(1, this.paramNumber('', action.params.volume, 0.5)));
         playCue(sound, volume);
         break;
       }
@@ -558,6 +617,7 @@ class WeildCodeEngine {
         if (!varName) break;
         // v1.6: values can be numbers, plain text, a VARIABLE NAME reference,
         // or a math expression built with blocks (e.g. "score + 1").
+        // v1.7: tagged block values ({__wb_var} / {__wb_expr}) resolve too.
         const value = this.resolveVariableValue('', action.params.value ?? '0');
         useStudioStore.getState().setGlobalVariable(varName, value);
         useStudioStore.getState().addConsoleMessage('info', `[WeildCode] Set variable "${varName}" = ${value} (game rule)`);
@@ -577,7 +637,7 @@ class WeildCodeEngine {
       }
       case 'set_health': {
         const maxHp = useStudioStore.getState().playState.characterMaxHealth;
-        const hp = Math.max(0, Math.min(maxHp, Number(action.params.health ?? 100)));
+        const hp = Math.max(0, Math.min(maxHp, this.paramNumber('', action.params.health, 100)));
         useStudioStore.getState().setPlayState({ characterHealth: hp });
         useStudioStore.getState().addConsoleMessage('info', `[WeildCode] Player health set to ${hp}`);
         break;
@@ -600,7 +660,8 @@ class WeildCodeEngine {
         break;
       }
       case 'repeat': {
-        const count = Math.max(1, Math.min(50, Number(action.params.count) || 3));
+        // v1.7: capped (a repeat count of 1e9 used to freeze the tab).
+        const count = this.clampRepeatCount(this.paramNumber('', action.params.count, 3));
         if (action.children && action.children.length > 0) {
           for (let i = 0; i < count; i++) {
             this.executeGameActions(action.children, ruleId, depth + 1);
@@ -609,12 +670,24 @@ class WeildCodeEngine {
         break;
       }
       case 'repeat_every': {
-        const intervalSeconds = Math.max(0.1, Number(action.params.intervalSeconds) || 2);
-        const maxRepeats = Number(action.params.maxRepeats) || 0;
+        const intervalSeconds = Math.max(WeildCodeEngine.MIN_INTERVAL, this.paramNumber('', action.params.intervalSeconds, 2));
+        const maxRepeats = Math.floor(Math.max(0, this.paramNumber('', action.params.maxRepeats, 0)));
+        const timerKey = `repeat_game_${action.id}`;
+        // v1.7 PERF FIX: re-triggering an ALREADY RUNNING repeat_every
+        // (e.g. its parent rule fires again from a touch) used to execute
+        // the children immediately AND reset the timer, so a 60 Hz touch
+        // turned "every 2 seconds" into "every frame". A running timer
+        // now just refreshes its settings; children keep their cadence.
+        if (this.timers.has(timerKey)) {
+          const t = this.timers.get(timerKey)!;
+          t.intervalSeconds = intervalSeconds;
+          t.maxRepeats = maxRepeats;
+          break;
+        }
         if (action.children && action.children.length > 0) {
           this.executeGameActions(action.children, ruleId, depth + 1);
         }
-        this.timers.set(`repeat_game_${action.id}`, {
+        this.timers.set(timerKey, {
           ruleId,
           partId: '',
           intervalSeconds,
@@ -627,7 +700,7 @@ class WeildCodeEngine {
         break;
       }
       case 'tell_object': {
-        const targetName = action.params.targetName || '';
+        const targetName = this.paramString('', action.params.targetName, '');
         if (!targetName) break;
         const state = useStudioStore.getState();
         let targetPart: StudioPart | null = null;
@@ -668,7 +741,8 @@ class WeildCodeEngine {
 
       // Handle wait - pause execution and resume later
       if (action.type === 'wait') {
-        const seconds = action.params.seconds || 1;
+        // v1.7: clamped so a 0-second wait can't wake 60 times a second.
+        const seconds = Math.max(WeildCodeEngine.MIN_INTERVAL, this.paramNumber(partId, action.params.seconds, 1));
         const waitKey = `${partId}_${ruleId}_${i}`;
         this.pendingWaits.set(waitKey, {
           ruleId,
@@ -684,6 +758,9 @@ class WeildCodeEngine {
   }
 
   private executeAction(partId: string, action: WeildCodeAction, ruleId: string, depth: number) {
+    // v1.7: per-frame action budget (see executeGameAction).
+    if (!this.spendActionBudget()) return;
+
     const state = useStudioStore.getState();
     const part = state.objects.get(partId);
     if (!part || !isPart(part)) return;
@@ -718,12 +795,12 @@ class WeildCodeEngine {
         break;
       }
       case 'change_transparency': {
-        useStudioStore.getState().updateObject(partId, { transparency: action.params.transparency ?? 0.5 });
+        useStudioStore.getState().updateObject(partId, { transparency: this.clamp01(this.paramNumber(partId, action.params.transparency, 0.5)) });
         break;
       }
       case 'apply_force': {
         // Apply force via BodyMover (BodyForce)
-        const force = action.params.force || { x: 0, y: 50, z: 0 };
+        const force = this.paramVec3(partId, action.params.force, { x: 0, y: 50, z: 0 });
         useStudioStore.getState().addBodyMover(partId, {
           id: `bm_wc_${Date.now()}`,
           type: 'BodyForce',
@@ -733,8 +810,8 @@ class WeildCodeEngine {
         break;
       }
       case 'apply_explosion': {
-        const radius = action.params.radius || 8;
-        const pressure = action.params.pressure || 500000;
+        const radius = Math.max(0, this.paramNumber(partId, action.params.radius, 8));
+        const pressure = this.paramNumber(partId, action.params.pressure, 500000);
         useStudioStore.getState().createExplosion(
           { ...part.position },
           radius,
@@ -749,7 +826,7 @@ class WeildCodeEngine {
         // (click/pop/whoosh/chime/alert) are synthesized with distinct
         // waveforms + envelopes. Volume comes from the rule's volume param.
         const sound = action.params.sound || 'click';
-        const volume = Math.max(0, Math.min(1, (action.params.volume as number) ?? 0.6));
+        const volume = Math.max(0, Math.min(1, this.paramNumber(partId, action.params.volume, 0.6)));
         if (sound === 'boom') {
           playSound('explosion', volume);
         } else {
@@ -775,8 +852,8 @@ class WeildCodeEngine {
       }
       case 'explode': {
         // Same as apply_explosion - just a better name
-        const radius = action.params.radius || 8;
-        const pressure = action.params.pressure || 500000;
+        const radius = Math.max(0, this.paramNumber(partId, action.params.radius, 8));
+        const pressure = this.paramNumber(partId, action.params.pressure, 500000);
         useStudioStore.getState().createExplosion(
           { ...part.position },
           radius,
@@ -786,7 +863,10 @@ class WeildCodeEngine {
       }
       case 'go_on_fire': {
         const color = action.params.color || '#ff6600';
-        const size = action.params.size || 3;
+        const size = Math.max(0.1, this.paramNumber(partId, action.params.size, 3));
+        // v1.7 PERF: cap the effects per part (a touched rule firing
+        // repeatedly used to stack unbounded Fire instances).
+        if (!this.canAddEffect(partId)) break;
         useStudioStore.getState().addEffect(partId, {
           id: `fx_fire_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
           type: 'Fire',
@@ -798,8 +878,9 @@ class WeildCodeEngine {
       }
       case 'light_up': {
         const color = action.params.color || '#ffeb3b';
-        const brightness = action.params.brightness ?? 2;
-        const range = action.params.range ?? 10;
+        const brightness = Math.max(0, this.paramNumber(partId, action.params.brightness, 2));
+        const range = Math.max(0, this.paramNumber(partId, action.params.range, 10));
+        if (!this.canAddEffect(partId)) break;
         useStudioStore.getState().addEffect(partId, {
           id: `fx_light_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
           type: 'Light',
@@ -813,8 +894,9 @@ class WeildCodeEngine {
       }
       case 'release_smoke': {
         const color = action.params.color || '#666666';
-        const size = action.params.size || 3;
-        const opacity = action.params.opacity ?? 0.5;
+        const size = Math.max(0.1, this.paramNumber(partId, action.params.size, 3));
+        const opacity = this.clamp01(this.paramNumber(partId, action.params.opacity, 0.5));
+        if (!this.canAddEffect(partId)) break;
         useStudioStore.getState().addEffect(partId, {
           id: `fx_smoke_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
           type: 'Smoke',
@@ -826,15 +908,15 @@ class WeildCodeEngine {
         break;
       }
       case 'extinguish': {
-        this.startEffectFade(partId, 'Fire', action.params.fadeDuration ?? 1);
+        this.startEffectFade(partId, 'Fire', this.paramNumber(partId, action.params.fadeDuration, 1));
         break;
       }
       case 'disable_light': {
-        this.startEffectFade(partId, 'Light', action.params.fadeDuration ?? 1);
+        this.startEffectFade(partId, 'Light', this.paramNumber(partId, action.params.fadeDuration, 1));
         break;
       }
       case 'clear_smoke': {
-        this.startEffectFade(partId, 'Smoke', action.params.fadeDuration ?? 1);
+        this.startEffectFade(partId, 'Smoke', this.paramNumber(partId, action.params.fadeDuration, 1));
         break;
       }
       case 'teleport_player_to_part': {
@@ -861,29 +943,30 @@ class WeildCodeEngine {
         break;
       }
       case 'repeat': {
-        const count = action.params.count || 3;
-        const delayBetween = action.params.delayBetween || 0;
+        // v1.7: capped (this path previously had NO cap at all).
+        const count = this.clampRepeatCount(this.paramNumber(partId, action.params.count, 3));
         if (action.children && action.children.length > 0) {
           for (let i = 0; i < count; i++) {
-            if (delayBetween > 0 && i > 0) {
-              // Simple delay approximation (not async - immediate for now)
-              // In a full implementation, we'd schedule these
-            }
             this.executeActions(partId, action.children, ruleId, depth + 1);
           }
         }
         break;
       }
       case 'repeat_every': {
-        const intervalSeconds = action.params.intervalSeconds || 2;
-        const maxRepeats = action.params.maxRepeats || 0;
-        // Set up a timer-like recurring execution
-        // For simplicity, we execute immediately and set up a timer for repeats
+        const intervalSeconds = Math.max(WeildCodeEngine.MIN_INTERVAL, this.paramNumber(partId, action.params.intervalSeconds, 2));
+        const maxRepeats = Math.floor(Math.max(0, this.paramNumber(partId, action.params.maxRepeats, 0)));
+        const timerKey = `repeat_${partId}_${action.id}`;
+        // v1.7 PERF FIX: an already-running timer is refreshed, not
+        // re-fired (see executeGameAction for the rationale).
+        if (this.timers.has(timerKey)) {
+          const t = this.timers.get(timerKey)!;
+          t.intervalSeconds = intervalSeconds;
+          t.maxRepeats = maxRepeats;
+          break;
+        }
         if (action.children && action.children.length > 0) {
           this.executeActions(partId, action.children, ruleId, depth + 1);
         }
-        // Set up recurring timer
-        const timerKey = `repeat_${partId}_${action.id}`;
         this.timers.set(timerKey, {
           ruleId,
           partId,
@@ -897,7 +980,7 @@ class WeildCodeEngine {
         break;
       }
       case 'tell_object': {
-        const targetName = action.params.targetName || '';
+        const targetName = this.paramString(partId, action.params.targetName, '');
         if (!targetName) break;
 
         // Find the target object by name
@@ -917,13 +1000,13 @@ class WeildCodeEngine {
         break;
       }
       case 'print_message': {
-        const message = action.params.message || 'Hello, world!';
+        const message = this.paramString(partId, action.params.message, 'Hello, world!');
         const position = action.params.position || 'bottom';
         const textColor = action.params.textColor || '#ffffff';
         const fontStyle = action.params.fontStyle || 'normal';
-        const fontSize = action.params.fontSize || 24;
+        const fontSize = this.paramNumber(partId, action.params.fontSize, 24);
         const backgroundColor = action.params.backgroundColor || '#000000';
-        const duration = action.params.duration ?? 3;
+        const duration = this.paramNumber(partId, action.params.duration, 3);
         useStudioStore.getState().addScreenMessage({
           message,
           position: position as 'top' | 'bottom',
@@ -942,11 +1025,11 @@ class WeildCodeEngine {
         break;
       }
       case 'show_name': {
-        const rawText = action.params.text || 'Hello';
+        const rawText = this.paramString(partId, action.params.text, 'Hello');
         const text = rawText.substring(0, 12); // max 12 chars
         const color = action.params.color || '#ffffff';
-        const fontSize = action.params.fontSize || 16;
-        const duration = action.params.duration ?? 5;
+        const fontSize = this.paramNumber(partId, action.params.fontSize, 16);
+        const duration = this.paramNumber(partId, action.params.duration, 5);
         this.nameLabels.set(partId, {
           text,
           color,
@@ -969,7 +1052,8 @@ class WeildCodeEngine {
         const varName = action.params.variableName || '';
         if (!varName) break;
         // v1.6: numbers, plain text, variable-name references, and block-built
-        // math expressions are all valid values now.
+        // math expressions are all valid values now. v1.7: tagged block
+        // values ({__wb_var} / {__wb_expr}) resolve through the same path.
         const value = this.resolveVariableValue(partId, action.params.value ?? '0');
         const scope = action.params.scope || 'global';
         if (scope === 'object') {
@@ -1062,6 +1146,15 @@ class WeildCodeEngine {
       // ─── v1.5: body movers as actions ───
       case 'add_body_mover': {
         const moverType = action.params.moverType || 'BodyForce';
+        // v1.7 PERF: cap the movers per part. A touched rule that adds a
+        // mover used to append one mover PER FIRE (unbounded array growth
+        // + ever-heavier physics). Extra adds are dropped with a hint.
+        const existingMovers = part.bodyMovers || [];
+        if (existingMovers.length >= WeildCodeEngine.MAX_BODY_MOVERS) {
+          useStudioStore.getState().addConsoleMessage('warn', `[WeildCode] "${part.name}" already has ${existingMovers.length} body movers (max ${WeildCodeEngine.MAX_BODY_MOVERS}). Remove some first.`);
+          break;
+        }
+        const vec = this.paramVec3(partId, { x: action.params.x, y: action.params.y, z: action.params.z }, { x: 0, y: 0, z: 0 });
         const common = {
           id: `mover_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
           type: moverType,
@@ -1070,26 +1163,25 @@ class WeildCodeEngine {
         let mover: any;
         switch (moverType) {
           case 'BodyVelocity':
-            mover = { ...common, velocity: { x: action.params.x || 0, y: action.params.y || 0, z: action.params.z || 0 }, maxForce: { x: 10000, y: 10000, z: 10000 } };
+            mover = { ...common, velocity: { x: vec.x, y: vec.y, z: vec.z }, maxForce: { x: 10000, y: 10000, z: 10000 } };
             break;
           case 'BodyGyro':
-            mover = { ...common, cframe: { x: action.params.x || 0, y: action.params.y || 0, z: action.params.z || 0 }, maxTorque: { x: 10000, y: 10000, z: 10000 } };
+            mover = { ...common, cframe: { x: vec.x, y: vec.y, z: vec.z }, maxTorque: { x: 10000, y: 10000, z: 10000 } };
             break;
           case 'BodyPosition':
-            mover = { ...common, position: { x: action.params.x || 0, y: action.params.y || 0, z: action.params.z || 0 }, maxForce: { x: 10000, y: 10000, z: 10000 } };
+            mover = { ...common, position: { x: vec.x, y: vec.y, z: vec.z }, maxForce: { x: 10000, y: 10000, z: 10000 } };
             break;
           case 'BodyThrust':
-            mover = { ...common, force: { x: action.params.x || 0, y: action.params.y || 0, z: action.params.z || 0 }, location: { x: 0, y: 0, z: 0 } };
+            mover = { ...common, force: { x: vec.x, y: vec.y, z: vec.z }, location: { x: 0, y: 0, z: 0 } };
             break;
           case 'BodyAngularVelocity':
-            mover = { ...common, angularVelocity: { x: action.params.x || 0, y: action.params.y || 0, z: action.params.z || 0 }, maxTorque: { x: 10000, y: 10000, z: 10000 } };
+            mover = { ...common, angularVelocity: { x: vec.x, y: vec.y, z: vec.z }, maxTorque: { x: 10000, y: 10000, z: 10000 } };
             break;
           default: // BodyForce
-            mover = { ...common, type: 'BodyForce', force: { x: action.params.x || 0, y: action.params.y || 0, z: action.params.z || 0 } };
+            mover = { ...common, type: 'BodyForce', force: { x: vec.x, y: vec.y, z: vec.z } };
             break;
         }
-        const existing = part.bodyMovers || [];
-        useStudioStore.getState().updateObject(partId, { bodyMovers: [...existing, mover] } as any);
+        useStudioStore.getState().updateObject(partId, { bodyMovers: [...existingMovers, mover] } as any);
         useStudioStore.getState().addConsoleMessage('info', `[WeildCode] Added ${moverType} to "${part.name}"`);
         break;
       }
@@ -1101,7 +1193,7 @@ class WeildCodeEngine {
       }
       case 'set_health': {
         const maxHp = useStudioStore.getState().playState.characterMaxHealth;
-        const hp = Math.max(0, Math.min(maxHp, Number(action.params.health ?? 100)));
+        const hp = Math.max(0, Math.min(maxHp, this.paramNumber(partId, action.params.health, 100)));
         useStudioStore.getState().setPlayState({ characterHealth: hp });
         useStudioStore.getState().addConsoleMessage('info', `[WeildCode] Player health set to ${hp}`);
         break;
@@ -1114,8 +1206,8 @@ class WeildCodeEngine {
   private executeCreatePart(sourcePartId: string, action: WeildCodeAction) {
     const state = useStudioStore.getState();
     const partType = (action.params.partType || 'Block') as PartType;
-    const partName = action.params.partName || 'NewPart';
-    const position = action.params.position || { x: 0, y: 1, z: 0 };
+    const partName = this.paramString(sourcePartId, action.params.partName, 'NewPart');
+    const position = this.paramVec3(sourcePartId, action.params.position, { x: 0, y: 1, z: 0 });
     const color = action.params.color || '#4ff7f5';
 
     // If source part exists, offset relative to it
@@ -1186,7 +1278,7 @@ class WeildCodeEngine {
 
   private executeMove(partId: string, action: WeildCodeAction) {
     const mode = action.params.mode || 'offset';
-    const position = action.params.position || { x: 0, y: 1, z: 0 };
+    const position = this.paramVec3(partId, action.params.position, { x: 0, y: 1, z: 0 });
 
     const state = useStudioStore.getState();
     const part = state.objects.get(partId);
@@ -1207,7 +1299,7 @@ class WeildCodeEngine {
   }
 
   private executeRotate(partId: string, action: WeildCodeAction) {
-    const rotation = action.params.rotation || { x: 0, y: 90, z: 0 };
+    const rotation = this.paramVec3(partId, action.params.rotation, { x: 0, y: 90, z: 0 });
 
     const state = useStudioStore.getState();
     const part = state.objects.get(partId);
@@ -1224,7 +1316,7 @@ class WeildCodeEngine {
 
   private executeResize(partId: string, action: WeildCodeAction) {
     const mode = action.params.mode || 'offset';
-    const size = action.params.size || { x: 1, y: 1, z: 1 };
+    const size = this.paramVec3(partId, action.params.size, { x: 1, y: 1, z: 1 });
 
     const state = useStudioStore.getState();
     const part = state.objects.get(partId);
@@ -1281,9 +1373,9 @@ class WeildCodeEngine {
   // Find the named part, compute a position on the chosen face, and set
   // playState.teleportPosition. PlayCharacter picks this up on the next frame.
   private executeTeleportPlayerToPart(sourcePartId: string, action: WeildCodeAction) {
-    const targetName = action.params.targetName || '';
+    const targetName = this.paramString(sourcePartId, action.params.targetName, '');
     const face = action.params.face || 'top';
-    const offset = action.params.offset || { x: 0, y: 0, z: 0 };
+    const offset = this.paramVec3(sourcePartId, action.params.offset, { x: 0, y: 0, z: 0 });
 
     if (!targetName) {
       useStudioStore.getState().addConsoleMessage('warn', `[WeildCode] teleport_player_to_part: no target name specified`);
@@ -1358,10 +1450,10 @@ class WeildCodeEngine {
   // Teleport the player to an xyz position. Each axis has a "relative" flag -
   // when true, the value is ADDED to the current position; when false, it REPLACES it.
   private executeTeleportPlayer(action: WeildCodeAction) {
-    const pos = action.params.position || { x: 0, y: 5, z: 0 };
-    const relativeX = !!(pos.relativeX);
-    const relativeY = !!(pos.relativeY);
-    const relativeZ = !!(pos.relativeZ);
+    const pos = this.paramVec3('', action.params.position, { x: 0, y: 5, z: 0 });
+    const relativeX = !!(action.params.position?.relativeX);
+    const relativeY = !!(action.params.position?.relativeY);
+    const relativeZ = !!(action.params.position?.relativeZ);
 
     const currentPos = useStudioStore.getState().playState.characterPosition;
     const newPos = {
@@ -1378,7 +1470,7 @@ class WeildCodeEngine {
   // Modify the player's health. When "relative" is true, the value is added to
   // the current health; when false, it replaces it. Clamped to [0, maxHealth].
   private executeModifyPlayerHealth(action: WeildCodeAction) {
-    const healthDelta = action.params.health ?? 0;
+    const healthDelta = this.paramNumber('', action.params.health, 0);
     const relative = action.params.relative !== false; // default true
 
     const state = useStudioStore.getState();
@@ -1412,10 +1504,10 @@ class WeildCodeEngine {
   private executeCreateCopy(sourcePartId: string, action: WeildCodeAction) {
     const state = useStudioStore.getState();
     const target = action.params.target || 'self';
-    const targetName = action.params.targetName || '';
-    const copyName = action.params.copyName || '';
-    const count = Math.min(action.params.count || 1, 20); // cap at 20 copies
-    const offset = action.params.offset || { x: 2, y: 0, z: 0 };
+    const targetName = this.paramString(sourcePartId, action.params.targetName, '');
+    const copyName = this.paramString(sourcePartId, action.params.copyName, '');
+    const count = Math.floor(Math.min(Math.max(1, this.paramNumber(sourcePartId, action.params.count, 1)), 20)); // cap at 20 copies
+    const offset = this.paramVec3(sourcePartId, action.params.offset, { x: 2, y: 0, z: 0 });
 
     // Find the source part
     let sourcePart: StudioPart | null = null;
@@ -1605,8 +1697,21 @@ class WeildCodeEngine {
    *   "score"     -> the variable score's value (name reference)
    *   "score + 1" -> evaluated result          (math expression)
    *   "hello"     -> "hello"                   (plain text)
+   * v1.7 tagged block values:
+   *   {__wb_var: "score"}    -> the variable's value
+   *   {__wb_expr: "a + b"}   -> evaluated result (0 when it can't be)
    */
   private resolveVariableValue(partId: string, rawValue: unknown): number | string {
+    // v1.7: tagged block values first (no ambiguity with plain strings).
+    if (rawValue !== null && typeof rawValue === 'object' && !Array.isArray(rawValue)) {
+      const v = rawValue as { __wb_var?: unknown; __wb_expr?: unknown };
+      if (typeof v.__wb_var === 'string') return this.lookupVariableValue(partId, v.__wb_var);
+      if (typeof v.__wb_expr === 'string') {
+        const evaluated = this.evalExpression(partId, v.__wb_expr);
+        return evaluated ?? 0;
+      }
+      return String(rawValue);
+    }
     const trimmed = String(rawValue ?? '').trim();
     if (trimmed === '') return 0;
     const numVal = Number(trimmed);
@@ -1631,10 +1736,139 @@ class WeildCodeEngine {
     return String(rawValue);
   }
 
+  // ─── v1.7: block-value param resolution (every rule param) ───
+  // Number and text params compiled from the Code editor can be:
+  //   • a plain literal (number | string)               -> used as-is
+  //   • { __wb_var: "score" }  a variable reference     -> looked up
+  //   • { __wb_expr: "a + b" } a math expression        -> evaluated
+  // Vector3 params resolve axis by axis. Anything that fails to resolve
+  // degrades to the provided fallback instead of throwing.
+
+  /** Look a variable up: object variables on the acting part first, then
+   * globals. Unknown variables read as 0. */
+  private lookupVariableValue(partId: string, name: string): number | string {
+    const state = useStudioStore.getState();
+    if (partId) {
+      const part = state.objects.get(partId);
+      if (part && isPart(part)) {
+        const v = part.objectVariables?.[name];
+        if (v !== undefined) return v as number | string;
+      }
+    }
+    const g = state.globalVariables[name];
+    if (g !== undefined) return g as number | string;
+    return 0;
+  }
+
+  /** Resolve one raw param value (literal / var ref / expression). */
+  private resolveParamValue(partId: string, raw: unknown): number | string {
+    if (raw !== null && typeof raw === 'object' && !Array.isArray(raw)) {
+      const v = raw as { __wb_var?: unknown; __wb_expr?: unknown };
+      if (typeof v.__wb_var === 'string') return this.lookupVariableValue(partId, v.__wb_var);
+      if (typeof v.__wb_expr === 'string') {
+        const evaluated = this.evalExpression(partId, v.__wb_expr);
+        return evaluated ?? 0;
+      }
+    }
+    return raw as number | string;
+  }
+
+  /** Resolve a NUMBER param with a safe fallback. */
+  private paramNumber(partId: string, raw: unknown, fallback: number): number {
+    if (raw === undefined || raw === null || raw === '') return fallback;
+    if (typeof raw === 'number') return isFinite(raw) ? raw : fallback;
+    const v = this.resolveParamValue(partId, raw);
+    const n = Number(v);
+    return isFinite(n) ? n : fallback;
+  }
+
+  /** Resolve a TEXT param with a safe fallback. */
+  private paramString(partId: string, raw: unknown, fallback: string): string {
+    if (raw === undefined || raw === null) return fallback;
+    if (typeof raw === 'string') return raw;
+    if (typeof raw === 'number') return String(raw);
+    const v = this.resolveParamValue(partId, raw);
+    return v === undefined || v === null ? fallback : String(v);
+  }
+
+  /** Resolve a VECTOR3-ish param ({x,y,z} with any axis being a literal,
+   * variable reference or expression). */
+  private paramVec3(partId: string, raw: unknown, fallback: { x: number; y: number; z: number }): { x: number; y: number; z: number } {
+    if (raw === null || raw === undefined || typeof raw !== 'object' || Array.isArray(raw)) return { ...fallback };
+    const o = raw as Record<string, unknown>;
+    return {
+      x: this.paramNumber(partId, o.x, fallback.x),
+      y: this.paramNumber(partId, o.y, fallback.y),
+      z: this.paramNumber(partId, o.z, fallback.z),
+    };
+  }
+
+  private clamp01(n: number): number {
+    return Math.max(0, Math.min(1, n));
+  }
+
+  /** v1.7: clamp a repeat count (1..MAX_REPEAT_COUNT). */
+  private clampRepeatCount(raw: number): number {
+    if (!isFinite(raw) || raw < 1) return 1;
+    return Math.min(Math.floor(raw), WeildCodeEngine.MAX_REPEAT_COUNT);
+  }
+
+  /** v1.7: spend one unit of the per-frame action budget. False = the
+   * frame is over budget and this action must be skipped. */
+  private spendActionBudget(): boolean {
+    this.frameActionCount++;
+    if (this.frameActionCount <= WeildCodeEngine.MAX_ACTIONS_PER_FRAME) return true;
+    const now = performance.now();
+    if (now - this.lastBudgetWarnAt > 1000) {
+      this.lastBudgetWarnAt = now;
+      useStudioStore.getState().addConsoleMessage(
+        'warn',
+        `[WeildCode] Rule budget reached for this frame (${WeildCodeEngine.MAX_ACTIONS_PER_FRAME} actions). Some actions were skipped. Use longer intervals or smaller repeats.`,
+      );
+    }
+    return false;
+  }
+
+  /** v1.7: may this part take another effect? (capped per part) */
+  private canAddEffect(partId: string): boolean {
+    const part = useStudioStore.getState().objects.get(partId);
+    if (!part || !isPart(part)) return false;
+    if ((part.effects || []).length >= WeildCodeEngine.MAX_EFFECTS) {
+      useStudioStore.getState().addConsoleMessage('warn', `[WeildCode] "${part.name}" already has ${WeildCodeEngine.MAX_EFFECTS} effects. Remove some first.`);
+      return false;
+    }
+    return true;
+  }
+
+  // ─── Variable Trigger Polling ───
+
+  /** v1.7: parts that actually carry polled rules (rebuilt when the world
+   * changes). Big worlds without such rules skip the whole scan. */
+  private getPolledParts(state: ReturnType<typeof useStudioStore.getState>): { part: StudioPart; rules: WeildCodeRule[] }[] {
+    if (this.polledPartsVersion === state.objectsVersion) return this.polledPartsCache;
+    const cached: { part: StudioPart; rules: WeildCodeRule[] }[] = [];
+    state.objects.forEach((obj) => {
+      if (!isPart(obj)) return;
+      const rules = (obj.rules || []).filter((r) =>
+        r.enabled && (
+          r.trigger.type === 'when_variable_equals' ||
+          r.trigger.type === 'when_variable_changes' ||
+          r.trigger.type === 'when_condition' ||
+          r.trigger.type === 'when_coinflip'
+        ));
+      if (rules.length > 0) cached.push({ part: obj, rules });
+    });
+    this.polledPartsCache = cached;
+    this.polledPartsVersion = state.objectsVersion;
+    return cached;
+  }
+
   // ─── Variable Trigger Polling ───
 
   private updateVariableTriggers(dt: number, state: ReturnType<typeof useStudioStore.getState>) {
     const currentVars = state.globalVariables;
+    const polled = this.getPolledParts(state);
+    if (polled.length === 0) return;
 
     // ── Global variable change detection (existing) ──
     const changedVars = new Set<string>();
@@ -1653,13 +1887,12 @@ class WeildCodeEngine {
       }
     }
 
-    // ── Per-object variable change detection (new) ──
+    // ── Per-object variable change detection (polled parts only) ──
     // Build a map: partId -> set of changed var names
     const changedObjectVars = new Map<string, Set<string>>();
-    state.objects.forEach((obj) => {
-      if (!isPart(obj)) return;
-      const current = obj.objectVariables || {};
-      const prev = this.objectVariableSnapshots.get(obj.id) || new Map<string, number | string>();
+    for (const { part } of polled) {
+      const current = part.objectVariables || {};
+      const prev = this.objectVariableSnapshots.get(part.id) || new Map<string, number | string>();
       const changed = new Set<string>();
       // Detect value changes and new vars
       for (const [name, value] of Object.entries(current)) {
@@ -1674,92 +1907,83 @@ class WeildCodeEngine {
         }
       }
       if (changed.size > 0) {
-        changedObjectVars.set(obj.id, changed);
+        changedObjectVars.set(part.id, changed);
         // Update snapshot to current
         const snap = new Map<string, number | string>();
         for (const [name, value] of Object.entries(current)) {
           snap.set(name, value);
         }
-        this.objectVariableSnapshots.set(obj.id, snap);
+        this.objectVariableSnapshots.set(part.id, snap);
       }
-    });
+    }
 
     // ── Fire when_variable_changes ──
     // Global scope
     if (changedVars.size > 0) {
-      state.objects.forEach((obj) => {
-        if (!isPart(obj)) return;
-        const rules = obj.rules || [];
+      for (const { part, rules } of polled) {
         for (const rule of rules) {
-          if (!rule.enabled || rule.trigger.type !== 'when_variable_changes') continue;
+          if (rule.trigger.type !== 'when_variable_changes') continue;
           const scope = rule.trigger.params.scope || 'global';
           if (scope !== 'global') continue; // handled below
           const varName = rule.trigger.params.variableName || '';
           if (changedVars.has(varName)) {
-            this.executeActions(obj.id, rule.actions, rule.id);
+            this.executeActions(part.id, rule.actions, rule.id);
           }
         }
-      });
+      }
     }
     // Object scope - only fire on the part that owns the variable
     if (changedObjectVars.size > 0) {
       changedObjectVars.forEach((changedSet, partId) => {
-        const obj = state.objects.get(partId);
-        if (!obj || !isPart(obj)) return;
-        const rules = obj.rules || [];
-        for (const rule of rules) {
-          if (!rule.enabled || rule.trigger.type !== 'when_variable_changes') continue;
+        const entry = polled.find((p) => p.part.id === partId);
+        if (!entry) return;
+        for (const rule of entry.rules) {
+          if (rule.trigger.type !== 'when_variable_changes') continue;
           const scope = rule.trigger.params.scope || 'global';
           if (scope !== 'object') continue;
           const varName = rule.trigger.params.variableName || '';
           if (changedSet.has(varName)) {
-            this.executeActions(obj.id, rule.actions, rule.id);
+            this.executeActions(partId, rule.actions, rule.id);
           }
         }
       });
     }
 
     // ── Poll when_variable_equals ──
-    state.objects.forEach((obj) => {
-      if (!isPart(obj)) return;
-      const rules = obj.rules || [];
+    for (const { part, rules } of polled) {
       for (const rule of rules) {
-        if (!rule.enabled || rule.trigger.type !== 'when_variable_equals') continue;
+        if (rule.trigger.type !== 'when_variable_equals') continue;
         const varName = rule.trigger.params.variableName || '';
-        const targetValue = rule.trigger.params.value ?? '';
-        const checkInterval = rule.trigger.params.checkInterval ?? 0.5;
+        const targetValue = this.paramString(part.id, rule.trigger.params.value, '');
+        const checkInterval = Math.max(WeildCodeEngine.MIN_INTERVAL, this.paramNumber(part.id, rule.trigger.params.checkInterval, 0.5));
         const scope = rule.trigger.params.scope || 'global';
 
-        const key = `${obj.id}_${rule.id}`;
+        const key = `${part.id}_${rule.id}`;
         let acc = this.variableCheckAccumulators.get(key) || 0;
         acc += dt;
         if (acc >= checkInterval) {
           acc = 0;
           const currentValue = scope === 'object'
-            ? obj.objectVariables?.[varName]
+            ? part.objectVariables?.[varName]
             : currentVars[varName];
-          if (currentValue !== undefined && String(currentValue) === String(targetValue)) {
-            this.executeActions(obj.id, rule.actions, rule.id);
+          if (currentValue !== undefined && String(currentValue) === targetValue) {
+            this.executeActions(part.id, rule.actions, rule.id);
           }
         }
         this.variableCheckAccumulators.set(key, acc);
       }
-    });
+    }
   }
 
   // ─── Condition Trigger Polling ───
 
   private updateConditionTriggers(dt: number, state: ReturnType<typeof useStudioStore.getState>) {
-    state.objects.forEach((obj) => {
-      if (!isPart(obj)) return;
-      const rules = obj.rules || [];
+    for (const { part, rules } of this.getPolledParts(state)) {
       for (const rule of rules) {
-        if (!rule.enabled) continue;
-
         // when_coinflip
         if (rule.trigger.type === 'when_coinflip') {
-          const key = `${obj.id}_${rule.id}`;
-          const chancePercent = rule.trigger.params.chancePercent ?? 50;
+          const key = `${part.id}_${rule.id}`;
+          const chancePercent = Math.max(0, Math.min(100, this.paramNumber(part.id, rule.trigger.params.chancePercent, 50)));
           const repeat = rule.trigger.params.repeat || 'every';
 
           if (repeat === 'once' && this.coinFlipFired.has(key)) continue;
@@ -1770,7 +1994,7 @@ class WeildCodeEngine {
             acc = 0;
             const roll = Math.random() * 100;
             if (roll < chancePercent) {
-              this.executeActions(obj.id, rule.actions, rule.id);
+              this.executeActions(part.id, rule.actions, rule.id);
               if (repeat === 'once') {
                 this.coinFlipFired.add(key);
               }
@@ -1781,23 +2005,23 @@ class WeildCodeEngine {
 
         // when_condition
         if (rule.trigger.type === 'when_condition') {
-          const key = `${obj.id}_${rule.id}`;
+          const key = `${part.id}_${rule.id}`;
           const condition = rule.trigger.params.condition || 'anchored';
-          const checkInterval = rule.trigger.params.checkInterval ?? 0.5;
+          const checkInterval = Math.max(WeildCodeEngine.MIN_INTERVAL, this.paramNumber(part.id, rule.trigger.params.checkInterval, 0.5));
 
           let acc = this.conditionCheckAccumulators.get(key) || 0;
           acc += dt;
           if (acc >= checkInterval) {
             acc = 0;
-            const part = state.objects.get(obj.id);
-            if (part && isPart(part) && this.evaluateCondition(part, condition, rule.trigger.params, state)) {
-              this.executeActions(obj.id, rule.actions, rule.id);
+            const fresh = state.objects.get(part.id);
+            if (fresh && isPart(fresh) && this.evaluateCondition(fresh, condition, rule.trigger.params, state)) {
+              this.executeActions(part.id, rule.actions, rule.id);
             }
           }
           this.conditionCheckAccumulators.set(key, acc);
         }
       }
-    });
+    }
   }
 
   private evaluateCondition(part: StudioPart, condition: string, params: Record<string, any>, state: ReturnType<typeof useStudioStore.getState>): boolean {
@@ -1865,6 +2089,14 @@ class WeildCodeEngine {
   }
 
   handleTouch(partId: string, touchType: 'player' | 'parts' | 'any' = 'any') {
+    // v1.7 PERF: standing on a part fires the physics contact EVERY frame
+    // (~60 Hz). A 100 ms debounce per part + touch type keeps touch rules
+    // responsive (10 fires/sec max) while killing the rule storm.
+    const key = `${partId}::${touchType}`;
+    const now = performance.now();
+    const last = this.touchFiredAt.get(key) ?? -Infinity;
+    if (now - last < WeildCodeEngine.TOUCH_DEBOUNCE_MS) return;
+    this.touchFiredAt.set(key, now);
     this.fireTrigger(partId, 'when_touched', { touchType });
   }
 

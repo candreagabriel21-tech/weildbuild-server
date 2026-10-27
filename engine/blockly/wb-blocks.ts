@@ -1,5 +1,5 @@
 // ═══════════════════════════════════════════════════════════════════
-// WeildBuild — Blockly block definitions for the Code editor (v1.6)
+// WeildBuild — Blockly block definitions for the Code editor (v1.7)
 // ═══════════════════════════════════════════════════════════════════
 // Real Google Blockly (npm: blockly). Every trigger and action in the
 // WeildCode catalog becomes a Blockly block, GENERATED from
@@ -10,12 +10,16 @@
 //     "enabled" checkbox. Right click offers "Save as custom rule".
 //   • wb_action_<type>   statement blocks: params as fields, nested
 //     children (repeat / tell_object) as a DO statement input.
+//   • v1.7: NUMBER and TEXT parameters are VALUE INPUTS with shadow
+//     literal blocks: type a number/text directly (the shadow), or drag
+//     a math / variable / text block into the socket. Variable-NAME
+//     parameters render as a variable dropdown field.
 //   • wb_var_get / wb_var_set / wb_var_change  variables live HERE now
 //     (globals + object variables are created and used with blocks).
 //   • wb_math_*  math expression blocks; they compile to the engine's
 //     expression strings (variable names resolve at runtime).
-//   • wb_advanced_note  placeholder for rules written in advanced text
-//     mode (kept untouched, edited in the Logic panel).
+//   • wb_advanced_note  placeholder for rules written in the retired
+//     advanced text mode (kept untouched; delete the block to remove).
 //
 // This module registers blocks INTO Blockly when defineWbBlocks() runs
 // (called by the client-only CodeEditor component after it dynamically
@@ -65,6 +69,15 @@ export function noDash(s: string): string {
 /** Escape a literal % for Blockly message interpolation. */
 function msgEscape(s: string): string {
   return s.replace(/%/g, '%%');
+}
+
+/** Escape text for XML attributes/contents (shadow defaults). */
+function xmlEscape(s: string): string {
+  return String(s ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
 }
 
 // ─── Block type helpers ───
@@ -145,8 +158,10 @@ function paramFragments(param: TriggerParam | ActionParam): ArgFragment[] {
       });
       break;
     case 'number':
+      // v1.7: value input + shadow number (type a literal, or plug in
+      // math / variable blocks).
       out.push({
-        arg: { type: 'field_number', name: `p_${param.key}`, value: Number(param.default ?? 0) },
+        arg: { type: 'input_value', name: `p_${param.key}`, check: 'wb_expr' },
         message: `${msgEscape(label)} %N`,
       });
       break;
@@ -164,17 +179,27 @@ function paramFragments(param: TriggerParam | ActionParam): ArgFragment[] {
       break;
     case 'vector3':
     case 'vector3_relative': {
-      const d = (param.default && typeof param.default === 'object') ? param.default : { x: 0, y: 0, z: 0 };
-      out.push({ arg: { type: 'field_number', name: `p_${param.key}_x`, value: Number(d.x ?? 0) }, message: `${msgEscape(label)} x %N` });
-      out.push({ arg: { type: 'field_number', name: `p_${param.key}_y`, value: Number(d.y ?? 0) }, message: `y %N` });
-      out.push({ arg: { type: 'field_number', name: `p_${param.key}_z`, value: Number(d.z ?? 0) }, message: `z %N` });
+      // v1.7: each axis is its own value input with a shadow number.
+      out.push({ arg: { type: 'input_value', name: `p_${param.key}_x`, check: 'wb_expr' }, message: `${msgEscape(label)} x %N` });
+      out.push({ arg: { type: 'input_value', name: `p_${param.key}_y`, check: 'wb_expr' }, message: `y %N` });
+      out.push({ arg: { type: 'input_value', name: `p_${param.key}_z`, check: 'wb_expr' }, message: `z %N` });
       break;
     }
     default: // string
-      out.push({
-        arg: { type: 'field_input', name: `p_${param.key}`, text: String(param.default ?? ''), spellcheck: false },
-        message: `${msgEscape(label)} %N`,
-      });
+      if (param.key === 'variableName') {
+        // A variable NAME: dropdown of the workspace variables.
+        out.push({
+          arg: { type: 'field_variable', name: `p_${param.key}`, variable: String(param.default || 'score') },
+          message: `${msgEscape(label)} %N`,
+        });
+      } else {
+        // v1.7: value input + shadow text (type a literal, or plug in
+        // text / variable / math blocks).
+        out.push({
+          arg: { type: 'input_value', name: `p_${param.key}`, check: ['wb_text', 'wb_expr'] },
+          message: `${msgEscape(label)} %N`,
+        });
+      }
       break;
   }
   return out;
@@ -189,6 +214,49 @@ function assemble(label: string, fragments: ArgFragment[]): { message: string; a
     parts.push(f.message.replace('%N', `%${args.length}`));
   }
   return { message: parts.join(' '), args };
+}
+
+// ─── Shadow literals for freshly dragged blocks (v1.7) ───
+
+function numShadowXml(n: unknown): string {
+  const v = Number(n);
+  return `<shadow type="wb_math_number"><field name="NUM">${isFinite(v) ? String(v) : '0'}</field></shadow>`;
+}
+
+function textShadowXml(s: unknown): string {
+  return `<shadow type="wb_text"><field name="TEXT">${xmlEscape(String(s ?? ''))}</field></shadow>`;
+}
+
+/**
+ * The <value> XML with shadow literal blocks for every number/text/vector3
+ * parameter of a trigger or action block. The toolbox embeds this in its
+ * flyout items so a freshly dragged block already shows editable literal
+ * pills (which real math/variable/text blocks can replace).
+ */
+export function blockShadowXml(type: string): string {
+  let params: (TriggerParam | ActionParam)[] | null = null;
+  if (type.startsWith(TRIGGER_PREFIX)) {
+    const t = TRIGGER_DEFINITIONS.find((d) => triggerBlockType(d.type) === type);
+    params = t ? t.params : null;
+  } else if (type.startsWith(ACTION_PREFIX)) {
+    const a = ACTION_DEFINITIONS.find((d) => actionBlockType(d.type) === type);
+    params = a ? a.params : null;
+  }
+  if (!params) return '';
+  let xml = '';
+  for (const p of params) {
+    if (p.type === 'number') {
+      xml += `<value name="p_${p.key}">${numShadowXml(p.default ?? 0)}</value>`;
+    } else if (p.type === 'string' && p.key !== 'variableName') {
+      xml += `<value name="p_${p.key}">${textShadowXml(p.default ?? '')}</value>`;
+    } else if (p.type === 'vector3' || p.type === 'vector3_relative') {
+      const d = (p.default && typeof p.default === 'object') ? p.default as Record<string, unknown> : {};
+      for (const axis of ['x', 'y', 'z'] as const) {
+        xml += `<value name="p_${p.key}_${axis}">${numShadowXml(d[axis] ?? 0)}</value>`;
+      }
+    }
+  }
+  return xml;
 }
 
 // ─── Block registration (idempotent) ───
@@ -210,6 +278,7 @@ export function defineWbBlocks(Blockly: any): void {
       type: triggerBlockType(t.type),
       message0: message,
       args0: args,
+      inputsInline: true,
       nextStatement: null,
       colour: t.gameOnly ? 330 : 45,
       tooltip: noDash(t.description) + ' Uncheck "on" to disable this rule. Right click to save it as a custom rule.',
@@ -229,10 +298,11 @@ export function defineWbBlocks(Blockly: any): void {
       type: actionBlockType(a.type),
       message0: message,
       args0: args,
+      inputsInline: true,
       previousStatement: null,
       nextStatement: null,
       colour: 260,
-      tooltip: noDash(a.description),
+      tooltip: noDash(a.description) + ' Number and text sockets accept typed values, math blocks, variables and text blocks.',
       helpUrl: '',
     });
   }
@@ -243,7 +313,7 @@ export function defineWbBlocks(Blockly: any): void {
     message0: 'Advanced text rule: %1',
     args0: [{ type: 'field_input', name: 'p_name', text: 'Rule', spellcheck: false }],
     colour: 15,
-    tooltip: 'This rule was written in advanced text mode. It is kept exactly as it is. Edit or view it in the Logic panel.',
+    tooltip: 'This rule was written in the older text mode. It still runs, but it can only be edited here by deleting this block. New rules are built with blocks.',
     helpUrl: '',
   });
 

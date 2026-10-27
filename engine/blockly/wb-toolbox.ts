@@ -10,7 +10,7 @@
 // old editor used) rendered as ready-made stacks in the flyout.
 
 import { WeildCodeRule } from '../weildcode-types';
-import { buildCategories, getSearchIndex } from './wb-blocks';
+import { buildCategories, getSearchIndex, blockShadowXml } from './wb-blocks';
 import { ruleToBlockXml } from './wb-compile';
 
 export interface CustomTemplate {
@@ -19,7 +19,9 @@ export interface CustomTemplate {
   rule: WeildCodeRule;
 }
 
-/** Flyout items that look best with pre-filled shadow inputs. */
+/** Flyout item for a block type, with shadow literals on every
+ * number/text/vector3 socket (v1.7) so freshly dragged blocks are
+ * immediately usable: type into the pill, or drop a real block on it. */
 function flyoutBlock(type: string): string {
   switch (type) {
     case 'wb_var_set':
@@ -39,7 +41,9 @@ function flyoutBlock(type: string): string {
         + `<value name="B"><shadow type="wb_math_number"><field name="NUM">1</field></shadow></value>`
         + `</block>`;
     default:
-      return `<block type="${type}"></block>`;
+      // Trigger + action blocks: shadows generated from their param
+      // definitions (number/text/vector3 sockets only).
+      return `<block type="${type}">${blockShadowXml(type)}</block>`;
   }
 }
 

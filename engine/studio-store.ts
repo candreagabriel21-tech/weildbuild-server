@@ -1745,7 +1745,9 @@ export const useStudioStore = create<StudioStore>((set, get) => ({
 
   addScreenMessage: (msg) =>
     set((state) => ({
-      screenMessages: [...state.screenMessages, {
+      // v1.7 PERF: cap concurrent screen messages (a fast repeat rule used
+      // to stack unbounded overlays + React re-renders). Oldest dropped.
+      screenMessages: [...state.screenMessages.slice(-7), {
         ...msg,
         id: `scrmsg_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
         startTime: performance.now(),

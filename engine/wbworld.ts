@@ -237,14 +237,14 @@ export function wbworldSizeInfo(payloadBytes: Uint8Array, payload: object) {
 }
 
 // ═══════════════════════════════════════════════════════════════════
-// v1.1 — GAME STORAGE uses the same format
+// v2.0 — GAME STORAGE is PLAIN JSON (user decision)
 // ═══════════════════════════════════════════════════════════════════
-// Publishing a game now uploads the world as an encrypted .wbworld
-// blob (identical bytes to File > Export); the server stores it in the
-// game_worlds table and never sees plain JSON. Loading a game brings
-// the blob back as `world_b64` and decrypts it HERE - the same code
-// path as File > Import. Old games that still carry a plain studioState
-// (pre-migration) keep working through the fallback below.
+// Encryption now happens ONLY when a player exports/downloads a game
+// file in the create tab (.wbworld, identical bytes as before). The
+// server and the device-local drafts store plain JSON: encrypted blobs
+// under active editing caused bugs. Games fetched from a v1.x server
+// (pre-migration) may still carry an encrypted world_b64 blob - the
+// decodeGameWorld fallback below decrypts those transparently.
 
 /** bytes <-> base64 (browser-safe, chunked for large worlds). */
 export function bytesToBase64(bytes: Uint8Array): string {
@@ -264,25 +264,26 @@ export function base64ToBytes(b64: string): Uint8Array {
 }
 
 /**
- * Build the publish transport: light metadata + the world encrypted as
- * a .wbworld blob (base64). This REPLACES the old studioState/primitives
- * upload - same bytes as an export file, so what you publish is exactly
- * what File > Export would have written.
+ * Build the publish transport world: PLAIN studioState JSON (v2.0).
+ * The server stores exactly this; no encryption on the working copy.
+ * File > Export still encrypts with buildWbworldPayload + encryptWbworld.
  */
-export async function buildWorldB64(name: string, description = ""): Promise<string> {
-  const payload = buildWbworldPayload(name, description);
-  const bytes = await encryptWbworld(payload);
-  return bytesToBase64(bytes);
+export function buildPublishStudioState(name: string, description = ""): any {
+  return buildWbworldPayload(name, description).studioState;
 }
 
 /**
  * Decode a game fetched from the server into its studio state.
  * Handles both storage generations:
- *   1. v1.1+: `world_b64` (encrypted .wbworld blob - decrypt here)
- *   2. legacy: plain `studioState` JSON (pre-migration rows)
+ *   1. v2.0+: plain `studioState` JSON (the normal path, no decrypt)
+ *   2. v1.x: `world_b64` (encrypted .wbworld blob - decrypt here,
+ *      pre-migration rows only)
  * Returns null when the game has no loadable world.
  */
 export async function decodeGameWorld(game: { world_b64?: string; studioState?: any }): Promise<StudioProjectState | null> {
+  if (game.studioState && isValidStudioState(game.studioState)) {
+    return game.studioState as StudioProjectState;
+  }
   if (game.world_b64) {
     try {
       const payload = await decryptWbworld(base64ToBytes(game.world_b64));

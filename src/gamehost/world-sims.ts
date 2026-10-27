@@ -3,8 +3,9 @@
 // ═══════════════════════════════════════════════════════════════════
 // Owns one server-authoritative world worker PER INSTANCE:
 //
-//   • ensureSim(instance): fetches the game's encrypted .wbworld blob
-//     from the Main Server, decrypts it (shared/wbworld.ts), boots the
+//   • ensureSim(instance): fetches the game's world from the Main
+//     Server (v2.0: plain studioState JSON; v1.x rows still carrying an
+//     encrypted .wbworld blob are decrypted as a fallback), boots the
 //     bundled world-runtime worker (dist/gamehost/world-runtime.bundle.js)
 //     and feeds it the studio state. ONE worker per instance = full
 //     isolation (own zustand store, own engine) and parallel physics.
@@ -99,7 +100,7 @@ export class WorldSimManager {
       return;
     }
 
-    // 1. Fetch the game row (metadata + encrypted world blob) from Main.
+    // 1. Fetch the game row (metadata + world) from Main.
     let studioState: any = null;
     try {
       const res = await fetch(
@@ -108,15 +109,16 @@ export class WorldSimManager {
       );
       if (res.ok) {
         const game: any = await res.json();
-        if (game?.world_b64) {
+        // v2.0: the normal path is a PLAIN studioState. The encrypted
+        // world_b64 blob is a v1.x fallback (pre-migration rows).
+        if (game?.studioState && typeof game.studioState === "object") {
+          studioState = game.studioState;
+        } else if (game?.world_b64) {
           const bytes = bufferFromBase64(game.world_b64);
           if (bytes) {
             const payload = decryptWbworldBuffer(bytes);
             studioState = payload?.studioState ?? null;
           }
-        } else if (game?.studioState) {
-          // Legacy row the boot migration hasn't converted yet.
-          studioState = game.studioState;
         }
       }
     } catch (e: unknown) {

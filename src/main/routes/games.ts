@@ -48,11 +48,30 @@ function sanitizeThumbnail(value: unknown): string | undefined {
   return value;
 }
 
-/** v1.1: validate the encrypted .wbworld blob (base64) a publish carries.
- * Checks: is a string, decodes as strict base64, has the WBWD1 header +
- * version, and stays under WORLD_MAX_BYTES decoded. Returns the cleaned
- * string, or undefined to DROP it (the game row is still created - it just
- * has no world until the next successful publish). */
+/** v2.0: validate the PLAIN studioState object a publish carries.
+ * Checks: is a plain (non-array) object, serializes cleanly, and stays
+ * under the size cap. Returns the cleaned object, or undefined to DROP
+ * it (the game row is still created - it just has no world until the
+ * next successful publish). */
+const STUDIO_STATE_MAX_JSON = 8_000_000;
+function sanitizeStudioState(value: unknown): any | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (typeof value !== "object" || Array.isArray(value)) return undefined;
+  try {
+    const json = JSON.stringify(value);
+    if (json.length > STUDIO_STATE_MAX_JSON) return undefined;
+  } catch {
+    return undefined;
+  }
+  return value;
+}
+
+/** v1.1 (legacy input path): validate the encrypted .wbworld blob
+ * (base64) older clients still send. The server DECRYPTS it and stores
+ * the world as plain JSON (v2.0). Checks: is a string, decodes as strict
+ * base64, has the WBWD1 header + version, and stays under
+ * WORLD_MAX_BYTES decoded. Returns the cleaned string, or undefined to
+ * DROP it. */
 const WORLD_B64_MAX_CHARS = 6_000_000; // > 4MB decoded (4/3 inflation)
 function sanitizeWorldB64(value: unknown): string | undefined {
   if (value === undefined || value === null) return undefined;
@@ -62,6 +81,22 @@ function sanitizeWorldB64(value: unknown): string | undefined {
   if (!buf || !isValidWbworldBuffer(buf)) return undefined;
   if (buf.length > WORLD_MAX_BYTES) return undefined;
   return value;
+}
+
+/** v2.0: normalize the world field(s) on a create/update body in place.
+ * Keeps a valid plain studioState, keeps a valid legacy world_b64 (the
+ * db layer decrypts it), drops everything else. */
+function sanitizeWorldFields(gameData: any): void {
+  const plain = sanitizeStudioState(gameData.studioState);
+  if (plain !== undefined) gameData.studioState = plain;
+  else delete gameData.studioState;
+  const world = sanitizeWorldB64(gameData.world_b64);
+  if (world) gameData.world_b64 = world;
+  else delete gameData.world_b64;
+  if (gameData.studioState && gameData.world_b64) {
+    // Never store both: the plain state wins.
+    delete gameData.world_b64;
+  }
 }
 
 /** Read a single string query param (empty string counts as absent). */
@@ -114,9 +149,8 @@ gamesRouter.post("/", safeHandler(async (req, res) => {
   // 1.4.6: side-view thumbnail (studio-generated) - validate or drop
   const thumb = sanitizeThumbnail(gameData.thumbnail);
   if (thumb) gameData.thumbnail = thumb; else delete gameData.thumbnail;
-  // v1.1: encrypted .wbworld world blob - validate or drop
-  const world = sanitizeWorldB64(gameData.world_b64);
-  if (world) gameData.world_b64 = world; else delete gameData.world_b64;
+  // v2.0: world = plain studioState (preferred) or legacy world_b64
+  sanitizeWorldFields(gameData);
 
   // CRITICAL: Creator is ALWAYS from the session, NEVER from request body
   // The server decides who created the game, not the client
@@ -179,9 +213,8 @@ gamesRouter.put("/", safeHandler(async (req, res) => {
   // 1.4.6: side-view thumbnail (studio-generated) - validate or drop
   const thumbUpd = sanitizeThumbnail(updates.thumbnail);
   if (thumbUpd) updates.thumbnail = thumbUpd; else delete updates.thumbnail;
-  // v1.1: encrypted .wbworld world blob - validate or drop
-  const worldUpd = sanitizeWorldB64(updates.world_b64);
-  if (worldUpd) updates.world_b64 = worldUpd; else delete updates.world_b64;
+  // v2.0: world = plain studioState (preferred) or legacy world_b64
+  sanitizeWorldFields(updates);
 
   // Never allow changing the creator through an update
   delete updates.creator;

@@ -128,60 +128,62 @@ async function syncOfficialItems(): Promise<void> {
   console.log(`[db-setup] Official shop items re-synced (${synced}/${files.length} items).`);
 }
 
-// ─── v1.1: migrate legacy JSONB games to the .wbworld format ───
-// Games published before v1.1 carry their whole studio state as plain
-// JSON inside games.extra_data. This one-time-per-row migration encrypts
-// each into a GameWorld row (same bytes as File > Export) and strips the
-// heavy fields from extra_data, leaving only light metadata. Idempotent:
-// rows without extra_data.studioState are skipped, already-migrated rows
-// have nothing left to do. Runs on every boot (cheap COUNT first).
-async function migrateGamesToWbworld(): Promise<void> {
-  const { encryptWbworldPayload } = await import("../shared/wbworld");
-  // Find candidate rows (extra_data has a studioState key). Prisma can't
-  // query JSON keys portably, so scan with a light select - games tables
-  // are small (hundreds of rows), and only UNMIGRATED rows do work.
-  const rows = await prisma.game.findMany({
-    select: { id: true, name: true, description: true, extraData: true },
-    take: 5000,
-  });
+// ─── v2.0: migrate v1.x encrypted game worlds back to PLAIN JSON ───
+// Games saved by v1.x carry their world as an encrypted .wbworld blob in
+// the game_worlds side table. Per the user's decision the server now
+// stores worlds as plain JSON (encryption only happens on export in the
+// create tab). This one-time-per-row migration decrypts every side-row
+// back into extra_data.studioState and deletes the side-row. Idempotent:
+// rows only in extra_data are skipped, missing side-table is fine, and a
+// row that already has a plain studioState just loses its side-row.
+async function migrateGamesToPlain(): Promise<void> {
+  const { decryptWbworldBuffer } = await import("../shared/wbworld");
+  let worldRows: any[] = [];
+  try {
+    worldRows = await prisma.gameWorld.findMany({ select: { gameId: true, world: true } });
+  } catch {
+    return; // table doesn't exist (fresh install): nothing to migrate
+  }
   let migrated = 0;
-  let freedBytes = 0;
-  for (const row of rows) {
-    const extra = (row.extraData as any) || {};
-    const studioState = extra.studioState;
-    if (!studioState || typeof studioState !== "object") continue;
-    if (extra.primitives) freedBytes += JSON.stringify(extra.primitives).length;
-    freedBytes += JSON.stringify(studioState).length;
-    // Light metadata (already in extra) keeps living there.
-    const payload = {
-      format: "wbworld",
-      version: 1,
-      name: row.name || "My World",
-      description: row.description || "",
-      multiplayer: extra.multiplayer ?? (extra.max_players ?? 10) > 1,
-      max_players: extra.max_players ?? 10,
-      spawn_point: extra.spawn_point ?? [0, 0.15, 0],
-      studioState,
-      exportedAt: new Date().toISOString(),
-      exportedBy: "boot-migration",
-    };
-    const world = encryptWbworldPayload(payload);
-    await prisma.gameWorld.upsert({
-      where: { gameId: row.id },
-      create: { gameId: row.id, world: world as any, bytesLen: world.length },
-      update: { world: world as any, bytesLen: world.length },
-    });
-    // Strip the heavy fields; keep every light key (thumbnail, flags...).
-    const next: any = { ...extra };
-    delete next.studioState;
-    delete next.primitives;
-    await prisma.game.update({ where: { id: row.id }, data: { extraData: next } });
-    migrated++;
+  for (const worldRow of worldRows) {
+    try {
+      const game = await prisma.game.findUnique({
+        where: { id: worldRow.gameId },
+        select: { extraData: true },
+      });
+      if (!game) {
+        // Game row is gone (deleted): the side-row is garbage. Drop it.
+        await prisma.gameWorld.deleteMany({ where: { gameId: worldRow.gameId } });
+        continue;
+      }
+      const extra = (game.extraData as any) || {};
+      if (!extra.studioState) {
+        const payload = decryptWbworldBuffer(Buffer.from(worldRow.world));
+        const studioState = payload?.studioState;
+        if (studioState && typeof studioState === "object") {
+          await prisma.game.update({
+            where: { id: worldRow.gameId },
+            data: { extraData: { ...extra, studioState } as any },
+          });
+          migrated++;
+        } else {
+          console.warn(
+            `[db-setup] plain migration: game ${worldRow.gameId} has an unreadable world blob - it was left untouched`
+          );
+          continue;
+        }
+      }
+      // Plain state exists now: the encrypted side-row is redundant.
+      await prisma.gameWorld.deleteMany({ where: { gameId: worldRow.gameId } });
+    } catch (err: any) {
+      console.warn(
+        `[db-setup] plain migration: game ${worldRow.gameId} failed (non-fatal, retried next boot): ${String(err?.message ?? err).split("\n")[0]}`
+      );
+    }
   }
   if (migrated > 0) {
     console.log(
-      `[db-setup] wbworld migration: ${migrated} game(s) converted to the encrypted\n` +
-        `    .wbworld format (~${(freedBytes / 1024).toFixed(0)} KB of JSONB set free).`
+      `[db-setup] plain-world migration: ${migrated} game(s) decrypted back to plain JSON storage.`
     );
   }
 }
@@ -243,14 +245,14 @@ export async function ensureDatabase(): Promise<void> {
     console.warn(`[db-setup] Official item re-sync failed (non-fatal, retried on next boot): ${msg}`);
   }
 
-  // v1.1: convert legacy plain-JSON games to the encrypted .wbworld
-  // format (idempotent; skips rows that are already migrated).
-  console.log("[db-setup] Step 4/4 — migrating games to the .wbworld format…");
+  // v2.0: decrypt any v1.x encrypted world rows back into plain JSON
+  // storage (idempotent; nothing to do once every row is plain).
+  console.log("[db-setup] Step 4/4 — migrating encrypted worlds to plain storage…");
   try {
-    await migrateGamesToWbworld();
+    await migrateGamesToPlain();
   } catch (err: any) {
     const msg = String(err?.message ?? err).split("\n")[0];
-    console.warn(`[db-setup] wbworld migration failed (non-fatal, retried on next boot): ${msg}`);
+    console.warn(`[db-setup] plain-world migration failed (non-fatal, retried on next boot): ${msg}`);
   }
 
   console.log("─".repeat(58));

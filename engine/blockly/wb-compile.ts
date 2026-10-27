@@ -42,14 +42,88 @@ function xmlEscape(s: string): string {
     .replace(/'/g, '&apos;');
 }
 
-function numField(block: any, name: string, fallback: number): number {
-  const v = Number(block.getFieldValue(name));
-  return isFinite(v) ? v : fallback;
-}
-
 function boolField(block: any, name: string): boolean {
   const v = block.getFieldValue(name);
   return v === true || v === 'TRUE' || v === 'true';
+}
+
+// ─── v1.7: value-input params (number / text) ───
+// Number and text parameters are VALUE INPUTS on the blocks:
+//   • a shadow (or duplicated literal) block  -> plain literal value
+//   • a "get variable" block                 -> { __wb_var: name }
+//   • any other expression block              -> { __wb_expr: "a + b" }
+// The engine resolves the tagged objects at runtime; plain literals
+// behave exactly like the pre-v1.7 field values (perfect round trips
+// for every existing rule).
+
+export interface WbVarRef { __wb_var: string }
+export interface WbExprRef { __wb_expr: string }
+
+export function isWbVarRef(v: unknown): v is WbVarRef {
+  return !!v && typeof v === 'object' && !Array.isArray(v) && typeof (v as any).__wb_var === 'string';
+}
+
+export function isWbExprRef(v: unknown): v is WbExprRef {
+  return !!v && typeof v === 'object' && !Array.isArray(v) && typeof (v as any).__wb_expr === 'string';
+}
+
+/** The variable name of a wb_var_get block. */
+function varGetName(block: any): string {
+  return variableFieldName(block, 'VAR') || 'variable';
+}
+
+/**
+ * Read a variable-name FIELD as the variable NAME.
+ * Blockly 13's getFieldValue() returns the variable ID (a generated
+ * 20-char token); the variable model + field text carry the NAME.
+ * Falls back to getFieldValue for headless mocks and older Blockly.
+ */
+function variableFieldName(block: any, fieldName: string): string {
+  const field = typeof block.getField === 'function' ? block.getField(fieldName) : null;
+  if (field) {
+    const v = (field as any).variable;
+    if (v && typeof v.name === 'string' && v.name !== '') return v.name;
+    if (v && typeof v.getName === 'function') {
+      const n = v.getName();
+      if (typeof n === 'string' && n !== '') return n;
+    }
+    const t = typeof (field as any).getText === 'function' ? (field as any).getText() : '';
+    if (typeof t === 'string' && t !== '') return t;
+  }
+  const raw = block.getFieldValue(fieldName);
+  return raw == null ? '' : String(raw);
+}
+
+/** Read a NUMBER value input (shadow literal, variable ref or expression). */
+function numberInput(block: any, name: string, fallback: number, warnings: string[]): number | WbVarRef | WbExprRef {
+  const tgt = block.getInputTargetBlock ? block.getInputTargetBlock(name) : null;
+  if (!tgt) return fallback;
+  if (tgt.type === 'wb_math_number') {
+    const v = Number(tgt.getFieldValue('NUM'));
+    return isFinite(v) ? v : fallback;
+  }
+  if (tgt.type === 'wb_text') {
+    // Defensive: text blocks do not normally connect to number sockets.
+    const v = Number(tgt.getFieldValue('TEXT'));
+    return isFinite(v) ? v : fallback;
+  }
+  if (tgt.type === 'wb_var_get') return { __wb_var: varGetName(tgt) };
+  const expr = compileExprBlock(tgt, {}, warnings);
+  const n = Number(expr);
+  if (expr.trim() !== '' && !isNaN(n)) return n;
+  return { __wb_expr: expr };
+}
+
+/** Read a TEXT value input (shadow literal, variable ref or expression). */
+function textInput(block: any, name: string, fallback: string, warnings: string[]): string | number | WbVarRef | WbExprRef {
+  const tgt = block.getInputTargetBlock ? block.getInputTargetBlock(name) : null;
+  if (!tgt) return fallback;
+  if (tgt.type === 'wb_text') return String(tgt.getFieldValue('TEXT') ?? '');
+  if (tgt.type === 'wb_var_get') return { __wb_var: varGetName(tgt) };
+  const expr = compileExprBlock(tgt, {}, warnings);
+  const n = Number(expr);
+  if (expr.trim() !== '' && !isNaN(n)) return n; // canonical numeric form
+  return { __wb_expr: expr };
 }
 
 // ─── Math expression compile (blocks → engine expression string) ───
@@ -137,7 +211,7 @@ function compileActionBlock(block: any, warnings: string[]): WeildCodeAction | n
       id: (block as any).wbActionId || newId('act'),
       type: 'set_variable',
       params: {
-        variableName: String(block.getFieldValue('VAR') ?? ''),
+        variableName: variableFieldName(block, 'VAR'),
         value: compileValueBlock(block.getInputTargetBlock('TO'), warnings),
         scope: String(block.getFieldValue('SCOPE') || 'global'),
       },
@@ -145,7 +219,7 @@ function compileActionBlock(block: any, warnings: string[]): WeildCodeAction | n
     };
   }
   if (block.type === 'wb_var_change') {
-    const varName = String(block.getFieldValue('VAR') ?? '');
+    const varName = variableFieldName(block, 'VAR');
     return {
       id: (block as any).wbActionId || newId('act'),
       type: 'change_variable',
@@ -173,16 +247,22 @@ function compileActionBlock(block: any, warnings: string[]): WeildCodeAction | n
       const base = (p.default && typeof p.default === 'object') ? { ...p.default } : {};
       params[p.key] = {
         ...base,
-        x: numField(block, `p_${p.key}_x`, Number(base.x ?? 0)),
-        y: numField(block, `p_${p.key}_y`, Number(base.y ?? 0)),
-        z: numField(block, `p_${p.key}_z`, Number(base.z ?? 0)),
+        x: numberInput(block, `p_${p.key}_x`, Number(base.x ?? 0), warnings),
+        y: numberInput(block, `p_${p.key}_y`, Number(base.y ?? 0), warnings),
+        z: numberInput(block, `p_${p.key}_z`, Number(base.z ?? 0), warnings),
       };
     } else if (p.type === 'number') {
-      params[p.key] = numField(block, `p_${p.key}`, Number(p.default ?? 0));
+      params[p.key] = numberInput(block, `p_${p.key}`, Number(p.default ?? 0), warnings);
     } else if (p.type === 'boolean') {
       params[p.key] = boolField(block, `p_${p.key}`);
-    } else {
+    } else if (p.key === 'variableName') {
+      // Variable dropdown field: the NAME, not Blockly's variable id.
+      params[p.key] = variableFieldName(block, `p_${p.key}`) || String(p.default ?? '');
+    } else if (p.type === 'select' || p.type === 'color') {
+      // Dropdowns and colour pickers are plain fields.
       params[p.key] = String(block.getFieldValue(`p_${p.key}`) ?? p.default ?? '');
+    } else {
+      params[p.key] = textInput(block, `p_${p.key}`, String(p.default ?? ''), warnings);
     }
   }
 
@@ -211,20 +291,27 @@ function compileChain(startBlock: any, warnings: string[]): WeildCodeAction[] {
 }
 
 function triggerParamsFromBlock(block: any, def: { params: typeof ACTION_DEFINITIONS[number]['params'] }): Record<string, any> {
+  const warnings: string[] = [];
   const params: Record<string, any> = {};
   for (const p of def.params as any[]) {
     if (p.type === 'vector3' || p.type === 'vector3_relative') {
       params[p.key] = {
-        x: numField(block, `p_${p.key}_x`, 0),
-        y: numField(block, `p_${p.key}_y`, 0),
-        z: numField(block, `p_${p.key}_z`, 0),
+        x: numberInput(block, `p_${p.key}_x`, 0, warnings),
+        y: numberInput(block, `p_${p.key}_y`, 0, warnings),
+        z: numberInput(block, `p_${p.key}_z`, 0, warnings),
       };
     } else if (p.type === 'number') {
-      params[p.key] = numField(block, `p_${p.key}`, Number(p.default ?? 0));
+      params[p.key] = numberInput(block, `p_${p.key}`, Number(p.default ?? 0), warnings);
     } else if (p.type === 'boolean') {
       params[p.key] = boolField(block, `p_${p.key}`);
-    } else {
+    } else if (p.key === 'variableName') {
+      // Variable dropdown field: the NAME, not Blockly's variable id.
+      params[p.key] = variableFieldName(block, `p_${p.key}`) || String(p.default ?? '');
+    } else if (p.type === 'select' || p.type === 'color') {
+      // Dropdowns and colour pickers are plain fields.
       params[p.key] = String(block.getFieldValue(`p_${p.key}`) ?? p.default ?? '');
+    } else {
+      params[p.key] = textInput(block, `p_${p.key}`, String(p.default ?? ''), warnings);
     }
   }
   return params;
@@ -325,6 +412,43 @@ function valueToXml(value: unknown): string {
   return `<block type="wb_text">${fieldXml('TEXT', String(value ?? ''))}</block>`;
 }
 
+// ─── v1.7: stored param values → value-input XML ───
+
+function shadowNumXml(v: unknown): string {
+  const n = Number(v);
+  return `<shadow type="wb_math_number">${fieldXml('NUM', isFinite(n) ? String(n) : '0')}</shadow>`;
+}
+
+function shadowTextXml(v: unknown): string {
+  return `<shadow type="wb_text">${fieldXml('TEXT', String(v ?? ''))}</shadow>`;
+}
+
+/** A NUMBER param value (literal / var ref / expression) → <value> XML. */
+function numberParamToXml(name: string, v: unknown): string {
+  let inner: string;
+  if (isWbVarRef(v)) {
+    inner = `<block type="wb_var_get">${fieldXml('SCOPE', 'global')}${fieldXml('VAR', v.__wb_var)}</block>`;
+  } else if (isWbExprRef(v)) {
+    inner = valueToXml(v.__wb_expr); // raw expression block (or plain number)
+  } else {
+    inner = shadowNumXml(v);
+  }
+  return `<value name="${name}">${inner}</value>`;
+}
+
+/** A TEXT param value (literal / var ref / expression) → <value> XML. */
+function textParamToXml(name: string, v: unknown): string {
+  let inner: string;
+  if (isWbVarRef(v)) {
+    inner = `<block type="wb_var_get">${fieldXml('SCOPE', 'global')}${fieldXml('VAR', v.__wb_var)}</block>`;
+  } else if (isWbExprRef(v)) {
+    inner = valueToXml(v.__wb_expr);
+  } else {
+    inner = shadowTextXml(v);
+  }
+  return `<value name="${name}">${inner}</value>`;
+}
+
 /** Decompile a change_variable expression into a BY input block. */
 function expressionToXml(expr: string, varName: string, scope: string): string {
   const s = String(expr ?? '').trim().replace(/^\((.*)\)$/, '$1');
@@ -374,16 +498,21 @@ function actionToXml(action: WeildCodeAction, nextXml: string): string {
   for (const p of def.params) {
     const v = action.params?.[p.key];
     if (p.type === 'vector3' || p.type === 'vector3_relative') {
-      const o = (v && typeof v === 'object') ? v : {};
-      xml += fieldXml(`p_${p.key}_x`, String(o.x ?? 0));
-      xml += fieldXml(`p_${p.key}_y`, String(o.y ?? 0));
-      xml += fieldXml(`p_${p.key}_z`, String(o.z ?? 0));
+      const o = (v && typeof v === 'object' && !isWbVarRef(v) && !isWbExprRef(v)) ? v : {};
+      xml += numberParamToXml(`p_${p.key}_x`, o.x ?? 0);
+      xml += numberParamToXml(`p_${p.key}_y`, o.y ?? 0);
+      xml += numberParamToXml(`p_${p.key}_z`, o.z ?? 0);
     } else if (p.type === 'boolean') {
       xml += fieldXml(`p_${p.key}`, v ? 'TRUE' : 'FALSE');
     } else if (p.type === 'number') {
-      xml += fieldXml(`p_${p.key}`, String(Number(v ?? p.default ?? 0)));
-    } else {
+      xml += numberParamToXml(`p_${p.key}`, v ?? p.default ?? 0);
+    } else if (p.key === 'variableName') {
       xml += fieldXml(`p_${p.key}`, String(v ?? p.default ?? ''));
+    } else if (p.type === 'select' || p.type === 'color') {
+      // Dropdowns and colour pickers are FIELDS, not value inputs.
+      xml += fieldXml(`p_${p.key}`, String(v ?? p.default ?? ''));
+    } else {
+      xml += textParamToXml(`p_${p.key}`, v ?? p.default ?? '');
     }
   }
   if (def.hasChildren) {
@@ -418,14 +547,19 @@ export function ruleToBlockXml(rule: WeildCodeRule): string {
   for (const p of def.params) {
     const v = rule.trigger.params?.[p.key];
     if (p.type === 'vector3') {
-      const o = (v && typeof v === 'object') ? v : {};
-      xml += fieldXml(`p_${p.key}_x`, String(o.x ?? 0));
-      xml += fieldXml(`p_${p.key}_y`, String(o.y ?? 0));
-      xml += fieldXml(`p_${p.key}_z`, String(o.z ?? 0));
+      const o = (v && typeof v === 'object' && !isWbVarRef(v) && !isWbExprRef(v)) ? v : {};
+      xml += numberParamToXml(`p_${p.key}_x`, o.x ?? 0);
+      xml += numberParamToXml(`p_${p.key}_y`, o.y ?? 0);
+      xml += numberParamToXml(`p_${p.key}_z`, o.z ?? 0);
     } else if (p.type === 'number') {
-      xml += fieldXml(`p_${p.key}`, String(Number(v ?? p.default ?? 0)));
-    } else {
+      xml += numberParamToXml(`p_${p.key}`, v ?? p.default ?? 0);
+    } else if (p.key === 'variableName') {
       xml += fieldXml(`p_${p.key}`, String(v ?? p.default ?? ''));
+    } else if (p.type === 'select' || p.type === 'color') {
+      // Dropdowns and colour pickers are FIELDS, not value inputs.
+      xml += fieldXml(`p_${p.key}`, String(v ?? p.default ?? ''));
+    } else {
+      xml += textParamToXml(`p_${p.key}`, v ?? p.default ?? '');
     }
   }
   xml += '\n';

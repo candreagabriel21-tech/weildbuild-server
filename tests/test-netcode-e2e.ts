@@ -83,21 +83,28 @@ async function main() {
   // jwt import AFTER AUTH_SECRET is in the env (it reads at module load).
   ({ signSessionToken } = await import("../src/shared/jwt"));
 
-  // ── 1. Stub Main: serves the game (encrypted world) + host registration ──
-  const worldB64 = bufferToBase64(encryptWbworldPayload({
-    format: 'wbworld', version: 1, name: 'Netcode E2E', description: '',
+  // ── 1. Stub Main: serves the game (v2.0 PLAIN studioState + a legacy
+  //    encrypted world_b64 row) + host registration ──
+  const gameRow = {
+    id: 'e2egame1', name: 'Netcode E2E', description: '', creator: 'e2e',
+    plays: 0, max_players: 10, multiplayer: true, studioState,
+  };
+  // v1.x row (pre-migration): the gamehost must still decrypt it.
+  const legacyWorldB64 = bufferToBase64(encryptWbworldPayload({
+    format: 'wbworld', version: 1, name: 'Netcode Legacy', description: '',
     multiplayer: true, max_players: 10, spawn_point: [0, 0, 0],
     studioState, exportedAt: new Date().toISOString(), exportedBy: 'e2e',
   }));
-  const gameRow = {
-    id: 'e2egame1', name: 'Netcode E2E', description: '', creator: 'e2e',
-    plays: 0, max_players: 10, multiplayer: true, world_b64: worldB64,
+  const legacyRow = {
+    id: 'e2egame2', name: 'Netcode Legacy', description: '', creator: 'e2e',
+    plays: 0, max_players: 10, multiplayer: true, world_b64: legacyWorldB64,
   };
   const stubMain = createServer((req, res) => {
     const url = new URL(req.url || '/', `http://localhost:${STUB_MAIN_PORT}`);
     if (url.pathname === '/api/games' && url.searchParams.get('id')) {
+      const row = url.searchParams.get('id') === 'e2egame2' ? legacyRow : gameRow;
       res.writeHead(200, { 'content-type': 'application/json' });
-      res.end(JSON.stringify(gameRow));
+      res.end(JSON.stringify(row));
       return;
     }
     if (url.pathname === '/internal/hosts/register' || url.pathname === '/internal/hosts/heartbeat') {
@@ -182,7 +189,7 @@ async function main() {
     const b = snap1.players.find((p: any) => p.username === 'Bob');
     assert.ok(a && b, 'snapshot carries both players');
     assert.equal(a.hp, 100, 'full health');
-    console.log('✓ game:state snapshots flowing (sim booted from the encrypted world)');
+    console.log('✓ game:state snapshots flowing (sim booted from the plain world)');
 
     // Bob must ALSO receive snapshots (room broadcast)
     const bobSnap: any = await waitEvent(bob, 'game:state', (m: any) => Array.isArray(m.players) && m.players.length >= 2, 10000);
@@ -241,6 +248,28 @@ async function main() {
 
     alice.disconnect();
     bob.disconnect();
+
+    // ── 11. v1.x legacy row (encrypted world_b64) still boots a sim ──
+    const legacyRes = await fetch(`http://localhost:${GAMEHOST_PORT}/internal/instances`, {
+      method: 'POST',
+      headers: { 'x-internal-token': INTERNAL_TOKEN, 'content-type': 'application/json' },
+      body: JSON.stringify({ gameId: 'e2egame2', maxPlayers: 4 }),
+    });
+    assert.ok(legacyRes.status === 200 || legacyRes.status === 201, 'legacy instance creation accepted');
+    const { instanceId: legacyInstanceId } = (await legacyRes.json()) as { instanceId: string };
+    const carol: Socket = io(`http://localhost:${GAMEHOST_PORT}`, {
+      transports: ['websocket'], auth: { token: await signSessionToken('Carol') }, reconnection: false,
+    });
+    carol.on('game:error', (e: any) => { throw new Error(`carol game:error: ${e?.message}`); });
+    carol.emit('game:join', { instanceId: legacyInstanceId, gameId: 'e2egame2', username: 'Carol', avatar: {} });
+    const legacySnap: any = await waitEvent(carol, 'game:state', (m: any) => Array.isArray(m.players) && m.players.some((p: any) => p.username === 'Carol'), 30000).catch(() => null);
+    assert.ok(legacySnap, 'legacy encrypted world decrypted + simulated (snapshot received)');
+    const legacyFell = await waitEvent(carol, 'game:state', (m: any) => (m.parts || []).some((p: any) => p.id === 'ball' && p.y < 6), 15000).catch(() => null);
+    assert.ok(legacyFell, 'legacy world physics runs (boulder fell)');
+    carol.emit('game:leave', { instanceId: legacyInstanceId });
+    carol.disconnect();
+    console.log('✓ legacy encrypted world_b64 row: decrypt fallback + sim boot');
+
     console.log('\n✓ netcode E2E: ALL PASS');
   } finally {
     gamehost.kill('SIGTERM');
