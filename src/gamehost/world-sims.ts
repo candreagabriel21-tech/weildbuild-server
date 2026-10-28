@@ -66,6 +66,9 @@ export class WorldSimManager {
   private sims = new Map<string, SimEntry>();
   private sweeper: NodeJS.Timeout;
   private snapshotListeners: Array<(instanceId: string, snap: WorldSnapshot) => void> = [];
+  // v6.2.7: pending getWorldState replies (reqId -> { instance, resolver }).
+  private worldStateWaiters = new Map<number, { instanceId: string; resolve: (state: any) => void }>();
+  private worldStateReqCounter = 0;
 
   constructor(private manager: GameInstanceManager) {
     // Dispose sims whose instance vanished (empty-grace sweeper closed it).
@@ -169,6 +172,16 @@ export class WorldSimManager {
       if (!m || typeof m !== "object") return;
       if (m.t === "snapshot") {
         for (const cb of this.snapshotListeners) cb(instance.id, m as WorldSnapshot);
+      } else if (m.t === "worldState") {
+        // v6.2.7: a getWorldState reply - hand it to the waiting joiner.
+        const waiter = this.worldStateWaiters.get(m.reqId);
+        if (waiter) {
+          waiter.resolve({
+            objects: Array.isArray(m.objects) ? m.objects : [],
+            joints: Array.isArray(m.joints) ? m.joints : [],
+            globalVariables: (m.globalVariables && typeof m.globalVariables === "object") ? m.globalVariables : {},
+          });
+        }
       } else if (m.t === "stopped") {
         this.disposeInternal(instance.id);
       } else if (m.t === "error") {
@@ -221,11 +234,57 @@ export class WorldSimManager {
     }
   }
 
+  /** v6.2.6: one 0.25 s character-state report from an owning client
+   * (position/yaw/anim). The worker applies the light checks and keeps
+   * the last accepted report as that player's position. */
+  pstate(instanceId: string, socketId: string, payload: Record<string, unknown>): void {
+    const sim = this.sims.get(instanceId);
+    if (!sim || !sim.ready || sim.disposed) return;
+    sim.worker.postMessage({
+      t: "pstate",
+      socketId,
+      x: Number(payload.x) || 0,
+      y: Number(payload.y) || 0,
+      z: Number(payload.z) || 0,
+      yaw: Number(payload.yaw) || 0,
+      walking: !!payload.walking,
+      jumping: !!payload.jumping,
+      sprint: !!payload.sprint,
+    });
+  }
+
+  /** v6.2.7: ask the worker for the instance's CURRENT full world state
+   * (every non-character part with live transforms, joints, global
+   * variables) - what a late joiner syncs from so it sees the world as
+   * it actually is (rule-created parts, settled physics, changed colors),
+   * not as it was published. Null when the sim is not ready. */
+  requestWorldState(instanceId: string): Promise<{
+    objects: any[];
+    joints: any[];
+    globalVariables: Record<string, unknown>;
+  } | null> {
+    const sim = this.sims.get(instanceId);
+    if (!sim || !sim.ready || sim.disposed) return Promise.resolve(null);
+    const reqId = ++this.worldStateReqCounter;
+    return new Promise((resolve) => {
+      const timeout = setTimeout(() => {
+        this.worldStateWaiters.delete(reqId);
+        resolve(null); // never block a joiner on a stuck worker
+      }, 10000);
+      this.worldStateWaiters.set(reqId, {
+        instanceId,
+        resolve: (state: any) => {
+          clearTimeout(timeout);
+          this.worldStateWaiters.delete(reqId);
+          resolve(state);
+        },
+      });
+      sim.worker.postMessage({ t: "getWorldState", reqId });
+    });
+  }
+
   /** One input tick from a player (~20 Hz). Payload already sanitized by
-   * the worker; here we only validate the basics to keep it cheap.
-   * v6.2.8: SAVED path - only consumed while the worker runs
-   * PLAYER_NETCODE_MODE=server-sim (the client still streams it so the
-   * server can flip modes without a client redeploy). */
+   * the worker; here we only validate the basics to keep it cheap. */
   input(instanceId: string, socketId: string, payload: Record<string, unknown>): void {
     const sim = this.sims.get(instanceId);
     if (!sim || !sim.ready || sim.disposed) return;
@@ -237,30 +296,6 @@ export class WorldSimManager {
       jump: !!payload.jump,
       sprint: !!payload.sprint,
       yaw: Number(payload.yaw) || 0,
-    });
-  }
-
-  /** v6.2.8: one CLIENT STATE REPORT (the Roblox-style relay, default
-   * mode) - the owning client's own simulation of its character, arriving
-   * every CLIENT_REPORT_INTERVAL_MS. Numbers are coerced here; the
-   * worker runs the actual sanity checks (teleport + speed caps). */
-  report(instanceId: string, socketId: string, payload: Record<string, unknown>): void {
-    const sim = this.sims.get(instanceId);
-    if (!sim || !sim.ready || sim.disposed) return;
-    sim.worker.postMessage({
-      t: "report",
-      socketId,
-      x: Number(payload.x),
-      y: Number(payload.y),
-      z: Number(payload.z),
-      vx: Number(payload.vx) || 0,
-      vy: Number(payload.vy) || 0,
-      vz: Number(payload.vz) || 0,
-      yaw: Number(payload.yaw) || 0,
-      walking: !!payload.walking,
-      sprint: !!payload.sprint,
-      jumping: !!payload.jumping,
-      grounded: !!payload.grounded,
     });
   }
 
@@ -279,6 +314,13 @@ export class WorldSimManager {
     if (!sim || sim.disposed) return;
     sim.disposed = true;
     this.sims.delete(instanceId);
+    // v6.2.7: fail any pending world-state waits for this sim.
+    for (const [reqId, waiter] of Array.from(this.worldStateWaiters)) {
+      if (waiter.instanceId === instanceId) {
+        this.worldStateWaiters.delete(reqId);
+        waiter.resolve(null);
+      }
+    }
     try { sim.worker.terminate(); } catch { /* already gone */ }
   }
 

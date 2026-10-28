@@ -1,15 +1,19 @@
 // ═══════════════════════════════════════════════════════════════════
-// WeildBuild — SERVER-AUTHORITATIVE MULTIPLAYER E2E (v1.1)
+// WeildBuild — ROBLOX-STYLE MULTIPLAYER E2E (v6.2.6)
 // ═══════════════════════════════════════════════════════════════════
 // Full-stack netcode test against the REAL gamehost process:
 //
-//   stub Main (serves the game's encrypted world)  ←  gamehost  ←  2
-//   socket.io clients (Alice + Bob) trading game:input for game:state.
+//   stub Main (serves the game's world)  ←  gamehost  ←  socket.io
+//   clients (Alice + Bob + Carol) trading 0.25 s game:pstate reports
+//   for game:state relays.
 //
-// Verifies the complete authority loop:
-//   ticket auth → game:join → instance sim boot (world fetch + decrypt +
-//   worker) → input → server-side movement/jump physics → snapshots
-//   broadcast to the room → legacy game:move ignored while a sim lives.
+// Verifies the complete v6.2.6 flow:
+//   ticket auth → game:join → instance sim boot → spawn-slot tp flags →
+//   game:syncWorld: FRESH instance answers "skip", a LIVED-IN instance
+//   streams the live world state (settled physics, joints, variables) →
+//   pstate reports relayed to the room (Roblox-style client ownership) →
+//   light checks reject impossible report jumps → legacy game:move still
+//   ignored while a sim lives.
 //
 // Usage: npx tsx tests/test-netcode-e2e.ts
 
@@ -53,7 +57,7 @@ const studioState = {
       children: [], parentId: null, bodyMovers: [], effects: [], rules: [] },
   ],
   joints: [], treeInstances: [], waterBodies: [], terrainLayers: [],
-  globalTimers: [], globalVariables: {}, avatar: {},
+  globalTimers: [], globalVariables: { score: 7 }, avatar: {},
   worldSettings: { maxPlayers: 10, gravity: -35 },
   physicsSettings: { gravity: -35 },
 };
@@ -162,129 +166,115 @@ async function main() {
     assert.ok(instanceId, 'instanceId returned');
     console.log(`✓ instance created: ${instanceId}`);
 
-    // ── 4. Two clients join with real signed tickets ──
+    // ── 4. Alice joins the FRESH instance with a real signed ticket ──
     const ticketA = await signSessionToken('Alice');
-    const ticketB = await signSessionToken('Bob');
     const alice: Socket = io(`http://localhost:${GAMEHOST_PORT}`, {
       transports: ['websocket'], auth: { token: ticketA }, reconnection: false,
     });
-    const bob: Socket = io(`http://localhost:${GAMEHOST_PORT}`, {
-      transports: ['websocket'], auth: { token: ticketB }, reconnection: false,
-    });
-
     alice.on('game:error', (e: any) => { throw new Error(`alice game:error: ${e?.message}`); });
-    bob.on('game:error', (e: any) => { throw new Error(`bob game:error: ${e?.message}`); });
 
     alice.emit('game:join', { instanceId, gameId: 'e2egame1', username: 'Alice', avatar: {} });
-    bob.emit('game:join', { instanceId, gameId: 'e2egame1', username: 'Bob', avatar: {} });
     const playersA: any = await waitEvent(alice, 'game:players', (m: any) => Array.isArray(m) && m.some((p: any) => p.username === 'Alice'));
     assert.ok(playersA.length >= 1, 'alice sees herself in the player list');
-    const both: any = await waitEvent(alice, 'game:players', (m: any) => m.some((p: any) => p.username === 'Bob'));
-    assert.equal(both.length, 2, 'both players in the room list');
     console.log('✓ ticket auth + game:join + player roster');
 
-    // ── 5. The authoritative sim boots: game:state snapshots arrive ──
-    const snap1: any = await waitEvent(alice, 'game:state', (m: any) => Array.isArray(m.players) && m.players.length >= 2, 30000);
+    // ── 5. FRESH instance: game:syncWorld answers "skip" (nothing to sync
+    //    - the published studio state IS the truth) ──
+    alice.emit('game:syncWorld', {});
+    const freshSync: any = await waitEvent(alice, 'game:worldState', (m: any) => m?.fresh === true, 10000);
+    assert.ok(freshSync, 'a fresh instance answers game:worldState {fresh: true}');
+    console.log('✓ fresh instance: world sync skipped (published state is the truth)');
+
+    // ── 6. The authoritative sim boots: game:state snapshots arrive, and
+    //    Alice's first entry carries the spawn-slot tp flag ──
+    const snap1: any = await waitEvent(alice, 'game:state', (m: any) => Array.isArray(m.players) && m.players.some((p: any) => p.username === 'Alice'), 30000);
     const a = snap1.players.find((p: any) => p.username === 'Alice');
-    const b = snap1.players.find((p: any) => p.username === 'Bob');
-    assert.ok(a && b, 'snapshot carries both players');
     assert.equal(a.hp, 100, 'full health');
-    console.log('✓ game:state snapshots flowing (sim booted from the plain world)');
+    assert.ok(a.tp === 1, "the joiner's first entry is tp-flagged (the local body teleports to its spawn slot)");
+    console.log('✓ game:state snapshots flowing + spawn-slot tp flag');
 
-    // Bob must ALSO receive snapshots (room broadcast)
-    const bobSnap: any = await waitEvent(bob, 'game:state', (m: any) => Array.isArray(m.players) && m.players.length >= 2, 10000);
-    assert.ok(bobSnap.players.some((p: any) => p.username === 'Alice'), 'bob sees alice in snapshots');
-    console.log('✓ snapshots broadcast to the whole room');
-
-    // ── 6. The unanchored boulder falls server-side (physics for everyone) ──
+    // ── 7. The unanchored boulder falls server-side (physics for everyone) ──
     const fell = await waitEvent(alice, 'game:state', (m: any) => (m.parts || []).some((p: any) => p.id === 'ball' && p.y < 6), 15000).catch(() => null);
     assert.ok(fell, 'the boulder fell in the authoritative physics');
     console.log('✓ world physics simulated server-side (boulder fell)');
 
-    // ── 7. Alice walks: client reports -> relay -> snapshots ──
-    // v6.2.8 (Roblox-style relay): the client simulates its OWN character
-    // and streams its state every 0.25 s; the server relays it (with the
-    // light sanity checks) to everyone. This test plays the owning client.
+    // ── 8. Bob joins the LIVED-IN instance and asks for the world state:
+    //    he gets the SETTLED boulder position + joints + rule variables,
+    //    not the published snapshot ──
+    const ticketB = await signSessionToken('Bob');
+    const bob: Socket = io(`http://localhost:${GAMEHOST_PORT}`, {
+      transports: ['websocket'], auth: { token: ticketB }, reconnection: false,
+    });
+    bob.on('game:error', (e: any) => { throw new Error(`bob game:error: ${e?.message}`); });
+    bob.emit('game:join', { instanceId, gameId: 'e2egame1', username: 'Bob', avatar: {} });
+    await waitEvent(bob, 'game:players', (m: any) => Array.isArray(m) && m.some((p: any) => p.username === 'Alice') && m.some((p: any) => p.username === 'Bob'));
+
+    // Let the boulder fully settle before the sync ask.
+    await waitEvent(alice, 'game:state', (m: any) => (m.parts || []).some((p: any) => p.id === 'ball' && p.y <= 1.05), 15000).catch(() => null);
+    bob.emit('game:syncWorld', {});
+    const syncedParts: any[] = [];
+    let syncedJoints: any[] | undefined;
+    let syncedVars: Record<string, unknown> | undefined;
+    let syncDone = false;
+    while (!syncDone) {
+      const chunk: any = await waitEvent(bob, 'game:worldState', (m: any) => m && typeof m === 'object' && !m.fresh, 15000);
+      if (Array.isArray(chunk.objects)) syncedParts.push(...chunk.objects);
+      if (Array.isArray(chunk.joints)) syncedJoints = chunk.joints;
+      if (chunk.globalVariables && typeof chunk.globalVariables === 'object') syncedVars = chunk.globalVariables;
+      if (chunk.done) syncDone = true;
+    }
+    assert.ok(syncedParts.length >= 2, `the lived-in sync carries the world parts (got ${syncedParts.length})`);
+    const syncedBall = syncedParts.find((o: any) => o.id === 'ball');
+    assert.ok(syncedBall, 'the boulder record is in the sync');
+    assert.ok(syncedBall.position.y <= 1.05,
+      `the sync carries the SETTLED boulder position (y=${syncedBall.position.y.toFixed(2)}, published was 12)`);
+    assert.ok(!syncedParts.some((o: any) => o.id === 'root'), 'character parts are excluded from the sync');
+    assert.ok(syncedVars && (syncedVars as any).score === 7, 'rule variables ride the sync');
+    console.log(`✓ lived-in sync: ${syncedParts.length} parts, boulder settled at y=${syncedBall.position.y.toFixed(2)}, variables included`);
+
+    // ── 9. Alice walks: her client reports (0.25 s cadence) -> relays ──
     const startX = a.position[0];
-    let clientX = startX;
+    let reportX = startX;
     const walk = setInterval(() => {
-      clientX += 2.7; // 10.8 studs/s * 0.25 s (the real client cadence)
-      alice.emit('game:report', { instanceId, x: clientX, y: 0, z: 0, vx: 10.8, vy: 0, vz: 0, yaw: Math.PI / 2, walking: true, sprint: false, jumping: false, grounded: true });
-    }, 250);
+      reportX += 1.4;
+      alice.emit('game:pstate', { instanceId, x: reportX, y: 0, z: 0, yaw: 0, walking: true, jumping: false, sprint: false });
+    }, 100);
     const moved = await waitEvent(alice, 'game:state',
-      (m: any) => m.players?.some((p: any) => p.username === 'Alice' && p.position[0] > startX + 1), 8000).catch(() => null);
+      (m: any) => m.players?.some((p: any) => p.username === 'Alice' && p.position[0] > startX + 2), 8000).catch(() => null);
     clearInterval(walk);
-    alice.emit('game:report', { instanceId, x: clientX, y: 0, z: 0, vx: 0, vy: 0, vz: 0, yaw: Math.PI / 2, walking: false, sprint: false, jumping: false, grounded: true });
-    assert.ok(moved, `alice moved +X via her own reports (${startX.toFixed(2)} -> ?)`);
+    assert.ok(moved, `alice's reports were relayed (${startX.toFixed(2)} -> ?)`);
     const aMoved = moved.players.find((p: any) => p.username === 'Alice');
-    console.log(`✓ client-report relay: Alice ${startX.toFixed(2)} -> ${aMoved.position[0].toFixed(2)}`);
-    // The relayed velocity rides along (the client's own, echoed back).
-    assert.ok(Array.isArray(aMoved.velocity) && aMoved.velocity.length === 3, 'the report velocity is relayed with the transform');
-    assert.ok(Math.abs(aMoved.velocity[0] - 10.8) < 0.01, `relayed velocity matches the report (${aMoved.velocity[0]})`);
+    assert.strictEqual(aMoved.anim.walking, true, 'the walking flag rides the relay');
+    console.log(`✓ client ownership: Alice's pstate reports relayed (${startX.toFixed(2)} -> ${aMoved.position[0].toFixed(2)}), anim.walking = true`);
 
     // Bob sees Alice move in HIS snapshots too
     const bobSees = await waitEvent(bob, 'game:state',
-      (m: any) => m.players?.some((p: any) => p.username === 'Alice' && p.position[0] > startX + 1), 8000).catch(() => null);
+      (m: any) => m.players?.some((p: any) => p.username === 'Alice' && p.position[0] > startX + 2), 8000).catch(() => null);
     assert.ok(bobSees, 'bob observed alice moving');
     console.log('✓ bob observed alice moving');
 
-    // ── 8. Alice jumps (her client simulates it; the relay just carries it) ──
-    await sleep(250); // clear the flood guard from the walk-stop report
-    alice.emit('game:report', { instanceId, x: clientX, y: 1.4, z: 0, vx: 0, vy: 9.5, vz: 0, yaw: Math.PI / 2, walking: false, sprint: false, jumping: true, grounded: false });
-    const jumped = await waitEvent(alice, 'game:state',
-      (m: any) => m.players?.some((p: any) => p.username === 'Alice' && p.position[1] > 0.8 && p.anim?.jumping === true), 8000).catch(() => null);
-    assert.ok(jumped, 'the relayed jump arc + jumping pose arrived');
-    console.log('✓ jump relayed (position + anim flags)');
+    // ── 10. LIGHT CHECK: an impossible 600-stud report is rejected ──
+    const beforeAttack: any = await waitEvent(alice, 'game:state', (m: any) => Array.isArray(m.players) && m.players.some((p: any) => p.username === 'Alice'), 5000);
+    const axBefore = beforeAttack.players.find((p: any) => p.username === 'Alice').position[0];
+    alice.emit('game:pstate', { instanceId, x: axBefore + 600, y: 0, z: 0, yaw: 0, walking: false, jumping: false, sprint: false });
+    await sleep(400);
+    const afterAttack: any = await waitEvent(alice, 'game:state', (m: any) => Array.isArray(m.players) && m.players.some((p: any) => p.username === 'Alice'), 8000);
+    const axAfter = afterAttack.players.find((p: any) => p.username === 'Alice').position[0];
+    assert.ok(Math.abs(axAfter - axBefore) < 50, `the 600-stud report was rejected (x ${axBefore.toFixed(1)} -> ${axAfter.toFixed(1)})`);
+    console.log('✓ light check: a 600-stud report jump rejected by the authority');
 
-    // ── 8b. v6.2.8 light checks: the 500-stud teleport is rejected ──
-    // (see the next frame that carries Alice: her position stays put)
-    const beforeCheat: any = await waitEvent(alice, 'game:state', (m: any) => Array.isArray(m.players) && m.players.some((p: any) => p.username === 'Alice'), 5000);
-    const axCheat = beforeCheat.players.find((p: any) => p.username === 'Alice').position[0];
-    for (let i = 0; i < 3; i++) {
-      alice.emit('game:report', { instanceId, x: axCheat + 800, y: 0, z: 0, vx: 0, vy: 0, vz: 0, yaw: 0, walking: false, sprint: false, jumping: false, grounded: true });
-      await sleep(200); // over the flood-guard interval so each hits the check
-    }
-    const afterCheat: any = await waitEvent(alice, 'game:state', (m: any) => Array.isArray(m.players) && m.players.some((p: any) => p.username === 'Alice'), 5000);
-    const axAfterCheat = afterCheat.players.find((p: any) => p.username === 'Alice').position[0];
-    assert.ok(Math.abs(axAfterCheat - axCheat) < 10, `500-stud teleport report rejected (x ${axCheat.toFixed(1)} -> ${axAfterCheat.toFixed(1)})`);
-    console.log('✓ light check: a 500-stud jump in one report is rejected');
-
-    // ── 8c. light checks: sustained speed hacking is rejected (and never
-    //      adopted inside a short burst - the streak needs 8+ rejections) ──
-    // A clean report first, so the hack burst's implied speeds are measured
-    // against a fresh baseline clock (a long stall legitimately covers more
-    // ground - the checks must not reject a resumed honest client).
-    alice.emit('game:report', { instanceId, x: axAfterCheat, y: 0, z: 0, vx: 0, vy: 0, vz: 0, yaw: 0, walking: false, sprint: false, jumping: false, grounded: true });
-    let hackX = axAfterCheat;
-    const hack = setInterval(() => {
-      hackX += 150; // 600 studs/s implied - far over the 120 cap
-      alice.emit('game:report', { instanceId, x: hackX, y: 0, z: 0, vx: 0, vy: 0, vz: 0, yaw: 0, walking: true, sprint: false, jumping: false, grounded: true });
-    }, 250);
-    await sleep(1600); // ~6 rejected reports - below the adopt threshold of 8
-    clearInterval(hack);
-    const afterHack: any = await waitEvent(alice, 'game:state', (m: any) => Array.isArray(m.players) && m.players.some((p: any) => p.username === 'Alice'), 5000);
-    const axAfterHack = afterHack.players.find((p: any) => p.username === 'Alice').position[0];
-    assert.ok(Math.abs(axAfterHack - axAfterCheat) < 10, `speed-hack reports rejected (x ${axAfterCheat.toFixed(1)} -> ${axAfterHack.toFixed(1)})`);
-    console.log('✓ light check: sustained 600 studs/s reports are rejected');
-
-    // ── 9. Legacy game:move is IGNORED while a sim lives (anti-cheat) ──
-    // v6.2.2: snapshots are DELTAS (Alice idle = not listed), so wait for
-    // frames that actually carry Alice before comparing her position.
-    const beforeMove: any = await waitEvent(alice, 'game:state', (m: any) => Array.isArray(m.players) && m.players.some((p: any) => p.username === 'Alice'), 5000);
-    const axBefore = beforeMove.players.find((p: any) => p.username === 'Alice').position[0];
+    // ── 11. Legacy game:move is IGNORED while a sim lives (anti-cheat) ──
     alice.emit('game:move', { instanceId, position: [axBefore + 500, 0, 0], rotation: [0, 0, 0] });
     await sleep(400);
-    const afterMove: any = await waitEvent(alice, 'game:state', (m: any) => Array.isArray(m.players) && m.players.some((p: any) => p.username === 'Alice'), 5000);
-    const axAfter = afterMove.players.find((p: any) => p.username === 'Alice').position[0];
-    assert.ok(Math.abs(axAfter - axBefore) < 50, `game:move ignored (x ${axBefore.toFixed(1)} -> ${axAfter.toFixed(1)})`);
+    const afterMove: any = await waitEvent(alice, 'game:state', (m: any) => Array.isArray(m.players) && m.players.some((p: any) => p.username === 'Alice'), 8000);
+    const axAfterMove = afterMove.players.find((p: any) => p.username === 'Alice').position[0];
+    assert.ok(Math.abs(axAfterMove - axAfter) < 50, `game:move ignored (x ${axAfter.toFixed(1)} -> ${axAfterMove.toFixed(1)})`);
     console.log('✓ legacy game:move (client-claimed position) rejected by the authority');
 
-    // ── 10. Leave: player leaves the sim and the roster ──
+    // ── 12. Leave: player leaves the sim and the roster ──
     bob.emit('game:leave', { instanceId });
     const left = await waitEvent(alice, 'game:playerLeft', (m: any) => m.username === 'Bob', 8000).catch(() => null);
     assert.ok(left, 'game:playerLeft fired');
-    // Delta-aware: wait for a frame that still carries Alice (a keyframe)
-    // but no longer Bob - that proves the roster was recomputed post-leave.
     const noBob = await waitEvent(alice, 'game:state',
       (m: any) => Array.isArray(m.players) && m.players.some((p: any) => p.username === 'Alice') && !m.players.some((p: any) => p.username === 'Bob'), 8000).catch(() => null);
     assert.ok(noBob, 'bob gone from snapshots');
@@ -293,7 +283,7 @@ async function main() {
     alice.disconnect();
     bob.disconnect();
 
-    // ── 11. v1.x legacy row (encrypted world_b64) still boots a sim ──
+    // ── 13. v1.x legacy row (encrypted world_b64) still boots a sim ──
     const legacyRes = await fetch(`http://localhost:${GAMEHOST_PORT}/internal/instances`, {
       method: 'POST',
       headers: { 'x-internal-token': INTERNAL_TOKEN, 'content-type': 'application/json' },

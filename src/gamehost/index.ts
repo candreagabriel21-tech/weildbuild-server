@@ -452,6 +452,11 @@ io.on("connection", (socket) => {
     }
 
     socket.join(`instance:${instanceId}`);
+    // v6.2.7: capture BEFORE addPlayer (this joiner makes the instance
+    // "lived-in" itself). Decides whether the joiner later syncs the live
+    // world state (a second player joining a running instance) or skips
+    // (a fresh instance - the published studio state IS the truth).
+    socket.data.joinedLivedIn = instance.everHadPlayers;
     const joined = manager.addPlayer(instanceId, {
       socketId: socket.id,
       username,
@@ -482,15 +487,68 @@ io.on("connection", (socket) => {
     );
   });
 
+  // ── game:pstate { instanceId, x, y, z, yaw, walking, jumping, sprint } ──
+  // v6.2.6: THE player channel of the Roblox-style model. Each client
+  // simulates its OWN character locally (the full singleplayer feel) and
+  // reports its state every 0.25 s; the worker applies light checks
+  // (PLAYER_LIGHT_CHECK_STUDS), keeps the last accepted report as that
+  // player's position, and relays it to everyone else in the snapshots.
+  socket.on("game:pstate", (payload: unknown) => {
+    const p = asRecord(payload);
+    const instance = resolvePlayerInstance(socket.id, p.instanceId);
+    if (!instance) return;
+    if (!instance.players.has(socket.id)) return;
+    socket.data.lastSeen = Date.now(); // duplicate guard liveness
+    worldSims.pstate(instance.id, socket.id, p);
+  });
+
+  // ── game:syncWorld ──
+  // v6.2.7: a joiner asks for the instance's CURRENT full world state
+  // (objects, joints, rule variables) so it starts where everyone else
+  // is - settled physics, rule-created parts, changed colors - instead
+  // of the published snapshot. A FRESH instance (nobody has ever joined,
+  // or a relay-only legacy game with no simulation) answers "skip": the
+  // client keeps the published state it already loaded. The payload is
+  // chunked (750 parts per message) so huge worlds never trip proxy or
+  // socket frame limits.
+  socket.on("game:syncWorld", async () => {
+    const instance = resolvePlayerInstance(socket.id, undefined);
+    if (!instance || !instance.players.has(socket.id)) return;
+    const livedIn = socket.data.joinedLivedIn === true;
+    const state = livedIn && worldSims.hasSim(instance.id)
+      ? await worldSims.requestWorldState(instance.id)
+      : null;
+    if (!state || !Array.isArray(state.objects)) {
+      // Fresh instance, relay-only game, or the worker did not answer:
+      // nothing to sync - the published state is what everyone plays.
+      socket.emit("game:worldState", { fresh: true, done: true });
+      return;
+    }
+    const CHUNK = 750;
+    const total = state.objects.length;
+    for (let i = 0; i < Math.max(1, Math.ceil(total / CHUNK)); i++) {
+      const slice = state.objects.slice(i * CHUNK, (i + 1) * CHUNK);
+      socket.emit("game:worldState", {
+        chunk: i,
+        done: (i + 1) * CHUNK >= total,
+        objects: slice,
+        joints: i === 0 ? state.joints : undefined,
+        globalVariables: i === 0 ? state.globalVariables : undefined,
+      });
+    }
+    console.log(
+      `[gamehost] world sync for ${authName(socket)} on ${instance.id}: ` +
+        `${total} parts, ${state.joints?.length ?? 0} joints, ` +
+        `${Object.keys(state.globalVariables ?? {}).length} variables`
+    );
+  });
+
   // ── game:input { instanceId, x, z, jump, sprint, yaw } ──
-  // v1.1: THE authority channel. Clients report camera-relative input at
-  // 30 Hz with instant flushes on direction/jump/sprint changes (v6.2.5);
-  // the simulation moves every character server-side and the game:state
-  // snapshots carry the truth back. Numbers are sanitized in the worker
-  // (direction clamped to unit length).
-  // v6.2.8: SAVED path - consumed only while the worker runs
-  // PLAYER_NETCODE_MODE=server-sim. The client still streams it so the
-  // server can flip back without a client redeploy.
+  // v6.2.6 LEGACY: the old authority-side movement channel. The server no
+  // longer simulates characters (each client owns its own body now and
+  // reports via game:pstate), so these are accepted and silently ignored -
+  // old clients keep working, their characters simply run client-side
+  // like everyone's.
   socket.on("game:input", (payload: unknown) => {
     const p = asRecord(payload);
     const instance = resolvePlayerInstance(socket.id, p.instanceId);
@@ -498,25 +556,6 @@ io.on("connection", (socket) => {
     if (!instance.players.has(socket.id)) return;
     socket.data.lastSeen = Date.now(); // duplicate guard liveness
     worldSims.input(instance.id, socket.id, p);
-  });
-
-  // ── game:report { instanceId, x, y, z, vx, vy, vz, yaw, walking, sprint,
-  //                 jumping, grounded } ──
-  // v6.2.8: the Roblox-style client-authoritative channel (DEFAULT mode).
-  // Each client simulates its OWN character locally (the singleplayer feel)
-  // and streams its state to the server every 0.25 s. The server applies
-  // tiny light checks (a 500-stud teleport cap + an implied-speed cap),
-  // keeps a kinematic ghost pill so characters still push world physics,
-  // and relays the state to everyone else (whose clients interpolate).
-  // hp / death / respawn / rules remain fully server-owned.
-  socket.on("game:report", (payload: unknown) => {
-    const p = asRecord(payload);
-    if (typeof p.x !== "number" || typeof p.y !== "number" || typeof p.z !== "number") return;
-    const instance = resolvePlayerInstance(socket.id, p.instanceId);
-    if (!instance) return;
-    if (!instance.players.has(socket.id)) return;
-    socket.data.lastSeen = Date.now(); // duplicate guard liveness
-    worldSims.report(instance.id, socket.id, p);
   });
 
   // ── game:click { instanceId, partId } ──

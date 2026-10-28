@@ -182,22 +182,18 @@ async function main(): Promise<void> {
     // (checked implicitly: player must appear in each, else the client
     // prune logic would drop them - verify at least once more here)
 
-    // ── 5. Movement resumes the delta stream ──
-    // v6.2.8: movement is now CLIENT REPORTS (the Roblox-style relay): the
-    // test acts as the owning client, simulating a walk at ~10.8 studs/s and
-    // shipping its position every 250 ms (the real client cadence). The
-    // relay broadcasts one delta per accepted report (~4/s) + keyframes -
-    // a far cry from the old 30 Hz simulated stream, which is the point.
+    // ── 5. Movement resumes the delta stream (v6.2.6: the owning client
+    //    reports its position every 0.25 s - each report changes the relayed
+    //    entry, so deltas flow at the report cadence) ──
     let walkX = 0;
     const walk = setInterval(() => {
-      walkX += 2.7; // 10.8 studs/s * 0.25 s
-      worker.postMessage({ t: 'report', socketId: 's-alice', x: walkX, y: 0, z: 0, vx: 10.8, vy: 0, vz: 0, yaw: Math.PI / 2, walking: true, sprint: false, jumping: false, grounded: true });
+      walkX += 1.4;
+      worker.postMessage({ t: 'pstate', socketId: 's-alice', x: walkX, y: 0, z: 0, yaw: 0, walking: true, jumping: false, sprint: false });
     }, 250);
-    const movingCount = await countSnapshots(worker, 1100);
+    const movingCount = await countSnapshots(worker, 1000);
     clearInterval(walk);
-    worker.postMessage({ t: 'report', socketId: 's-alice', x: walkX, y: 0, z: 0, vx: 0, vy: 0, vz: 0, yaw: Math.PI / 2, walking: false, sprint: false, jumping: false, grounded: true });
-    assert.ok(movingCount >= 3, `moving player streams deltas (got ${movingCount} in 1.1s at the 4 Hz report cadence)`);
-    console.log(`✓ movement resumes the delta stream: ${movingCount} snapshots in 1.1s (report cadence)`);
+    assert.ok(movingCount >= 3, `reporting player streams deltas (got ${movingCount}/s)`);
+    console.log(`✓ reports resume the delta stream: ${movingCount} snapshots in 1s`);
 
     // ── 6. Leave -> full silence again ──
     worker.postMessage({ t: 'playerLeave', socketId: 's-alice' });

@@ -256,6 +256,31 @@ export async function searchUsers(query: string) {
   }
 }
 
+// ─────────────────── FREE STARTER WARDROBE (simplification) ───────────────────
+// Every NEW account now starts owning the entire basic wardrobe — every
+// shirt, every pair of pants, and the friendly face set (all free faces
+// plus the classics: Smile, Surprised Guy, Looking Up, Happy, Fury, Smug
+// and Calm). verifyLogin() also BACKFILLS this set onto existing accounts,
+// so nobody is left without basics now that the shop UI is hidden.
+// To go back to the old 3-item starter kit, empty this list and remove
+// the two call sites (createUser + verifyLogin).
+export const STARTER_ITEMS: string[] = [
+  // every shirt (SHIRT-1 … SHIRT-9, see data/items/)
+  ...Array.from({ length: 9 }, (_, i) => `SHIRT-${i + 1}`),
+  // every pair of pants (PANTS-1 … PANTS-7)
+  ...Array.from({ length: 7 }, (_, i) => `PANTS-${i + 1}`),
+  // the face set: free faces + the classic smiles
+  "FACE-1",  // Smile Face (free)
+  "FACE-7",  // Girl Face (free)
+  "FACE-12", // Sad Face (free)
+  "FACE-4",  // Smug Face
+  "FACE-8",  // Surprised Guy
+  "FACE-9",  // Happy Face
+  "FACE-15", // Looking Up
+  "FACE-19", // Calm Face
+  "FACE-20", // Fury Face
+];
+
 export async function createUser(username: string, password: string) {
   const usernameValidation = validateUsername(username);
   if (!usernameValidation.valid) return { error: usernameValidation.error };
@@ -278,7 +303,7 @@ export async function createUser(username: string, password: string) {
     // accounts keep whatever balance they already have, this value
     // only seeds brand new registrations.
     webuy: 20,
-    items_owned: ["FACE-1", "SHIRT-1", "PANTS-1"],
+    items_owned: [...STARTER_ITEMS],
     friends: [] as string[],
     friend_requests: [] as string[],
     sent_requests: [] as string[],
@@ -323,6 +348,15 @@ export async function verifyLogin(username: string, password: string) {
     user.password = secureHashPassword(password, newSalt);
     user.hash_version = 1;
     await saveUser(username, user);
+  }
+
+  // SIMPLIFICATION (free starter wardrobe): make sure long-lived
+  // accounts ALSO own the free basics — the shop UI is hidden now, so
+  // there is no way to buy them anymore. Idempotent: only writes when
+  // something is actually missing (which after the first login is never).
+  if (!Array.isArray(user.items_owned)) user.items_owned = [];
+  if (!STARTER_ITEMS.every((id) => user.items_owned!.includes(id))) {
+    user.items_owned = [...new Set([...user.items_owned!, ...STARTER_ITEMS])];
   }
 
   user.last_login = new Date().toISOString();

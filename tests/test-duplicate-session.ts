@@ -164,9 +164,10 @@ async function main() {
     assert.equal(roster1.length, 1, 'exactly one Alice in the room after the first join');
     console.log('✓ first Alice joined');
 
-    // Mark her ACTIVE: input packets refresh the socket liveness stamp.
+    // Mark her ACTIVE: state-report packets refresh the socket liveness
+    // stamp (v6.2.6: game:pstate is the player channel now).
     const keepAlive = setInterval(() => {
-      alice1.emit('game:input', { instanceId, x: 0, z: 0, jump: false, sprint: false, yaw: 0 });
+      alice1.emit('game:pstate', { instanceId, x: 0, y: 0, z: 0, yaw: 0, walking: false, jumping: false, sprint: false });
     }, 100);
     await sleep(400);
 

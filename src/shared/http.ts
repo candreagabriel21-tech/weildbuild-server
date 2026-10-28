@@ -79,6 +79,11 @@ export function isAllowedOrigin(origin: string): boolean {
   if (/^https:\/\/[a-z0-9-]+\.onrender\.com$/i.test(clean)) return true;
   // v1.8.0: the Vercel-hosted web app + its deploy previews
   if (/^https:\/\/[a-z0-9-]+\.vercel\.(app|dev)$/i.test(clean)) return true;
+  // Sandbox web previews (space-z.ai): same trust model as the Vercel rule
+  // above — the session cookie is SameSite=Lax (never sent cross-site) and
+  // all auth flows through the X-Session-Token header, which only our own
+  // client ever holds, so a page on such an origin cannot act as anyone.
+  if (/^https:\/\/[a-z0-9-]+\.space-z\.ai$/i.test(clean)) return true;
   return false;
 }
 

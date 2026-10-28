@@ -91,6 +91,7 @@ const studioState = {
 
 async function main(): Promise<void> {
   const worker = new Worker(bundle);
+  let reportTimer: NodeJS.Timeout | null = null;
   try {
     worker.postMessage({ t: 'init', studioState, maxPlayers: 4 });
     await waitMessage(worker, (m) => m?.t === 'ready');
@@ -100,6 +101,15 @@ async function main(): Promise<void> {
     // Bob (join #1) lands on the ring, clear of it.
     worker.postMessage({ t: 'playerJoin', socketId: 's-alice', username: 'Alice' });
     worker.postMessage({ t: 'playerJoin', socketId: 's-bob', username: 'Bob' });
+
+    // v6.2.6: the clients own their characters - Alice's client reports her
+    // standing ON the lava brick (the owning simulation), Bob's reports him
+    // on his ring slot. The authority's touch checks run against the
+    // REPORTED positions, exactly like the real client flow.
+    reportTimer = setInterval(() => {
+      worker.postMessage({ t: 'pstate', socketId: 's-alice', x: 5, y: 0, z: 5, yaw: 0, walking: false, jumping: false, sprint: false });
+      worker.postMessage({ t: 'pstate', socketId: 's-bob', x: 5, y: 0, z: 6.6, yaw: 0, walking: false, jumping: false, sprint: false });
+    }, 250);
 
     const findPlayer = (snap: any, id: string) =>
       Array.isArray(snap?.players) ? snap.players.find((p: any) => p.socketId === id) : undefined;
@@ -153,6 +163,7 @@ async function main(): Promise<void> {
 
     console.log('\n✓ death/respawn + per-player effects: ALL PASS');
   } finally {
+    if (reportTimer) clearInterval(reportTimer);
     worker.postMessage({ t: 'stop' });
     await new Promise((r) => setTimeout(r, 300));
     try { await worker.terminate(); } catch { /* already gone */ }

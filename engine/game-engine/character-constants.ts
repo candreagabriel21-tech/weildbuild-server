@@ -35,43 +35,53 @@ export const SERVER_SIM_HZ = 30;
  * second = smoother motion and fresher data). Delta filtering keeps the
  * bandwidth close to the old 15 Hz idle cost. */
 export const SERVER_SNAPSHOT_HZ = 30;
-/** Client input send rate (Hz). v6.2.5: 20 -> 30 steady state; direction
- * changes and jump presses flush IMMEDIATELY (see reportInput in
- * netcode-bridge) so the authority reacts the moment a key changes. */
-export const CLIENT_INPUT_HZ = 30;
+// ─── v6.2.6: ROBLOX-STYLE CLIENT-AUTHORITATIVE PLAYERS ───
+/** How often each client reports its character state to the server
+ * (Hz). The user's plan: "the server reads client data every 0.25
+ * seconds" - the owning client simulates its own character (full
+ * singleplayer feel) and the server relays the reports to everyone
+ * else, who interpolate between them. */
+export const PLAYER_REPORT_HZ = 4;
+/** Light check (anti-cheat-lite, user-accepted): one report may not move
+ * a player more than this many studs from the last accepted position
+ * (user's example: "moving 500 studs/units in a frame"). Anything past
+ * it is rejected server-side. */
+export const PLAYER_LIGHT_CHECK_STUDS = 500;
 
-// ─── v6.2.8: PLAYER NETCODE MODE (the Roblox-style relay) ───
-//
-// How the gamehost treats PLAYER CHARACTERS:
-//
-//   'client-report' (DEFAULT, the Roblox model)
-//     The owning client simulates its own character (the full local
-//     singleplayer controller) and REPORTS its state to the server on a
-//     fixed heartbeat. The server accepts the report (after tiny light
-//     sanity checks - a hard per-report teleport cap and an implied-speed
-//     cap), keeps a KINEMATIC ghost pill for world interactions (your
-//     character still shoves crates server-side), and relays the state to
-//     everyone else, whose clients interpolate between the 4 Hz samples.
-//     hp / death / respawn / rules stay 100% server-owned. Exploit-prone
-//     by design (client-authoritative positions) - the light checks are
-//     sanity rails, not security.
-//
-//   'server-sim' (SAVED v6.2.5-v6.2.7 behavior)
-//     The server simulates every character itself from the 30 Hz game:input
-//     stream (input -> velocity -> cannon body, coyote-time jumps fired on
-//     message arrival) and broadcasts the simulated transforms. Restore by
-//     running the gamehost with PLAYER_NETCODE_MODE=server-sim - the client
-//     still sends the input stream alongside the reports, so flipping back
-//     needs NO client change (remote characters just render with some extra
-//     interpolation delay until clients catch up).
-export type PlayerNetcodeMode = 'client-report' | 'server-sim';
-export const PLAYER_NETCODE_MODE: PlayerNetcodeMode = 'client-report';
-
-/** How often each client reports its own character state to the server
- * (ms) in client-report mode - "the server reads client data every 0.25
- * seconds". Other players' screens interpolate between these samples, so
- * this is the smoothness/bandwidth dial for REMOTE characters. */
-export const CLIENT_REPORT_INTERVAL_MS = 250;
+/**
+ * v6.2.6: the client-side jump LATCH for reported anim state. The naive
+ * `!grounded && vy > 0` flag flips false at the jump apex and true again
+ * on landing-impact spikes - remote viewers rendered the jump animation
+ * and sound TWICE (the v6.2.4 server bug, now owned by the reporter).
+ * The latch is set by the actual jump impulse and cleared by the first
+ * grounded tick after a 0.15 s grace: exactly one rising edge (the jump)
+ * and one falling edge (the landing) per hop, which the server relays
+ * verbatim and every other client renders.
+ */
+export function createJumpLatch() {
+  let latched = false;
+  let age = 0;
+  return {
+    /** True while the current hop's jump flag should be reported. */
+    value(): boolean {
+      return latched;
+    },
+    /** Call on the frame a REAL jump impulse fires. */
+    onJump(): void {
+      latched = true;
+      age = 0;
+    },
+    /** Call every frame with the grounded flag + dt. */
+    tick(grounded: boolean, dt: number): void {
+      if (!latched) return;
+      age += dt;
+      if (grounded && age > 0.15) {
+        latched = false;
+        age = 0;
+      }
+    },
+  };
+}
 
 /**
  * The shared velocity-integration core. Given the previous horizontal

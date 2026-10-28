@@ -43,6 +43,11 @@ export interface GameInstance {
   createdAt: number;
   /** When the instance became empty (null while players are in it). */
   emptySince: number | null;
+  /** v6.2.7: true once ANY player has ever joined. Decides whether a
+   * joiner syncs the live world state (a lived-in instance has settled
+   * physics, rule-created parts, changed colors) or skips straight to
+   * its own published state (a fresh instance - nothing to sync). */
+  everHadPlayers: boolean;
   players: Map<string, GamePlayer>;
 }
 
@@ -94,6 +99,7 @@ export class GameInstanceManager {
       createdAt: Date.now(),
       // Starts empty: if nobody ever joins, the grace sweeper reclaims it.
       emptySince: Date.now(),
+      everHadPlayers: false,
       players: new Map(),
     };
     this.instances.set(id, instance);
@@ -134,6 +140,7 @@ export class GameInstanceManager {
     if (instance.players.size >= instance.maxPlayers) return null;
     instance.players.set(player.socketId, player);
     instance.emptySince = null;
+    instance.everHadPlayers = true;
     return instance;
   }
 

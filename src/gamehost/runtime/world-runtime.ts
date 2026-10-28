@@ -1,19 +1,42 @@
 // ═══════════════════════════════════════════════════════════════════
-// WeildBuild — SERVER-AUTHORITATIVE world runtime (v1.2)
+// WeildBuild — world runtime (v1.3 — ROBLOX-STYLE PLAYERS)
 // ═══════════════════════════════════════════════════════════════════
 // Runs INSIDE A WORKER THREAD, one per game instance, on the gamehost.
-// It loads the game's studio state, then runs THE SAME ENGINE THE CLIENT
-// RUNS - imported from server/engine (a synced copy of the platform's
-// src/lib, see scripts/build-world-runtime.mjs), bundled by esbuild:
 //
+// WHAT THE SERVER SIMULATES (the authority):
 //   • PhysicsWorld (cannon-es): every unanchored part, terrain, trees,
 //     joints, body movers - simulated for EVERYONE, once.
 //   • The WeildCode rules engine: triggers, timers, actions - the single
 //     authority. Its sound actions are relayed to the players' browsers
 //     (see sounds.ts setSoundSink); its screen messages ride snapshots.
-//   • One character pill hitbox PER PLAYER (PhysicsWorld's named-body
-//     API), driven by the movement math in character-constants.ts - the
-//     exact constants the client prediction uses.
+//   • Player LIFE state: hp, the death animation timer, respawn
+//     positions, rule teleports, void deaths.
+//
+// WHAT IT DOES *NOT* SIMULATE ANYMORE (v6.2.6, user's "better plan"):
+//   • CHARACTER MOVEMENT. The legacy server-side character simulation
+//     (game:input -> pill physics per player) is SAVED at
+//     world-runtime.legacy-player-sim.v625.ts.bak and DISABLED.
+//     Instead - exactly like Roblox's network ownership - each client
+//     simulates its OWN character locally (the full singleplayer feel:
+//     instant input, local walls, local jumps) and REPORTS its state to
+//     this worker every 0.25 s (PLAYER_REPORT_HZ, message 'pstate').
+//     The server keeps the last ACCEPTED report as that player's
+//     position (interest management, when_touched('player'), rule
+//     proximity, the roster other clients interpolate from).
+//
+// LIGHT CHECKS (anti-cheat-lite, user-accepted: "nobody cares"):
+//   A report is REJECTED (previous position kept) when it contains
+//   non-finite numbers or moves the player more than
+//   PLAYER_LIGHT_CHECK_STUDS from the last accepted position in one
+//   0.25 s period (user's example: 500 studs). Reports are also ignored
+//   while dying (the authority owns the transform then). This is a
+//   sanity rail, not anti-cheat.
+//
+// FORCED POSITIONS (the authority still moves players sometimes):
+//   Spawn slots, respawns and teleport_player rules set a pending tp;
+//   the next snapshot carries the new position flagged `tp: 1` so the
+//   OWNER teleports its local body and everyone else snaps (never
+//   glides) across the map.
 //
 // WHY A WORKER: the platform modules are module-level singletons (one
 // zustand store, one engine instance). A worker per instance gives every
@@ -24,15 +47,16 @@
 //   →  { t: 'init', studioState, maxPlayers }
 //     { t: 'playerJoin', socketId, username }
 //     { t: 'playerLeave', socketId }
-//     { t: 'input', socketId, x, z, jump, sprint, yaw }   (SAVED server-sim)
-//     { t: 'report', socketId, x, y, z, vx, vy, vz, yaw,  (v6.2.8 default)
-//       walking, sprint, jumping, grounded }
+//     { t: 'pstate', socketId, x, y, z, yaw, walking, jumping, sprint }
+//         (v6.2.6: the 0.25 s client state report - replaces 'input')
+//     { t: 'input', socketId, ... }   (LEGACY - accepted + ignored)
 //     { t: 'click', socketId, partId }
-//     { t: 'chat', username, message }        (Phase 5: chat rules)
+//     { t: 'chat', username, message }
+//     { t: 'getWorldState', reqId }   (v6.2.7: full-state sync for joiners)
 //     { t: 'stop' }
 //   ←  { t: 'ready' }
 //     { t: 'snapshot', seq, players, parts, partUpdates, fx, messages }
-//     { t: 'error', message }
+//     { t: 'worldState', reqId, objects, joints, globalVariables }
 //
 // This file is NOT compiled by the server's tsc - scripts/build-world-
 // runtime.mjs bundles it (and the engine/ sources it imports) with esbuild
@@ -63,72 +87,63 @@ if (typeof (globalThis as any).requestAnimationFrame !== 'function') {
 interface RuntimePlayer {
   socketId: string;
   username: string;
-  input: { x: number; z: number; jump: boolean; sprint: boolean; yaw: number };
-  hp: number;
-  dyingTimer: number;   // > 0 while the death animation plays
-  jumpCooldown: number;
-  /** v6.2.4: latched "airborne because of a jump" flag. The old
-   * velocity-y-threshold jumping flag flipped false at the apex and (much
-   * worse) flipped TRUE again for a tick when the landing impact resolved
-   * with a small upward velocity spike - every client rendered the jump
-   * animation and played the jump sound TWICE (once at the jump, once at
-   * landing). The latch is set by the actual jump impulse and cleared by
-   * the first grounded tick after a short grace, so its rising edge IS the
-   * jump and its falling edge IS the landing. */
-  airborneFromJump: boolean;
-  /** Seconds since the jump impulse set airborneFromJump (grace timer). */
-  jumpAge: number;
-  velX: number;         // smoothed horizontal velocity (prediction mirror)
-  velZ: number;
+  // ─── v6.2.6: REPORTED state (the owning client simulates the character) ───
+  /** Feet position from the last ACCEPTED 0.25 s report (or forced tp). */
+  x: number;
+  y: number;
+  z: number;
+  /** Body yaw (radians) from the last accepted report. */
   yaw: number;
-  /** v6.2.5: simClock when grounded last held (coyote-time jumps). The
-   * old relative accumulator (lastGroundedAt += dt) only worked inside
-   * stepSim; the absolute clock lets the input handler honor coyote time
-   * the instant a jump message arrives, not one tick later. */
-  lastGroundedClock: number;
-  touched: Set<string>; // part ids currently touched (when_touched re-arm)
-
-  // ─── v6.2.8: CLIENT-REPORT state (PLAYER_NETCODE_MODE=client-report) ───
-  // The owning client simulates its own character and streams its state;
-  // this is the last ACCEPTED report (what gets broadcast + where the
-  // kinematic ghost pill sits between reports).
-  report: {
-    x: number; y: number; z: number;       // FEET position (client-authoritative)
-    yaw: number;
-    vx: number; vy: number; vz: number;     // the client's own velocity
-    walking: boolean; sprint: boolean; jumping: boolean; grounded: boolean;
-  };
-  /** Wall-clock ms of the last ACCEPTED report (0 = none yet; also the
-   * baseline clock for the implied-speed sanity check). */
-  lastReportAt: number;
-  /** Wall-clock ms until which reports are dropped wholesale - armed by
-   * server-initiated moves (respawn, rule teleports) so the client's
-   * in-flight reports from the OLD position cannot drag the player back. */
-  ignoreReportsUntil: number;
-  /** Consecutive REJECTED reports (speed/teleport caps). The relay must
-   * never permanently freeze a diverged client, so after enough consecutive
-   * rejections the server ADOPTS the client's claim (positions are
-   * client-authoritative by design; the checks are sanity rails). */
-  rejectStreak: number;
+  /** Anim flags exactly as the owner reported them (relayed verbatim -
+   * the owner's jump latch produces exactly one edge per hop). */
+  walking: boolean;
+  jumping: boolean;
+  sprint: boolean;
+  /** Authority-owned life state. */
+  hp: number;
+  /** > 0 while the death animation plays; respawn fires when it expires. */
+  dyingTimer: number;
+  /** Forced position waiting to ride the next snapshot (spawn slot /
+   * respawn / teleport rule). Consumed when broadcast. */
+  pendingTp: { x: number; y: number; z: number } | null;
+  /** simClock time until which below-voidY reports are treated as stale
+   * leftovers of the death that just ended (see RESPAWN_VOID_GRACE_SECONDS). */
+  respawnGraceUntil: number;
+  /** Consecutive rejected reports (light-check strikes - diagnostics). */
+  strikes: number;
+  /** Part ids currently touched (when_touched re-arm). */
+  touched: Set<string>;
 }
 
 const SIM_HZ = 30;
-// v6.2.5: 15 -> 30. Clients render every character (your own included)
-// purely from interpolated snapshot samples, so the stream density IS the
-// smoothness: 33 ms spacing with a 100-150 ms render delay always spans
-// 3+ live samples. Delta filtering keeps the idle cost at the old 15 Hz
-// level (unchanged players are simply not listed).
+// Parts + player entries stream in DELTA snapshots at 30 Hz. Player
+// entries only actually change when a 0.25 s report lands (4 Hz per
+// player), so the wire cost stays tiny while parts keep the dense
+// stream client-side interpolation runs on.
 const SNAPSHOT_HZ = 30;
 // v6.2.1: aligned with the client's DEATH_DURATION (StudioPlayViewport
 // startDeath) - the local and remote death animations now end together with
 // the server-side respawn, so the body reappears exactly at the spawn point
 // instead of 0.45s of dead air.
 const DEATH_ANIMATION_SECONDS = 1.35;
-/** Coyote time: a jump still counts this long after leaving the ground.
- * Matches the client's prediction (coyoteTimer 0.1s) so the authority never
- * denies a jump the client already predicted (that was the jump
- * rubber-band: client jumps, server disagrees, next snapshot yanks back). */
-const JUMP_COYOTE_SECONDS = 0.1;
+// ─── v6.2.6: Roblox-style report cadence + light checks ───
+/** How often each client reports its character state (0.25 s). */
+const PLAYER_REPORT_HZ = 4;
+/** Light check: one report may not move the player more than this many
+ * studs from the last accepted position (user: "moving 500 studs in a
+ * frame"). Generous by design - it catches blatant teleports, nothing
+ * else. Terminal fall (50 studs/s) covers 12.5 studs per period. */
+const PLAYER_LIGHT_CHECK_STUDS = 500;
+/** v6.2.9 VOID DOUBLE-DEATH FIX: after the authority respawns a player,
+ * the owner's in-flight 0.25 s reports can still carry the DEATH SPOT
+ * (below voidY) for a network-beat - its local death animation ends
+ * slightly after ours, and the dyingTimer guard has already flipped to
+ * 0. Those stale reports used to re-arm the void check and kill the
+ * player a SECOND time at the spawn point (double explosion + double
+ * death wait, user report). During this grace window after a respawn,
+ * reports that would drag the record back into the void are dropped
+ * (a genuinely post-teleport report is above voidY by definition). */
+const RESPAWN_VOID_GRACE_SECONDS = 0.75;
 
 // ─── v6.2.2: idle + interest management ───
 /** Parts farther than this from EVERY player are not streamed in
@@ -139,7 +154,7 @@ const INTEREST_RADIUS = Math.max(80, Number(process.env.WORLD_INTEREST_RADIUS) |
 const INTEREST_RADIUS_SQ = INTEREST_RADIUS * INTEREST_RADIUS;
 /** Every player is re-broadcast at least this often (a keyframe) even
  * when nothing about them changed, so late joiners and drifted clients
- * self-heal. With 15 Hz deltas this trims idle traffic by ~97%. */
+ * self-heal. With delta snapshots this trims idle traffic by ~97%. */
 const PLAYER_KEYFRAME_SECONDS = 2;
 /** How often moving parts are written back into the store for the rules
  * engine. The CLIENT does this at 4 Hz; the worker used to do it at
@@ -180,55 +195,6 @@ async function main(): Promise<void> {
   const { restoreStudioState } = await import('../../../engine/studio-project');
   const { weildCodeEngine } = await import('../../../engine/weildcode-engine');
   const { PhysicsWorld } = await import('../../../engine/game-engine/physics');
-  const { setSoundSink } = await import('../../../engine/sounds');
-  const {
-    stepHorizontalVelocity, applyJump,
-    ACCEL_WALK, ACCEL_STOP, AIR_RELEASE_DECAY, AIR_MOVE_FACTOR,
-  } = await import('../../../engine/game-engine/character-constants');
-  // v6.2.8: the player netcode mode default + report cadence (shared with
-  // the client - see PLAYER_MODE above and character-constants.ts).
-  const {
-    PLAYER_NETCODE_MODE: PLAYER_NETCODE_MODE_DEFAULT,
-    CLIENT_REPORT_INTERVAL_MS,
-  } = await import('../../../engine/game-engine/character-constants');
-
-  // ─── v6.2.8: PLAYER NETCODE MODE (the Roblox-style relay) ───
-  // Default comes from the SHARED character-constants ('client-report'); the
-  // gamehost env PLAYER_NETCODE_MODE=server-sim restores the saved v6.2.5-
-  // v6.2.7 server-side character simulation (kept fully intact below - every
-  // old path is gated on this flag, nothing was deleted).
-  const PLAYER_NETCODE_MODE_ENV = process.env.PLAYER_NETCODE_MODE;
-  const PLAYER_MODE: 'client-report' | 'server-sim' =
-    PLAYER_NETCODE_MODE_ENV === 'server-sim' ? 'server-sim'
-      : PLAYER_NETCODE_MODE_ENV === 'client-report' ? 'client-report'
-        : PLAYER_NETCODE_MODE_DEFAULT;
-
-  // The relay's TINY LIGHT CHECKS (explicitly not security - the platform
-  // has no players to protect; these keep absurd garbage out of the stream):
-  /** Flood guard: reports closer together than this are dropped (the
-   * heartbeat is CLIENT_REPORT_INTERVAL_MS; half of it is the tolerance). */
-  const REPORT_MIN_INTERVAL_MS = Math.max(60, CLIENT_REPORT_INTERVAL_MS * 0.5);
-  /** The user's example check: a single report moving the character further
-   * than this from the last accepted position is rejected outright (500
-   * studs in one frame is never legitimate). */
-  const REPORT_MAX_JUMP_STUDS = 500;
-  /** Implied speed cap (studs/s): dist / max(reportInterval, timeSinceLast).
-   * Generously above every legit character motion (sprint ~18.4, terminal
-   * fall 50) so normal play - including long falls just above the void
-   * line - never trips it. */
-  const REPORT_SPEED_TOLERANCE = 120;
-  /** Cap on the dt used for the implied-speed math, so a long network stall
-   * cannot silently whitelist a huge jump (the hard cap above still applies). */
-  const REPORT_SPEED_DT_CAP_S = 5;
-  /** Consecutive rejections before the relay ADOPTS the client's position
-   * (client-authoritative by design - the checks are rails, not judges). */
-  const REPORT_REJECT_ADOPT = 8;
-  /** After a server-initiated move (respawn / rule teleport) reports are
-   * dropped for this long, covering the client's snap + next heartbeat. */
-  const TELEPORT_REPORT_GRACE_MS = 1200;
-  /** Terminal fall speed for the kinematic ghost's dead-reckoned arc
-   * (matches the client's own clamp). */
-  const GHOST_TERMINAL_VELOCITY = 50;
 
   type StudioPart = import('../../../engine/studio-store').StudioPart;
 
@@ -264,7 +230,11 @@ async function main(): Promise<void> {
     },
   });
 
-  // ─── Build the physics world (mirrors the client's PhysicsSimulation) ───
+  // ─── Build the physics world (parts, terrain, trees - NOT players) ───
+  // v6.2.6: no character pills exist on the server anymore. The owning
+  // clients simulate their characters; parts therefore do not collide
+  // with server-side player hitboxes (the classic network-ownership
+  // tradeoff the user accepted).
   const physicsSettings = useStudioStore.getState().physicsSettings;
   const world = new PhysicsWorld(physicsSettings);
 
@@ -301,10 +271,18 @@ async function main(): Promise<void> {
   const spawnFeet = characterRoot
     ? { x: characterRoot.position.x, y: characterRoot.position.y - characterRoot.size.y / 2, z: characterRoot.position.z }
     : { x: spawnPoint.x, y: spawnPoint.y, z: spawnPoint.z };
+  // Pill dims for touch checks / void checks (same clamps the client's
+  // createCharacterPillBody applies - see physics.ts).
+  const playerHeight = rootSize ? Math.max(0.4, Math.min(64, rootSize.y)) : 2;
+  const playerHalfW = rootSize
+    ? Math.max(0.05, Math.min(32, Math.min(rootSize.x, rootSize.z) / 2))
+    : 0.4;
 
   // Spawn spacing: joining players land on a widening ring around the
-  // spawn point (like classic lobby games) so overlapping pill hitboxes
-  // never shove each other around on join.
+  // spawn point (like classic lobby games) so overlapping characters
+  // never spawn inside each other on join. The slot reaches the client
+  // as its first `tp` (the local body teleports there behind the load
+  // curtain, before the player can even see the world).
   let joinCounter = 0;
   function spawnSlot(i: number): { x: number; y: number; z: number } {
     if (i === 0) return { ...spawnFeet };
@@ -322,76 +300,111 @@ async function main(): Promise<void> {
 
   function addPlayer(socketId: string, username: string): void {
     const slot = spawnSlot(joinCounter++);
-    world.addNamedCharacterBody(socketId, slot, { size: rootSize, rotationDeg: rootRot });
-    // v6.2.8: in client-report mode the named pill is a KINEMATIC GHOST -
-    // the owning client streams its own transform, and this pill only
-    // dead-reckons the reported velocity so the character still pushes
-    // parts (crates, plates) server-side for everyone. Nothing server-side
-    // can ever fight the owning client for the character's position.
-    if (PLAYER_MODE === 'client-report') {
-      world.setNamedCharacterKinematic(socketId, true);
-    }
     players.set(socketId, {
       socketId,
       username,
-      input: { x: 0, z: 0, jump: false, sprint: false, yaw: 0 },
+      x: slot.x,
+      y: slot.y,
+      z: slot.z,
+      yaw: rootRot?.y ? (rootRot.y * Math.PI) / 180 : 0,
+      walking: false,
+      jumping: false,
+      sprint: false,
       hp: useStudioStore.getState().playState.characterMaxHealth || 100,
       dyingTimer: 0,
-      jumpCooldown: 0,
-      airborneFromJump: false,
-      jumpAge: 0,
-      velX: 0,
-      velZ: 0,
-      yaw: rootRot?.y ? (rootRot.y * Math.PI) / 180 : 0,
-      lastGroundedClock: 0,
+      pendingTp: slot, // the joiner's local body teleports to its slot
+      respawnGraceUntil: 0,
+      strikes: 0,
       touched: new Set(),
-      // v6.2.8: the report state starts at the assigned spawn slot (what
-      // late joiners see until the owner's first heartbeat lands, ~0.25 s).
-      report: {
-        x: slot.x, y: slot.y, z: slot.z,
-        yaw: rootRot?.y ? (rootRot.y * Math.PI) / 180 : 0,
-        vx: 0, vy: 0, vz: 0,
-        walking: false, sprint: false, jumping: false, grounded: true,
-      },
-      lastReportAt: 0,
-      ignoreReportsUntil: 0,
-      rejectStreak: 0,
     });
   }
 
   function removePlayer(socketId: string): void {
-    world.removeNamedCharacterBody(socketId);
     players.delete(socketId);
     lastPlayerBroadcast.delete(socketId); // v6.2.2: drop its delta state
   }
 
-  function respawn(p: RuntimePlayer): void {
-    world.teleportNamedCharacterBody(p.socketId, spawnFeet);
-    p.hp = useStudioStore.getState().playState.characterMaxHealth || 100;
-    p.velX = 0;
-    p.velZ = 0;
-    p.dyingTimer = 0;
-    // A respawned body is FRESH (same semantics as a join): every
-    // when_touched trigger re-arms, so spawning ON a trigger part fires it
-    // again. v6.2.8: in client-report mode the kinematic ghost never gets
-    // the solver "pop" a dynamic body had, so without this the re-arm only
-    // worked by accident of the physics settle.
-    p.touched.clear();
-    // v6.2.8: the relay baseline follows the respawn (the client snaps its
-    // local body to the same spot on the dying falling edge), and in-flight
-    // reports from the death spot are dropped for the grace window so they
-    // cannot drag the player back to where they died.
-    if (PLAYER_MODE === 'client-report') {
-      p.report = {
-        x: spawnFeet.x, y: spawnFeet.y, z: spawnFeet.z,
-        yaw: p.report.yaw,
-        vx: 0, vy: 0, vz: 0,
-        walking: false, sprint: false, jumping: false, grounded: true,
-      };
-      p.lastReportAt = Date.now();
-      p.ignoreReportsUntil = Date.now() + TELEPORT_REPORT_GRACE_MS;
-      p.rejectStreak = 0;
+  /** v6.2.6: accept (or reject) one 0.25 s state report from a client. */
+  function acceptReport(p: RuntimePlayer, m: any): void {
+    const x = Number(m.x), y = Number(m.y), z = Number(m.z);
+    // Light check 1: garbage in, garbage OUT (never into the world state).
+    if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(z)) {
+      p.strikes++;
+      return;
     }
+    // While dying the authority owns the transform (the death spot).
+    if (p.dyingTimer > 0) return;
+    // v6.2.9 VOID DOUBLE-DEATH FIX: a just-respawned player's in-flight
+    // reports can still carry the pre-respawn death spot (below voidY) -
+    // the client's local death animation ends a network-beat after ours.
+    // Drop below-void reports during the grace window instead of letting
+    // them re-arm the void check (which killed the player a second time
+    // at the spawn point). No strike: the report is stale, not malicious.
+    if (simClock < p.respawnGraceUntil && y + playerHeight / 2 < world.voidY) return;
+    // Light check 2 (user's example): a report may not teleport the
+    // player more than PLAYER_LIGHT_CHECK_STUDS in one 0.25 s period.
+    const dx = x - p.x, dy = y - p.y, dz = z - p.z;
+    if (dx * dx + dy * dy + dz * dz > PLAYER_LIGHT_CHECK_STUDS * PLAYER_LIGHT_CHECK_STUDS) {
+      p.strikes++;
+      return;
+    }
+    p.strikes = 0;
+    p.x = x;
+    p.y = y;
+    p.z = z;
+    const yaw = Number(m.yaw);
+    if (Number.isFinite(yaw)) p.yaw = yaw;
+    p.walking = !!m.walking;
+    p.jumping = !!m.jumping;
+    p.sprint = !!m.sprint;
+    // Best-effort: keep the shared playState.characterPosition near the
+    // player for rules that read it (teleport_player relative, proximity
+    // checks). With one player (the common case) this is exact; with
+    // several it is last-reporter-wins until an actor-specific event
+    // (click/touch/chat) refreshes it - see setEngineActorPos.
+    if (players.size === 1) {
+      useStudioStore.getState().setPlayState({
+        characterPosition: { x, y, z },
+      });
+    }
+  }
+
+  /** Refresh playState.characterPosition for the ACTING player right
+   * before the engine runs its triggers (rules that read "the player's
+   * position" - teleport_player with relative axes etc.). */
+  function setEngineActorPos(username: string | undefined): void {
+    if (!username) return;
+    for (const p of players.values()) {
+      if (p.username === username) {
+        useStudioStore.getState().setPlayState({
+          characterPosition: { x: p.x, y: p.y, z: p.z },
+        });
+        return;
+      }
+    }
+  }
+
+  function respawn(p: RuntimePlayer): void {
+    p.hp = useStudioStore.getState().playState.characterMaxHealth || 100;
+    p.dyingTimer = 0;
+    p.pendingTp = { ...spawnFeet }; // the owner teleports; others snap
+    // v6.2.8 DOUBLE-DEATH FIX: move the SERVER's record of the player to
+    // the spawn point too (pendingTp alone only fixes the BROADCAST). The
+    // old code left p.x/p.y/p.z at the death spot — for a VOID death that
+    // is still below voidY, so the void check in the very same stepSim
+    // frame re-killed the just-respawned player: they exploded a SECOND
+    // time at the spawn point and waited through another full death
+    // animation ("you die again when you respawn" + the delayed respawn).
+    p.x = spawnFeet.x;
+    p.y = spawnFeet.y;
+    p.z = spawnFeet.z;
+    p.walking = false;
+    p.jumping = false;
+    p.sprint = false;
+    // v6.2.9: the record fix above is not enough on its own - the owner's
+    // in-flight reports still carry the death spot for a network-beat
+    // after this (see RESPAWN_VOID_GRACE_SECONDS). Arm the grace window.
+    p.respawnGraceUntil = simClock + RESPAWN_VOID_GRACE_SECONDS;
   }
 
   // ─── v6.2.1: per-player rule effects ───
@@ -404,6 +417,9 @@ async function main(): Promise<void> {
     if (p.dyingTimer <= 0 && p.hp > 0) {
       p.hp = 0;
       p.dyingTimer = DEATH_ANIMATION_SECONDS; // respawn fires when it expires
+      // The dead touch nothing: clearing the set re-arms when_touched for
+      // the respawned body (standing on the same lava kills you AGAIN).
+      p.touched.clear();
     }
   }
 
@@ -448,24 +464,15 @@ async function main(): Promise<void> {
         break;
       case 'teleport':
         if (e.position) {
-          world.teleportNamedCharacterBody(p.socketId, { x: e.position.x, y: e.position.y, z: e.position.z });
-          p.velX = 0;
-          p.velZ = 0;
-          // v6.2.8: the relay baseline follows the rule teleport; the
-          // client learns about it from the next snapshot (its drift valve
-          // snaps the local body), and in-flight reports from the old spot
-          // are dropped for the grace window so they cannot undo the rule.
-          if (PLAYER_MODE === 'client-report') {
-            p.report = {
-              x: e.position.x, y: e.position.y, z: e.position.z,
-              yaw: p.report.yaw,
-              vx: 0, vy: 0, vz: 0,
-              walking: false, sprint: false, jumping: false, grounded: true,
-            };
-            p.lastReportAt = Date.now();
-            p.ignoreReportsUntil = Date.now() + TELEPORT_REPORT_GRACE_MS;
-            p.rejectStreak = 0;
-          }
+          // v6.2.6: forced position - the owner's local body teleports
+          // when the tp flag reaches it; others snap via the >20-stud
+          // interpolation rule.
+          p.x = e.position.x;
+          p.y = e.position.y;
+          p.z = e.position.z;
+          p.pendingTp = { x: e.position.x, y: e.position.y, z: e.position.z };
+          p.walking = false;
+          p.jumping = false;
         }
         break;
     }
@@ -473,9 +480,10 @@ async function main(): Promise<void> {
 
   // ─── Rules engine: sound relay + screen message relay ───
   const fxOut: Array<{ name: string; volume: number }> = [];
-  setSoundSink((name, volume) => {
+  const soundRelay = (name: string, volume: number) => {
     if (fxOut.length < 64) fxOut.push({ name, volume: Math.max(0, Math.min(1, volume)) });
-  });
+  };
+  try { (await import('../../../engine/sounds')).setSoundSink(soundRelay); } catch { /* sounds module optional */ }
 
   const messagesOut: any[] = [];
   useStudioStore.subscribe((state: any, prev: any) => {
@@ -509,6 +517,11 @@ async function main(): Promise<void> {
   // Rule-driven full updates: zustand replaces objects on write, so a
   // reference change on a part our transform sync did NOT touch means a
   // rule edited it - broadcast the whole part so client stores converge.
+  // v6.2.7: the diff ALSO detects DELETED parts (ids that vanished from
+  // the store) and NEW parts (ids that appeared) - deletions were never
+  // broadcast before, so a rule deleting a part left a ghost on every
+  // connected client, and rule-created parts never reached clients whose
+  // updateObject no-ops on unknown ids (clients now addObject for those).
   let lastObjectsRef: Map<string, any> | null = null;
   const partUpdatesOut: any[] = [];
   const ourSyncIds = new Set<string>();
@@ -531,7 +544,7 @@ async function main(): Promise<void> {
   let slowPassAccum = 0;            // 0.5 s body add/remove/anchored sync
   let sleepPassAccum = 0;           // 0.33 s far-body sleep/wake pass
 
-  // ─── Input / click / chat from the host ───
+  // ─── Input / click / chat / reports from the host ───
   parentPort!.on('message', (m: any) => {
     if (!m || typeof m !== 'object') return;
     if (m.t === 'playerJoin' && typeof m.socketId === 'string') {
@@ -554,44 +567,51 @@ async function main(): Promise<void> {
       if (leaving) {
         try { weildCodeEngine.handlePlayerLeft(leaving.username); } catch { /* never kill the sim */ }
       }
+    } else if (m.t === 'pstate' && typeof m.socketId === 'string') {
+      // ─── v6.2.6: the 0.25 s client state report (THE player channel) ───
+      const p = players.get(m.socketId);
+      if (p) acceptReport(p, m);
     } else if (m.t === 'input' && typeof m.socketId === 'string') {
-      // ─── v6.2.8: SAVED server-sim input path (PLAYER_NETCODE_MODE=server-sim).
-      // In client-report mode (the default) the 30 Hz input stream is simply
-      // not consumed for movement - the owning client's state reports (below)
-      // are the character's authority. The code is kept fully intact so the
-      // env flag restores the v6.2.5-v6.2.7 behavior with zero code changes.
-      if (PLAYER_MODE !== 'server-sim') return;
-      const p = players.get(m.socketId);
-      if (!p) return;
-      // Sanitize: numbers only, direction clamped to unit length.
-      let x = Number(m.x) || 0;
-      let z = Number(m.z) || 0;
-      const len = Math.hypot(x, z);
-      if (len > 1) { x /= len; z /= len; }
-      if (p.dyingTimer <= 0) {
-        p.input = { x, z, jump: !!m.jump, sprint: !!m.sprint, yaw: Number(m.yaw) || 0 };
-        // v6.2.5: "the server takes input almost instantly" - a jump press
-        // fires THE MOMENT the message arrives instead of waiting for the
-        // next simulation tick (up to 33 ms). Steering input is consumed by
-        // stepSim at the next tick (<= 33 ms), which is the physics cadence
-        // anyway.
-        if (m.jump) tryJump(p);
-      }
-    } else if (m.t === 'report' && typeof m.socketId === 'string') {
-      // ─── v6.2.8: CLIENT REPORT (the Roblox-style relay, default mode) ───
-      // The owning client simulated its own character this past 0.25 s and
-      // tells us where it ended up. Light sanity checks, then the report
-      // becomes the broadcast state + drives the kinematic ghost pill.
-      const p = players.get(m.socketId);
-      if (!p) return;
-      try { applyReport(p, m); } catch { /* a malformed report must never kill the sim */ }
+      // v6.2.6 LEGACY: the old input-driven character simulation is SAVED
+      // (world-runtime.legacy-player-sim.v625.ts.bak) and disabled - the
+      // client simulates its own character now. Old clients still sending
+      // game:input are simply ignored (they also send pstate; nothing
+      // breaks, their character just runs client-side like everyone's).
     } else if (m.t === 'click' && typeof m.partId === 'string') {
       // v6.2.1: the clicker's username rides along so player-targeting
       // rules (kill/heal/damage/teleport) hit THEM, not the whole room.
-      try { weildCodeEngine.handleClick(m.partId, typeof m.username === 'string' ? m.username : undefined); } catch { /* rules must never kill the sim */ }
+      const username = typeof m.username === 'string' ? m.username : undefined;
+      setEngineActorPos(username);
+      try { weildCodeEngine.handleClick(m.partId, username); } catch { /* rules must never kill the sim */ }
     } else if (m.t === 'chat' && typeof m.message === 'string') {
       // v1.5: game rules - on_chat_message (optional username/contains filters).
-      try { weildCodeEngine.handleChatMessage(String(m.username || 'Player'), String(m.message)); } catch { /* never kill the sim */ }
+      const username = String(m.username || 'Player');
+      setEngineActorPos(username);
+      try { weildCodeEngine.handleChatMessage(username, String(m.message)); } catch { /* never kill the sim */ }
+    } else if (m.t === 'getWorldState') {
+      // ─── v6.2.7: full-state sync for a late joiner ───
+      // The gamehost only asks when the instance was already lived-in
+      // (a fresh instance has nothing to sync - the published studio
+      // state IS the truth). Sends every non-character part record with
+      // the LIVE physics transforms, plus joints and global variables.
+      const objects: any[] = [];
+      useStudioStore.getState().objects.forEach((obj: any) => {
+        if (!isPart(obj) || obj.isCharacterPart || obj.isCharacterRoot) return;
+        const rec: any = { ...obj };
+        const pb = world.bodies.get(obj.id);
+        if (pb) {
+          rec.position = { x: pb.position.x, y: pb.position.y, z: pb.position.z };
+          rec.rotation = { x: pb.rotation.x, y: pb.rotation.y, z: pb.rotation.z };
+        }
+        objects.push(rec);
+      });
+      post({
+        t: 'worldState',
+        reqId: m.reqId,
+        objects,
+        joints: useStudioStore.getState().joints,
+        globalVariables: useStudioStore.getState().globalVariables,
+      });
     } else if (m.t === 'stop') {
       shutdown();
     }
@@ -612,10 +632,13 @@ async function main(): Promise<void> {
     // when_touched('player'): fire on the parts each player overlaps,
     // once per contact (enter fires, leave re-arms) - the same semantics
     // as the client's collisionParts loop.
+    // v6.2.6: positions come from the ACCEPTED 0.25 s reports (there is
+    // no server-side pill anymore). A player standing on lava stays
+    // overlapped in every report until they leave, so the once-per-contact
+    // semantics still hold at report cadence.
     // v6.2.2 PERF: the candidate list is built ONCE per tick straight
     // from the physics bodies (current to THIS step, not the 7 Hz store
-    // write-back) instead of re-walking the whole store PER PLAYER -
-    // with 10 players that alone was a 10x multiplier on every object.
+    // write-back) instead of re-walking the whole store PER PLAYER.
     const candidates: Array<{ id: string; x: number; y: number; z: number; hx: number; hy: number; hz: number }> = [];
     world.bodies.forEach((pb) => {
       if (!pb.canCollide) return;
@@ -628,160 +651,26 @@ async function main(): Promise<void> {
     });
     if (candidates.length === 0) return;
     for (const p of players.values()) {
-      const body = world.getNamedCharacterBody(p.socketId);
-      if (!body) continue;
-      const entry = (world as any).namedCharacters?.get(p.socketId);
-      const height = entry?.height ?? 2;
-      const halfW = Math.min(entry?.size?.x ?? 0.8, entry?.size?.z ?? 0.8) / 2;
+      if (p.dyingTimer > 0) continue; // the dead touch nothing
+      const cy = p.y + playerHeight / 2; // pill center from feet
       const stillTouched = new Set<string>();
       const newlyTouched: string[] = [];
       for (const c of candidates) {
-        if (Math.abs(c.x - body.position.x) > c.hx + halfW + 0.1) continue;
-        if (Math.abs(c.z - body.position.z) > c.hz + halfW + 0.1) continue;
-        if (Math.abs(c.y - body.position.y) > c.hy + height / 2) continue;
+        if (Math.abs(c.x - p.x) > c.hx + playerHalfW + 0.1) continue;
+        if (Math.abs(c.z - p.z) > c.hz + playerHalfW + 0.1) continue;
+        if (Math.abs(c.y - cy) > c.hy + playerHeight / 2) continue;
         stillTouched.add(c.id);
         if (!p.touched.has(c.id)) newlyTouched.push(c.id);
       }
       for (const id of newlyTouched) {
         // v6.2.1: the TOUCHING player is the acting player - a lava brick
         // kills the player who stepped on it, not everyone in the room.
+        // (setEngineActorPos first: rules that read "the player's position"
+        // must see THIS player's reported spot, not a stale value.)
+        setEngineActorPos(p.username);
         try { weildCodeEngine.handleTouch(id, 'player', p.username); } catch { /* never kill the sim */ }
       }
       p.touched = stillTouched;
-    }
-  }
-
-  /**
-   * v6.2.5: fire a jump press the moment it is known - called from the
-   * input message handler (instant) AND from stepSim (the safety net).
-   * Honors the 0.5 s cooldown and coyote time (a jump still counts this
-   * long after leaving the ground, matching the client feel); sets the
-   * v6.2.4 airborneFromJump latch whose rising edge IS the jump and whose
-   * falling edge IS the landing (exactly one of each per hop, everywhere).
-   * A jump that cannot fire is consumed and dropped - identical to the old
-   * tick-only semantics.
-   */
-  function tryJump(p: RuntimePlayer): void {
-    if (p.dyingTimer > 0) return;
-    if (!p.input.jump) return;
-    p.input.jump = false; // consumed either way (never buffered mid-air)
-    const body = world.getNamedCharacterBody(p.socketId);
-    if (!body) return;
-    const grounded = world.namedCharacterGroundCheck(p.socketId);
-    const coyote = grounded || simClock - p.lastGroundedClock <= JUMP_COYOTE_SECONDS;
-    if (!(coyote && p.jumpCooldown <= 0)) return;
-    const j = applyJump(body.velocity.x, body.velocity.y, body.velocity.z, p.jumpCooldown);
-    if (!j) return;
-    body.velocity.set(j.x, j.y, j.z);
-    p.jumpCooldown = 0.5;
-    p.lastGroundedClock = -1e9; // the jump consumed the coyote grace
-    p.airborneFromJump = true;
-    p.jumpAge = 0;
-  }
-
-  /** Rate-limited rejection logger (a spamming client must not flood the
-   * host's stdout - one line per player per few seconds is plenty). */
-  let reportWarnAt = 0;
-  function warnRejected(p: RuntimePlayer, why: string, dist: number, implied: number): void {
-    const now = Date.now();
-    if (now - reportWarnAt < 5000) return;
-    reportWarnAt = now;
-    console.warn(
-      `[world-runtime] report rejected (${why}): ${p.username} dist=${dist.toFixed(1)} implied=${implied.toFixed(0)} u/s streak=${p.rejectStreak}`
-    );
-  }
-
-  /**
-   * v6.2.8: apply one CLIENT STATE REPORT (the Roblox-style relay).
-   *
-   * The owning client simulated its own character over the last 0.25 s and
-   * reports where it is / how it is moving. The server:
-   *   1. drops it wholesale during a server-initiated move grace (respawn /
-   *      rule teleport - in-flight reports from the old position must not
-   *      drag the player back) and enforces a small flood interval,
-   *   2. drops reports while the player is dying (the dead don't move; the
-   *      respawn resets the baseline),
-   *   3. kills void-fallers straight from the reported Y (below the line is
-   *      a death, never a "violation"),
-   *   4. runs the TINY LIGHT CHECKS - the user's 500-studs-in-one-report
-   *      hard cap and an implied-speed cap - rejecting (not kicking; there
-   *      are no players to protect) anything absurd. After enough
-   *      consecutive rejections the report is ADOPTED anyway: positions
-   *      are client-authoritative by design and the relay must never
-   *      permanently freeze a diverged (if honest) client,
-   *   5. accepts: the report becomes the broadcast state, and the KINEMATIC
-   *      ghost pill is placed + given the reported velocity so world
-   *      physics (crates being shoved) keeps feeling the character.
-   */
-  function applyReport(p: RuntimePlayer, m: any): void {
-    if (PLAYER_MODE !== 'client-report') return;
-    const now = Date.now();
-    if (now < p.ignoreReportsUntil) return;
-    if (now - p.lastReportAt < REPORT_MIN_INTERVAL_MS) return; // flood guard
-
-    // Sanitize: finite numbers only (a tampered client can send anything).
-    const x = Number(m.x), y = Number(m.y), z = Number(m.z);
-    if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(z)) return;
-    const clampV = (v: number) => Math.max(-REPORT_SPEED_TOLERANCE, Math.min(REPORT_SPEED_TOLERANCE, Number.isFinite(v) ? v : 0));
-    const vx = clampV(Number(m.vx) || 0);
-    const vy = clampV(Number(m.vy) || 0);
-    const vz = clampV(Number(m.vz) || 0);
-    const yaw = Number.isFinite(Number(m.yaw)) ? Number(m.yaw) : p.report.yaw;
-
-    // The dead don't move: reports during the death animation are dropped
-    // (the client's local body is frozen in its death anim anyway; respawn
-    // resets the baseline).
-    if (p.dyingTimer > 0) return;
-
-    // Void fall: below the line is a DEATH, not a violation. Echo where
-    // they fell (what other screens render for the death) and let the
-    // dyingTimer respawn cycle take over.
-    if (y < world.voidY) {
-      p.hp = 0;
-      p.dyingTimer = DEATH_ANIMATION_SECONDS;
-      p.report = { x, y, z, yaw, vx: 0, vy: 0, vz: 0, walking: false, sprint: false, jumping: false, grounded: false };
-      p.lastReportAt = now;
-      p.rejectStreak = 0;
-      return;
-    }
-
-    // The tiny light checks: distance from the last ACCEPTED position and
-    // the implied speed (dt floored at the report interval so a spammer
-    // cannot shrink the denominator, capped so a long stall cannot
-    // wholesale whitelist a huge jump).
-    const dx = x - p.report.x;
-    const dy = y - p.report.y;
-    const dz = z - p.report.z;
-    const dist = Math.hypot(dx, dy, dz);
-    const dtSec = Math.min(
-      REPORT_SPEED_DT_CAP_S,
-      Math.max(CLIENT_REPORT_INTERVAL_MS / 1000, (now - p.lastReportAt) / 1000),
-    );
-    const implied = dist / dtSec;
-    if (dist > REPORT_MAX_JUMP_STUDS || implied > REPORT_SPEED_TOLERANCE) {
-      p.rejectStreak += 1;
-      warnRejected(p, dist > REPORT_MAX_JUMP_STUDS ? 'teleport cap' : 'speed cap', dist, implied);
-      if (p.rejectStreak < REPORT_REJECT_ADOPT) return; // rejected
-      // else: ADOPT after a persistent streak - the relay never freezes a
-      // client forever (client-authoritative by design).
-    }
-
-    // ACCEPT: the report becomes the broadcast state + drives the ghost.
-    p.rejectStreak = 0;
-    p.report = {
-      x, y, z, yaw, vx, vy, vz,
-      walking: !!m.walking, sprint: !!m.sprint, jumping: !!m.jumping, grounded: !!m.grounded,
-    };
-    p.lastReportAt = now;
-    const body = world.getNamedCharacterBody(p.socketId);
-    if (body) {
-      const entry = (world as any).namedCharacters?.get(p.socketId);
-      const h = entry?.height ?? 2;
-      body.position.set(x, y + h / 2, z);
-      body.previousPosition.copy(body.position);
-      body.interpolatedPosition.copy(body.position);
-      body.velocity.set(vx, vy, vz);
-      body.wakeUp();
     }
   }
 
@@ -793,98 +682,25 @@ async function main(): Promise<void> {
     //    ticks (timer fires, touch events, clicks, chat).
     try { applyPlayerEffects(); } catch { /* never kill the sim */ }
 
-    // 1. Characters.
-    //
-    //    v6.2.8 splits this by PLAYER_NETCODE_MODE:
-    //    - client-report (default): the owning clients simulate their own
-    //      characters and stream state (applyReport above). All this loop
-    //      does per tick is run the death/respawn timer and integrate the
-    //      ghost pills' airborne arcs (gravity between reports, so a jumping
-    //      or falling character's ghost pushes parts along a physical
-    //      parabola instead of a straight laser line).
-    //    - server-sim (SAVED, env PLAYER_NETCODE_MODE=server-sim): the
-    //      input -> velocity -> cannon body simulation below, unchanged
-    //      from v6.2.5-v6.2.7.
-    if (PLAYER_MODE === 'client-report') {
-      for (const p of players.values()) {
-        const body = world.getNamedCharacterBody(p.socketId);
-        if (!body) continue;
-        if (p.dyingTimer > 0) {
-          p.dyingTimer -= dt;
-          // The ghost holds the death spot for the 1.35 s animation.
-          body.velocity.set(0, 0, 0);
-          if (p.dyingTimer <= 0) respawn(p);
-          continue;
-        }
-        // Dead-reckoned ghost arc between reports: while the client says it
-        // is GROUNDED the ghost holds its reported velocity exactly (a
-        // standing character must never sink into - and press on - the part
-        // under it); while AIRBORNE the ghost integrates gravity so jumps
-        // and falls sweep a real parabola (kinematic bodies get no gravity
-        // from cannon - forces only apply to DYNAMIC bodies).
-        if (!p.report.grounded) {
-          const nextVy = body.velocity.y + world.settings.gravity * dt;
-          body.velocity.y = Math.max(-GHOST_TERMINAL_VELOCITY, nextVy);
-        }
-      }
-    } else {
-    // ─── SAVED v6.2.5-v6.2.7 server-side character simulation ───
+    // 1. v6.2.6: player LIFE STATE ONLY (no movement simulation - the
+    //    owning clients move themselves and report at 0.25 s).
     for (const p of players.values()) {
-      const body = world.getNamedCharacterBody(p.socketId);
-      if (!body) continue;
-
       if (p.dyingTimer > 0) {
         p.dyingTimer -= dt;
-        body.velocity.set(0, 0, 0);
+        p.walking = false;
+        p.jumping = false;
+        p.sprint = false;
         if (p.dyingTimer <= 0) respawn(p);
-        continue;
       }
-      p.jumpCooldown = Math.max(0, p.jumpCooldown - dt);
-
-      const grounded = world.namedCharacterGroundCheck(p.socketId);
-      if (grounded) p.lastGroundedClock = simClock;
-      world.setNamedCharacterStanding(p.socketId, grounded && p.input.x === 0 && p.input.z === 0);
-
-      // v6.2.4: age the jump latch and clear it on the first grounded tick
-      // past a short grace (the impulse lands after this ground check in the
-      // same tick, and the body needs a tick or two to actually leave the
-      // ground, so a fresh jump must not clear itself immediately).
-      if (p.airborneFromJump) {
-        p.jumpAge += dt;
-        if (grounded && p.jumpAge > 0.15) {
-          p.airborneFromJump = false;
-          p.jumpAge = 0;
-        }
+      // Void death: the authority still owns "fell off the world".
+      // v6.2.8: only for LIVING players (hp > 0) — a just-respawned
+      // player (dyingTimer just hit 0, hp restored) must never be
+      // re-killed by a stale below-voidY record.
+      if (p.dyingTimer <= 0 && p.hp > 0 && p.y + playerHeight / 2 < world.voidY) {
+        p.hp = 0;
+        p.dyingTimer = DEATH_ANIMATION_SECONDS;
       }
-
-      // Smoothed target velocity (the client's two-stage ramp).
-      const stepped = stepHorizontalVelocity(p.velX, p.velZ, p.input.x, p.input.z, p.input.sprint, grounded, dt);
-      p.velX = stepped.velX;
-      p.velZ = stepped.velZ;
-
-      // Jump: v6.2.5 the input handler fires presses the instant they
-      // arrive (see the 'input' message case); this tick-path call remains
-      // as the safety net for any jump that lands between handler and tick
-      // (identical logic, idempotent under the 0.5 s cooldown).
-      tryJump(p);
-
-      // Steer the REAL body velocity toward the target (physics owns the
-      // outcome - walls/ramps/pushed parts behave physically).
-      const isWalking = Math.hypot(p.input.x, p.input.z) > 0.01;
-      const bodyLerp = grounded ? (isWalking ? ACCEL_WALK : ACCEL_STOP) : (isWalking ? ACCEL_WALK : AIR_RELEASE_DECAY);
-      const tb = 1 - Math.exp(-bodyLerp * 30 * dt);
-      const airTarget = grounded ? 1 : AIR_MOVE_FACTOR;
-      body.velocity.x += (p.velX * airTarget - body.velocity.x) * tb;
-      body.velocity.z += (p.velZ * airTarget - body.velocity.z) * tb;
-      if (grounded && !isWalking) {
-        const hSpeed = Math.hypot(body.velocity.x, body.velocity.z);
-        if (hSpeed < 0.75) { body.velocity.x = 0; body.velocity.z = 0; }
-      }
-
-      // Face the movement direction.
-      if (isWalking) p.yaw = Math.atan2(p.velX, p.velZ);
     }
-    } // end SAVED server-sim
 
     // 2. World physics: every part, terrain, trees, joints, movers.
     world.step(dt);
@@ -933,8 +749,7 @@ async function main(): Promise<void> {
       (pb as any)._wasGrounded = pb.isGrounded;
     }
 
-    // Void: fallen parts are deleted (when_destroyed fires); fallen
-    // players die and respawn.
+    // Void: fallen parts are deleted (when_destroyed fires).
     const fallen: string[] = [];
     for (const id of activeIds) {
       const pb = world.bodies.get(id);
@@ -946,18 +761,6 @@ async function main(): Promise<void> {
       for (const id of fallen) {
         activeIds.delete(id);
         s.removeObject(id); // fires when_destroyed rules
-      }
-    }
-    for (const p of players.values()) {
-      // v6.2.8: in client-report mode the REPORT is the player's position
-      // (the ghost is only a physics proxy - its dead-reckoned body can
-      // fall below the world during a rejected streak and must NEVER be
-      // allowed to kill the owner or break interest management). In
-      // server-sim mode the simulated body is the truth.
-      const py = PLAYER_MODE === 'client-report' ? p.report.y : world.getNamedCharacterBody(p.socketId)?.position.y;
-      if (py !== undefined && p.dyingTimer <= 0 && py < world.voidY) {
-        p.hp = 0;
-        p.dyingTimer = DEATH_ANIMATION_SECONDS;
       }
     }
 
@@ -1058,30 +861,20 @@ async function main(): Promise<void> {
     //     play-mode pass): unanchored parts beyond the interest radius of
     //     EVERY player stop simulating; they wake when someone comes near.
     //     "Runs objects only where there are players."
+    //     v6.2.6: "where the players are" = their last accepted reports.
     sleepPassAccum += dt;
     if (sleepPassAccum >= 1 / 3 && players.size > 0) {
       sleepPassAccum = 0;
-      const px: number[] = [], py: number[] = [], pz: number[] = [];
-      for (const p of players.values()) {
-        // v6.2.8: client-report mode centers interest on the REPORTED
-        // position (the ghost can lag it by a dead-reckoning drift).
-        if (PLAYER_MODE === 'client-report') {
-          px.push(p.report.x); py.push(p.report.y); pz.push(p.report.z);
-        } else {
-          const b = world.getNamedCharacterBody(p.socketId);
-          if (b) { px.push(b.position.x); py.push(b.position.y); pz.push(b.position.z); }
-        }
-      }
-      if (px.length > 0) {
+      if (players.size > 0) {
         for (const id of activeIds) {
           const pb = world.bodies.get(id);
           const cb = world.getCannonBody(id);
           if (!pb || !cb || pb.anchored || cb.mass === 0) continue;
           let inRange = false;
-          for (let i = 0; i < px.length; i++) {
-            const dx = pb.position.x - px[i];
-            const dy = pb.position.y - py[i];
-            const dz = pb.position.z - pz[i];
+          for (const p of players.values()) {
+            const dx = pb.position.x - p.x;
+            const dy = pb.position.y - p.y;
+            const dz = pb.position.z - p.z;
             if (dx * dx + dy * dy + dz * dz <= INTEREST_RADIUS_SQ) { inRange = true; break; }
           }
           if (!inRange) {
@@ -1106,60 +899,37 @@ async function main(): Promise<void> {
     // Players: changed transforms + hp + anim only, plus a keyframe of
     // EVERYONE every PLAYER_KEYFRAME_SECONDS (late joiners + drift
     // self-healing - clients treat a missing entry as "unchanged").
+    // v6.2.6: the transform/hp/anim come from the accepted reports; a
+    // pendingTp (spawn slot / respawn / teleport rule) forces the entry
+    // out flagged `tp` so the OWNER teleports and everyone else snaps.
     const keyframe = simClock >= nextPlayerKeyframeAt;
     if (keyframe) nextPlayerKeyframeAt = simClock + PLAYER_KEYFRAME_SECONDS;
     const playersOut: any[] = [];
     for (const p of players.values()) {
-      const body = world.getNamedCharacterBody(p.socketId);
-      if (!body) continue;
-      const entry = (world as any).namedCharacters?.get(p.socketId);
-      const height = entry?.height ?? 2;
-      // v6.2.8: WHERE the broadcast transform comes from:
-      //   client-report: the player's last ACCEPTED report (what the owning
-      //     client said, relayed verbatim - the ghost body is only the
-      //     physics proxy). velocity rides along so every client (the owner
-      //     included, for its drift-valve dead reckoning) can dead-reckon.
-      //   server-sim (SAVED): the simulated body's transform.
-      let x: number, y: number, z: number, yaw: number;
-      let velocity: [number, number, number];
-      let anim: { walking: boolean; jumping: boolean; dying: boolean; sprint: boolean };
-      if (PLAYER_MODE === 'client-report') {
-        x = p.report.x;
-        y = p.report.y;
-        z = p.report.z;
-        yaw = p.report.yaw;
-        velocity = [p.report.vx, p.report.vy, p.report.vz];
-        anim = {
-          walking: p.report.walking && p.dyingTimer <= 0,
-          jumping: p.report.jumping && p.dyingTimer <= 0,
-          dying: p.dyingTimer > 0,
-          sprint: p.report.sprint && p.dyingTimer <= 0,
-        };
-      } else {
-        const isWalking = Math.hypot(p.velX, p.velZ) > 0.01;
-        x = body.position.x;
-        y = body.position.y - height / 2;
-        z = body.position.z;
-        yaw = p.yaw;
-        velocity = [body.velocity.x, body.velocity.y, body.velocity.z];
-        anim = {
-          walking: isWalking && p.dyingTimer <= 0,
-          // v6.2.4: the LATCHED flag (see RuntimePlayer.airborneFromJump). The
-          // old velocity-y > 0.5 test flipped false at the apex (landing cues
-          // fired mid-air) and true again on the landing impact spike (the
-          // "jump animation and sound play twice" bug).
-          jumping: p.dyingTimer <= 0 && p.airborneFromJump,
-          dying: p.dyingTimer > 0,
-          sprint: isWalking && p.input.sprint,
-        };
+      let x = p.x, y = p.y, z = p.z;
+      let tp = false;
+      if (p.pendingTp) {
+        x = p.pendingTp.x;
+        y = p.pendingTp.y;
+        z = p.pendingTp.z;
+        p.x = x; p.y = y; p.z = z;
+        p.pendingTp = null;
+        tp = true;
       }
+      const anim = {
+        walking: p.walking && p.dyingTimer <= 0,
+        // The owner's latch (exactly one rising + one falling edge per hop).
+        jumping: p.jumping && p.dyingTimer <= 0,
+        dying: p.dyingTimer > 0,
+        sprint: p.sprint && p.dyingTimer <= 0,
+      };
       const hp = Math.round(p.hp);
       const prev = lastPlayerBroadcast.get(p.socketId);
-      const changed = !prev ||
+      const changed = !prev || tp ||
         Math.abs(prev.x - x) > 0.01 ||
         Math.abs(prev.y - y) > 0.01 ||
         Math.abs(prev.z - z) > 0.01 ||
-        Math.abs(prev.yaw - yaw) > 0.02 ||
+        Math.abs(prev.yaw - p.yaw) > 0.02 ||
         prev.hp !== hp ||
         prev.walking !== anim.walking ||
         prev.jumping !== anim.jumping ||
@@ -1167,35 +937,25 @@ async function main(): Promise<void> {
         prev.sprint !== anim.sprint;
       if (!keyframe && !changed) continue; // nothing new to say about them
       lastPlayerBroadcast.set(p.socketId, {
-        x, y, z, yaw, hp,
+        x, y, z, yaw: p.yaw, hp,
         walking: anim.walking, jumping: anim.jumping, dying: anim.dying, sprint: anim.sprint,
       });
       playersOut.push({
         socketId: p.socketId,
         username: p.username,
         position: [x, y, z],
-        rotation: [0, yaw, 0],
-        // v6.2.8: the character's velocity (client-reported or simulated) -
-        // used by the owner's drift valve for dead reckoning; harmless (and
-        // ignored) everywhere else.
-        velocity,
+        rotation: [0, p.yaw, 0],
         anim,
         hp,
         dying: p.dyingTimer > 0,
+        ...(tp ? { tp: 1 } : {}),
       });
     }
 
     // Player positions (interest tests for parts).
-    // v6.2.8: client-report mode centers interest on the REPORTED
-    // positions (the ghost pills can lag them by dead-reckoning drift).
     const plX: number[] = [], plY: number[] = [], plZ: number[] = [];
     for (const p of players.values()) {
-      if (PLAYER_MODE === 'client-report') {
-        plX.push(p.report.x); plY.push(p.report.y); plZ.push(p.report.z);
-      } else {
-        const b = world.getNamedCharacterBody(p.socketId);
-        if (b) { plX.push(b.position.x); plY.push(b.position.y); plZ.push(b.position.z); }
-      }
+      plX.push(p.x); plY.push(p.y); plZ.push(p.z);
     }
 
     // Join/boot keyframe queue: the next few snapshots re-broadcast every
@@ -1252,42 +1012,38 @@ async function main(): Promise<void> {
     }
 
     // Rule-driven full part updates (color/size/transparency/...).
+    // v6.2.7: NEW and DELETED parts ride the same channel - a deleted
+    // part broadcasts { id, deleted: true }, a rule-created part carries
+    // its full record (clients addObject when the id is unknown).
     const objects = useStudioStore.getState().objects;
-    // v6.2.7: part DELETIONS. The delta loop below only iterates what
-    // EXISTS; ids that were in the last snapshot's object map but are gone
-    // now were deleted since (void falls -> removeObject, rule
-    // destroy_part, moderation clears). Clients do not simulate parts
-    // anymore (v6.2.7 netcode), so without this list a deleted part would
-    // freeze mid-air on every screen instead of disappearing. Computed
-    // BEFORE the loop refreshes lastObjectsRef (which only ever adds or
-    // updates entries, so the order is safe either way).
-    const removedOut: string[] = [];
-    if (lastObjectsRef) {
-      for (const id of lastObjectsRef.keys()) {
-        if (!objects.has(id)) removedOut.push(id);
-      }
-      // Drop them from the diff base so each deletion broadcasts EXACTLY
-      // once (a lingering entry would re-fire on every later snapshot).
-      for (const id of removedOut) lastObjectsRef.delete(id);
-    }
     if (lastObjectsRef) {
       let budget = 200; // per-snapshot cap keeps huge rule storms bounded
+      for (const id of Array.from(lastObjectsRef.keys())) {
+        if (budget <= 0) break;
+        if (!objects.has(id)) {
+          partUpdatesOut.push({ id, deleted: true });
+          lastObjectsRef.delete(id);
+          budget -= 1;
+        }
+      }
       objects.forEach((obj: any, id: string) => {
         if (budget <= 0) return;
         if (!isPart(obj)) return;
         const prev = lastObjectsRef!.get(id);
         if (prev === obj) return;
         lastObjectsRef!.set(id, obj);
-        if (ourSyncIds.has(id) && prev) {
-          // Our transform sync only changes position/rotation - anything
-          // else changing means a rule touched it too. Cheap field check;
-          // a full deep-compare is overkill on the hot path.
-          if (
-            prev.color === obj.color &&
-            prev.size?.x === obj.size?.x && prev.size?.y === obj.size?.y && prev.size?.z === obj.size?.z &&
-            prev.transparency === obj.transparency &&
-            prev.material === obj.material
-          ) return;
+        if (prev) {
+          if (ourSyncIds.has(id)) {
+            // Our transform sync only changes position/rotation - anything
+            // else changing means a rule touched it too. Cheap field check;
+            // a full deep-compare is overkill on the hot path.
+            if (
+              prev.color === obj.color &&
+              prev.size?.x === obj.size?.x && prev.size?.y === obj.size?.y && prev.size?.z === obj.size?.z &&
+              prev.transparency === obj.transparency &&
+              prev.material === obj.material
+            ) return;
+          }
         }
         partUpdatesOut.push(obj);
         budget -= 1;
@@ -1301,7 +1057,6 @@ async function main(): Promise<void> {
       playersOut.length === 0 &&
       parts.length === 0 &&
       partUpdatesOut.length === 0 &&
-      removedOut.length === 0 &&
       fxOut.length === 0 &&
       messagesOut.length === 0
     ) {
@@ -1320,10 +1075,6 @@ async function main(): Promise<void> {
       players: playersOut,
       parts,
       partUpdates: partUpdatesOut.splice(0, partUpdatesOut.length),
-      // v6.2.7: part ids deleted since the last snapshot (void falls,
-      // rule destroys). Clients drop the part (mesh + collider + its
-      // interpolation history) the moment this arrives.
-      removed: removedOut,
       fx: fxOut.splice(0, fxOut.length),
       messages: messagesOut.splice(0, messagesOut.length),
     };

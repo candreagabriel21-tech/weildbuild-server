@@ -379,20 +379,6 @@ export class PhysicsWorld {
    * (classic building game behavior). Computed at play start by PhysicsSimulation. */
   voidY: number = -50;
 
-  // ─── v6.2.7: server-driven parts (multiplayer) ───
-  // In server-authoritative multiplayer the client must NOT simulate
-  // physical objects: the local sim + the per-snapshot correction blend
-  // fought each other (parts buzzed, and the ground under the player's
-  // feet kept shifting, so the character pill fell off blocks and through
-  // surfaces mid-jump). While this flag is set, every UNANCHORED part body
-  // is created KINEMATIC instead of DYNAMIC - gravity/contacts stop
-  // applying - and the play viewport drives its transform every frame from
-  // the interpolated server snapshot stream (exactly how remote characters
-  // render). The local character pill stays DYNAMIC: you collide against
-  // the server's version of every object, which is also exactly what you
-  // see. Singleplayer / Test Play keep the classic fully-local sim (false).
-  serverDrivenParts: boolean = false;
-
   constructor(settings: PhysicsSettings) {
     this.settings = settings;
 
@@ -424,7 +410,20 @@ export class PhysicsWorld {
 
   // ─── Body Management ───
 
-  addBody(part: StudioPart): PhysicsBody {
+  /**
+   * v6.2.6: add a part as a STATIC PROXY (server-authoritative
+   * multiplayer). The server simulates every part; the local world keeps
+   * only KINEMATIC COLLIDERS at the streamed positions so the local
+   * character (this client owns it) collides with the world exactly as it
+   * is rendered. No local part dynamics = no local-vs-server sim fight
+   * (the "buzzing" objects bug is gone by construction: nothing local
+   * ever pushes back).
+   */
+  addProxyBody(part: StudioPart): PhysicsBody {
+    return this.addBody(part, { asStaticProxy: true });
+  }
+
+  addBody(part: StudioPart, opts?: { asStaticProxy?: boolean }): PhysicsBody {
     // Skip parts that can't collide - but spawn points ARE collidable now
     // (they're real parts, not visual-only markers).
     if (!part.canCollide) {
@@ -456,8 +455,11 @@ export class PhysicsWorld {
 
     const mass = calculateMass(part.type, part.size, part.material, part.density);
     const material = getMaterialProps(part.material);
-    const isAnchored = part.anchored;
-    const cannonMass = isAnchored ? 0 : effectiveMass(mass);
+    const isAnchored = opts?.asStaticProxy ? true : part.anchored;
+    // v6.2.6: a static proxy ALWAYS has mass 0 (cannon-es makes mass-0
+    // bodies STATIC) - even for unanchored parts, whose dynamics run on
+    // the server and arrive as streamed transforms.
+    const cannonMass = opts?.asStaticProxy ? 0 : (isAnchored ? 0 : effectiveMass(mass));
 
     // Create cannon shape based on part type
     let shape: CANNON.Shape;
@@ -563,13 +565,6 @@ export class PhysicsWorld {
     // For anchored parts with mass > 0, set to kinematic so they can be moved
     if (isAnchored && cannonMass > 0) {
       cannonBody.type = CANNON.Body.KINEMATIC;
-    }
-    // v6.2.7: in server-authoritative multiplayer, UNANCHORED parts are
-    // kinematic too - the client no longer simulates physical objects at
-    // all; the snapshot interpolation drives them (see the flag up top).
-    if (!isAnchored && cannonMass > 0 && this.serverDrivenParts) {
-      cannonBody.type = CANNON.Body.KINEMATIC;
-      cannonBody.updateMassProperties();
     }
 
     this.world.addBody(cannonBody);
@@ -926,28 +921,6 @@ export class PhysicsWorld {
     if (target && entry.body.material !== target) entry.body.material = target;
   }
 
-  /**
-   * v6.2.8: flip a named character pill between DYNAMIC (the classic
-   * server-side simulation target - gravity, contacts, being pushed) and
-   * KINEMATIC (a client-report GHOST: the owning client streams its state,
-   * so the pill just dead-reckons the reported velocity and acts as an
-   * immovable pusher for world physics - characters still shove crates,
-   * but nothing server-side can ever fight the owning client for the
-   * character's transform). cannon-es zeroes a kinematic body's solve mass,
-   * so dynamic parts get pushed by it while it stays perfectly still
-   * against them; gravity and forces are only applied to DYNAMIC bodies.
-   */
-  setNamedCharacterKinematic(id: string, kinematic: boolean) {
-    const entry = this.namedCharacters.get(id);
-    if (!entry) return;
-    const want = kinematic ? CANNON.Body.KINEMATIC : CANNON.Body.DYNAMIC;
-    if (entry.body.type !== want) {
-      entry.body.type = want;
-      entry.body.updateMassProperties();
-      entry.body.wakeUp();
-    }
-  }
-
   /** Ground check for a named character (same multi-probe edge logic). */
   namedCharacterGroundCheck(id: string): boolean {
     const entry = this.namedCharacters.get(id);
@@ -1210,46 +1183,10 @@ export class PhysicsWorld {
         part.material ?? 'Plastic',
         part.density,
       );
-      if (this.serverDrivenParts) {
-        // v6.2.7: unanchored stays KINEMATIC in server mode (the snapshot
-        // stream owns its motion - no local sim to hand back to).
-        cannonBody.type = CANNON.Body.KINEMATIC;
-        cannonBody.mass = effectiveMass(mass);
-        cannonBody.updateMassProperties();
-        cannonBody.wakeUp();
-      } else {
-        cannonBody.type = CANNON.Body.DYNAMIC;
-        cannonBody.mass = effectiveMass(mass);
-        cannonBody.updateMassProperties();
-        cannonBody.wakeUp();
-      }
-    }
-  }
-
-  /**
-   * v6.2.7: (Re)apply the server-driven part motion type to every existing
-   * unanchored part body. Called when the flag flips (the play viewport
-   * checks the netcode mode every frame, so the conversion happens whether
-   * the mode was known before the world was built or not):
-   *   true  -> KINEMATIC (the snapshot interpolation drives these)
-   *   false -> DYNAMIC   (classic local simulation resumes)
-   */
-  reapplyPartMotionType(): void {
-    for (const [id, body] of this.bodies) {
-      if (body.anchored) continue;
-      const cannonBody = this.cannonBodies.get(id);
-      if (!cannonBody) continue;
-      if (this.serverDrivenParts) {
-        if (cannonBody.type !== CANNON.Body.KINEMATIC) {
-          cannonBody.type = CANNON.Body.KINEMATIC;
-          cannonBody.updateMassProperties();
-          cannonBody.wakeUp();
-        }
-      } else if (cannonBody.type !== CANNON.Body.DYNAMIC) {
-        cannonBody.type = CANNON.Body.DYNAMIC;
-        cannonBody.updateMassProperties();
-        cannonBody.wakeUp();
-      }
+      cannonBody.type = CANNON.Body.DYNAMIC;
+      cannonBody.mass = effectiveMass(mass);
+      cannonBody.updateMassProperties();
+      cannonBody.wakeUp();
     }
   }
 
