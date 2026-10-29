@@ -1,0 +1,10 @@
+{
+  "item_key": "FACE-9",
+  "name": "Happy Face",
+  "type": "face",
+  "price": 8,
+  "description": "Best day ever!",
+  "date_created": "2026-02-25",
+  "creator": "WeildBuild",
+  "data": "/items/faces/FACE-9.png"
+}

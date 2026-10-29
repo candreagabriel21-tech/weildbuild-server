@@ -333,11 +333,28 @@ async function main(): Promise<void> {
       strikes: 0,
       touched: new Set(),
     });
+    // v6.3.0 PLAYER COLLISIONS: a kinematic cannon Body per player. The
+    // owning client still drives its character's transform (the 0.25 s
+    // report sets p.x/y/z); we mirror that into a kinematic body so the
+    // contact solver sees "an infinite-mass body slid into this dynamic
+    // part" and pushes the part away - the user's "I walked into a ball
+    // and nothing happened" report. Gravity worked (baseplate fell,
+    // character fell after it), but the ball never moved because there
+    // was no server-side player body at all.
+    try {
+      world.addNamedCharacterBody(socketId, slot, {
+        size: { x: playerHalfW * 2, y: playerHeight, z: playerHalfW * 2 },
+      });
+      world.setNamedCharacterKinematic(socketId);
+    } catch { /* never kill the sim over a body add */ }
   }
 
   function removePlayer(socketId: string): void {
     players.delete(socketId);
     lastPlayerBroadcast.delete(socketId); // v6.2.2: drop its delta state
+    // v6.3.0: drop the kinematic collision body too (its contacts would
+    // otherwise keep resolving against a phantom player who left).
+    try { world.removeNamedCharacterBody(socketId); } catch { /* already gone */ }
   }
 
   /** v6.2.6: accept (or reject) one 0.25 s state report from a client. */
@@ -421,6 +438,11 @@ async function main(): Promise<void> {
     // in-flight reports still carry the death spot for a network-beat
     // after this (see RESPAWN_VOID_GRACE_SECONDS). Arm the grace window.
     p.respawnGraceUntil = simClock + RESPAWN_VOID_GRACE_SECONDS;
+    // v6.3.0 PLAYER COLLISIONS: snap the kinematic body to the spawn
+    // point with zeroed velocity. A respawn is a teleport - we don't
+    // want the body-sync pass to read (deathSpot -> spawn) as a huge
+    // velocity and slingshot every part around the spawn across the map.
+    try { world.teleportNamedCharacterBody(p.socketId, spawnFeet); } catch { /* body gone */ }
   }
 
   // ─── v6.2.1: per-player rule effects ───
@@ -489,6 +511,9 @@ async function main(): Promise<void> {
           p.pendingTp = { x: e.position.x, y: e.position.y, z: e.position.z };
           p.walking = false;
           p.jumping = false;
+          // v6.3.0 PLAYER COLLISIONS: snap the kinematic body too (same
+          // reason as respawn - a teleport is not a velocity impulse).
+          try { world.teleportNamedCharacterBody(p.socketId, e.position); } catch { /* body gone */ }
         }
         break;
     }
@@ -723,6 +748,47 @@ async function main(): Promise<void> {
         p.hp = 0;
         p.dyingTimer = DEATH_ANIMATION_SECONDS;
       }
+    }
+
+    // 1b. v6.3.0 PLAYER COLLISIONS: drive each player's kinematic cannon
+    //     body to follow its last accepted report. cannon-es integrates
+    //     the body's position from body.velocity each step, so we set
+    //     velocity = (target - body.position) / dt - this is what the
+    //     contact solver uses to impart an impulse to parts the player
+    //     walks INTO. Teleports/respawns already snapped the body via
+    //     teleportNamedCharacterBody, so deltas here are always small
+    //     (we clamp as a rail anyway in case a glitch landed the body
+    //     far from the report).
+    for (const p of players.values()) {
+      const body = world.getNamedCharacterBody(p.socketId);
+      if (!body) continue;
+      // The pill body center is feet + height/2 (matches
+      // createCharacterPillBody's body.position.set(spawn.x, spawn.y + H/2, ...)).
+      const targetY = p.y + playerHeight / 2;
+      const dx = p.x - body.position.x;
+      const dy = targetY - body.position.y;
+      const dz = p.z - body.position.z;
+      // A walking player moves ~5 studs/s; clamp anything bigger so a
+      // missed teleport (or any >30 studs/s delta) doesn't slingshot
+      // the parts around the body across the map. Sprint is ~7, jump
+      // peaks ~7, terminal fall is 50 - 30 is comfortably above all
+      // legitimate motion.
+      const maxV = 30;
+      let vx = dx / dt;
+      let vy = dy / dt;
+      let vz = dz / dt;
+      const vMag = Math.sqrt(vx * vx + vy * vy + vz * vz);
+      if (vMag > maxV) {
+        const s = maxV / vMag;
+        vx *= s; vy *= s; vz *= s;
+      }
+      body.velocity.set(vx, vy, vz);
+      // While dying the player's local body is in the death animation -
+      // hold the kinematic body still at the death spot so it doesn't
+      // keep shoving parts around a corpse (the authority owns the
+      // transform then; the death spot is where respawn will snap from).
+      if (p.dyingTimer > 0) body.velocity.set(0, 0, 0);
+      body.wakeUp(); // a driver body never sleeps
     }
 
     // 2. World physics: every part, terrain, trees, joints, movers.

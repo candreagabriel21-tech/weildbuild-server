@@ -995,6 +995,40 @@ export class PhysicsWorld {
     return this.namedCharacters.get(id)?.body;
   }
 
+  /**
+   * v6.3.0 PLAYER COLLISIONS: convert a named character body to KINEMATIC
+   * so it can push unanchored parts without being pushed back.
+   *
+   * The owning client still drives the player's transform via its 0.25 s
+   * state report (the server worker mirrors that into body.position /
+   * body.velocity each tick). The body needs to live in the physics world
+   * so the contact solver sees "an infinite-mass body slid into this
+   * dynamic part" and pushes the part away (the user's "I walked into a
+   * ball and nothing happened" report: gravity worked, the baseplate
+   * fell, the character fell after it, but the ball the character walked
+   * into never moved - because there was no server-side player body at
+   * all). Kinematic = mass 0, no gravity, no collision forces back onto
+   * the body; the contact solver still creates contact equations against
+   * dynamic bodies, and those equations push the dynamic side only.
+   */
+  setNamedCharacterKinematic(id: string): void {
+    const entry = this.namedCharacters.get(id);
+    if (!entry) return;
+    const body = entry.body;
+    body.type = CANNON.Body.KINEMATIC; // 4 - skips gravity + force integration
+    body.mass = 0;
+    body.invMass = 0;
+    body.updateMassProperties();
+    body.velocity.set(0, 0, 0);
+    body.angularVelocity.set(0, 0, 0);
+    body.previousPosition.copy(body.position);
+    body.interpolatedPosition.copy(body.position);
+    body.previousQuaternion.copy(body.quaternion);
+    body.interpolatedQuaternion.copy(body.quaternion);
+    body.allowSleep = false; // a kinematic driver body never sleeps
+    body.wakeUp();
+  }
+
   /** All named character entries (id -> { body, height, size }). */
   get namedCharacterEntries(): ReadonlyMap<string, { body: CANNON.Body; height: number; size: { x: number; y: number; z: number } }> {
     return this.namedCharacters;
