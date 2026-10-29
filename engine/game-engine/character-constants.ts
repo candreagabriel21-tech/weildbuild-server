@@ -37,11 +37,20 @@ export const SERVER_SIM_HZ = 30;
 export const SERVER_SNAPSHOT_HZ = 30;
 // ─── v6.2.6: ROBLOX-STYLE CLIENT-AUTHORITATIVE PLAYERS ───
 /** How often each client reports its character state to the server
- * (Hz). The user's plan: "the server reads client data every 0.25
- * seconds" - the owning client simulates its own character (full
- * singleplayer feel) and the server relays the reports to everyone
- * else, who interpolate between them. */
-export const PLAYER_REPORT_HZ = 4;
+ * (Hz). v1.3 (user request: "upload the player's position as soon as
+ * the player changes position, or every 0.05 seconds"): raised from
+ * 4 Hz to 20 Hz (one report per 0.05 s at most). The reporter in
+ * netcode-bridge also sends IMMEDIATELY when the position/rotation
+ * changed since the last report (still capped by this rate), and keeps
+ * a slow 2 Hz keepalive when standing perfectly still. The owning
+ * client simulates its own character (full singleplayer feel) and the
+ * server relays the reports to everyone else, who interpolate between
+ * them - the denser stream makes remote players look smoother too. */
+export const PLAYER_REPORT_HZ = 20;
+/** Idle keepalive (Hz): while the player has NOT moved, a report is
+ * still sent at this rate so the server keeps seeing a live client
+ * (presence, light checks, interpolation gap timeouts). */
+export const PLAYER_KEEPALIVE_HZ = 2;
 /** Light check (anti-cheat-lite, user-accepted): one report may not move
  * a player more than this many studs from the last accepted position
  * (user's example: "moving 500 studs/units in a frame"). Anything past

@@ -116,6 +116,11 @@ export function snapshotStudioState(): StudioProjectState {
 export function restoreStudioState(state: StudioProjectState): void {
   const newObjects = new Map<string, StudioObject>();
   for (const obj of state.objects) {
+    // v1.3 (user request - CharacterRoot removed): strip the old
+    // CharacterRoot part from pre-v1.3 saves so a translucent ghost box
+    // doesn't appear in the editor. The character spawns at the Spawn
+    // part / world setting and uses the standard hitbox instead.
+    if ((obj as any).isCharacterRoot) continue;
     const cloned = deepClone(obj);
     // Fix: Force character parts to be visible. Old saved projects may have
     // showInWorld=false on character parts from before the fix. Character parts
@@ -197,32 +202,23 @@ export function restoreStudioState(state: StudioProjectState): void {
   // v13.7: games published before v13.7 have no CharacterRoot part - create
   // one (sized to the default character) so the editable hitbox + spawn
   // marker exists everywhere. No-op when the project already has one.
-  useStudioStore.getState().ensureCharacterRoot();
+  // v1.3 (user request): the CharacterRoot part was DELETED. Old saves that
+  // still contain one have it stripped in the clone loop above (see the
+  // isCharacterRoot check) so a translucent ghost box doesn't appear in
+  // the editor. The character spawns at the Spawn part / world setting.
 }
 
 // ─── Find spawn position from the LIVE store (lightweight - no snapshot) ───
 
 /**
- * v13.7: spawn precedence: CharacterRoot part (its feet - move the root in
- * the editor to choose where players start) > Spawn part > world setting.
- * Used by Test Play and the published-games player.
+ * v1.3 (CharacterRoot removed): spawn precedence is now Spawn part >
+ * world setting. Used by Test Play and the published-games player.
  */
 export function findStudioSpawn(
   objects: Map<string, StudioObject>,
   worldSettings: WorldSettings,
 ): { x: number; y: number; z: number } {
   let spawn: { x: number; y: number; z: number } | null = null;
-  objects.forEach((obj) => {
-    if (spawn) return;
-    if (isPart(obj) && obj.isCharacterRoot) {
-      spawn = {
-        x: obj.position.x,
-        y: obj.position.y - obj.size.y / 2, // feet at the bottom of the hitbox
-        z: obj.position.z,
-      };
-    }
-  });
-  if (spawn) return spawn!;
   objects.forEach((obj) => {
     if (spawn) return;
     if (isPart(obj) && obj.isSpawnPoint) {
@@ -236,17 +232,8 @@ export function findStudioSpawn(
 // ─── Find spawn position from studio objects ───
 
 export function findSpawnPosition(state: StudioProjectState): { x: number; y: number; z: number } {
-  // v13.7: the CharacterRoot part wins - it's the character's own spawn
-  // marker, and moving it in the editor is how you choose where players start.
-  for (const obj of state.objects) {
-    if (isPart(obj) && (obj as StudioPart).isCharacterRoot) {
-      return {
-        x: obj.position.x,
-        y: obj.position.y - obj.size.y / 2, // feet at the bottom of the hitbox
-        z: obj.position.z,
-      };
-    }
-  }
+  // v1.3 (CharacterRoot removed): the Spawn part wins; the fallback is the
+  // world's Spawn Position setting (used to be a hardcoded {0,3,0}).
   for (const obj of state.objects) {
     if ('isSpawnPoint' in obj && (obj as any).isSpawnPoint) {
       return {
@@ -256,7 +243,10 @@ export function findSpawnPosition(state: StudioProjectState): { x: number; y: nu
       };
     }
   }
-  // Fallback: world origin
+  const ws = (state as any).worldSettings;
+  if (ws && ws.spawnPointPosition) {
+    return { x: ws.spawnPointPosition.x, y: ws.spawnPointPosition.y, z: ws.spawnPointPosition.z };
+  }
   return { x: 0, y: 3, z: 0 };
 }
 

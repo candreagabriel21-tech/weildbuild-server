@@ -51,13 +51,14 @@ const studioState = {
       transparency: 0, reflectance: 0, anchored: true, canCollide: true,
       friction: 0.5, elasticity: 0.2, density: 1, isBaseplate: true,
       children: [], parentId: null, bodyMovers: [], effects: [], rules: [] },
-    // CharacterRoot (spawn at 5, y feet on the baseplate)
-    { id: 'root', name: 'CharacterRoot', type: 'Block',
-      position: { x: 5, y: 1.5, z: 5 }, rotation: { x: 0, y: 0, z: 0 },
-      size: { x: 1.2, y: 3, z: 1.2 }, color: '#4a90d9', material: 'Plastic',
+    // v1.3 (CharacterRoot removed): a Spawn part drives the spawn point
+    // (feet on its top surface), like a real published game.
+    { id: 'spawn', name: 'Spawn', type: 'Spawn',
+      position: { x: 5, y: 0, z: 5 }, rotation: { x: 0, y: 0, z: 0 },
+      size: { x: 1, y: 1, z: 1 }, color: '#4a90d9', material: 'Plastic',
       transparency: 0, reflectance: 0, anchored: true, canCollide: false,
       friction: 0.5, elasticity: 0.2, density: 1,
-      isCharacterRoot: true, isCharacterPart: false,
+      isSpawnPoint: true, isCharacterPart: false,
       children: [], parentId: null, bodyMovers: [], effects: [], rules: [] },
     // An unanchored crate that should FALL (gravity) and appear in snapshots
     { id: 'crate', name: 'Crate', type: 'Block',
@@ -81,7 +82,7 @@ async function main() {
   worker.postMessage({ t: "init", studioState, maxPlayers: 10 });
   const ready = await waitMessage(worker, (m) => m.t === "ready", 20000);
   assert.ok(Array.isArray(ready.spawn) && ready.spawn.length === 3, "ready carries a spawn point");
-  assert.equal(ready.parts, 2, "two physics parts (the CharacterRoot is never a body)");
+  assert.equal(ready.parts, 3, "three parts queued (the Spawn part never becomes a physics body: canCollide=false)");
   console.log("✓ ready: spawn", ready.spawn, "parts", ready.parts);
 
   // 2. join two players
@@ -179,11 +180,13 @@ async function main() {
   worker.postMessage({ t: "getWorldState", reqId: 42 });
   const worldState: any = await waitMessage(worker, (m) => m.t === "worldState" && m.reqId === 42, 5000);
   const objects = worldState.objects as any[];
-  assert.ok(Array.isArray(objects) && objects.length === 2, "worldState carries the non-character parts");
+  // v1.3 (CharacterRoot removed): baseplate + Spawn + crate = 3 parts
+  // (the old root part is gone; the Spawn part is a real, expected part).
+  assert.ok(Array.isArray(objects) && objects.length === 3, "worldState carries the non-character parts");
   const crateRec = objects.find((o: any) => o.id === "crate");
   assert.ok(crateRec && crateRec.position.y < 5, `worldState carries the SETTLED crate position (y=${crateRec.position.y.toFixed(2)})`);
   assert.ok(!objects.some((o: any) => o.id === "root"), "character parts are excluded");
-  console.log(`✓ worldState: ${objects.length} parts with live transforms (crate settled at y=${crateRec.position.y.toFixed(2)})`);
+  console.log(`✓ worldstate: ${objects.length} parts with live transforms (crate settled at y=${crateRec.position.y.toFixed(2)})`);
 
   // 10. leave -> player disappears from snapshots
   worker.postMessage({ t: "playerLeave", socketId: "sockB" });

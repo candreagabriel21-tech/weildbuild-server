@@ -1,4 +1,5 @@
 import { create } from 'zustand';
+import * as THREE from 'three';
 import { WeildCodeRule } from './weildcode-types';
 // v13.4: the store fires WeildCode events (when_destroyed, on_property_change).
 // Circular import is safe: both modules only touch each other INSIDE functions
@@ -83,7 +84,7 @@ export interface ClipboardEntry {
   objects: StudioObject[];  // Can include both StudioPart and StudioModel (groups)
   cutFromIds: string[] | null; // null = copy, non-null = cut (original ids for reference)
 }
-export type StudioTab = 'File' | 'Home' | 'Model' | 'Terrain' | 'Test' | 'View';
+export type StudioTab = 'File' | 'Home' | 'Model' | 'Terrain' | 'Settings';
 
 export interface Vector3 {
   x: number;
@@ -141,6 +142,15 @@ export interface Joint {
   C1?: Vector3;
   motorSpeed?: number;
   motorMaxTorque?: number;
+  /**
+   * v1.3 (user request): the Rope's length in studs. A rope is a MAX-distance
+   * constraint - the parts can get CLOSER than this (the rope goes slack and
+   * sags), but never farther apart. This replaces the legacy hack where the
+   * length was smuggled into `motorMaxTorque` (that field is kept for
+   * backwards compatibility with old saves: ropes without `length` fall back
+   * to `motorMaxTorque ?? 5` when loaded).
+   */
+  length?: number;
 }
 
 // ─── Effects (Fire, Smoke, Light) ───
@@ -195,20 +205,13 @@ export interface StudioPart {
   isCharacterPart?: boolean;
   /** Which body part this is - used to assemble the character in-game. */
   characterPartType?: 'head' | 'torso' | 'leftArm' | 'rightArm' | 'leftLeg' | 'rightLeg' | 'face';
-  /**
-   * v13.7: True if this part IS the CharacterRoot - the character's physics
-   * hitbox and spawn point. A REAL part: select it, move/rotate/resize it with
-   * the gizmos like any other part. Its size is the hitbox size (the visible
-   * character scales to match), its position is where the character starts.
-   */
-  isCharacterRoot?: boolean;
-  /**
-   * v13.7: while true (the default), editing character body parts auto-refits
-   * the CharacterRoot hitbox to the new body bounds. Any manual resize/rotate
-   * of the CharacterRoot clears it - after that the hitbox is yours to control
-   * (and resizing it resizes the body parts instead).
-   */
-  characterRootAutoFit?: boolean;
+  // v1.3 (user request): the CharacterRoot part is DELETED. It used to be a
+  // special translucent part that acted as the character's spawn point +
+  // physics hitbox. Now the character simply spawns at the first Spawn part
+  // (or the world's Spawn Position setting) and uses the standard hitbox
+  // (DEFAULT_CHARACTER_HITBOX_SIZE in game-engine/physics.ts). Old saves
+  // that contain an isCharacterRoot part have it stripped on load (see
+  // restoreStudioState).
   /**
    * Show in World toggle. When true, the object works normally (rendered,
    * physical, runs code). When false, the object acts as if deleted - no
@@ -435,6 +438,11 @@ export interface StudioStore {
   showGrid: boolean;
   snapToGrid: boolean;
   gridSize: number;
+  // v1.1 (user request): while true, the snap setting is temporarily
+  // INVERTED (snap on becomes snap off, and vice versa). Set by holding G
+  // during a drag. Cleared on keyup. Lives in the store so the
+  // viewport drag handlers can read it without prop-drilling.
+  snapInvert: boolean;
 
   // Panel visibility (View tab toggles)
   showExplorer: boolean;
@@ -529,6 +537,14 @@ export interface StudioStore {
    *  NO character-root auto-sync or WeildCode property events fire: the group
    *  path computes character rig conversions itself and gesture-undo wraps it. */
   transformPartsBulk: (updates: Array<{ id: string; position?: Vector3; rotation?: Vector3; size?: Vector3 }>) => void;
+  // v1.2 (user request): group Position/Size/Rotation are now editable
+  // from the Properties panel. These helpers compute the per-leaf deltas
+  // (move all children by the same offset, scale all sizes + pivot-relative
+  // positions by the size ratio, rotate all positions around the pivot +
+  // add the rotation delta) and apply them via transformPartsBulk.
+  setGroupPosition: (groupId: string, newCenter: Vector3) => void;
+  setGroupSize: (groupId: string, newSize: Vector3) => void;
+  setGroupRotation: (groupId: string, newRotation: Vector3) => void;
   /** Part type waiting for the user to click a spot in the 3D view to place it there. */
   pendingPlacement: PartType | null;
   /** Enter click-to-place mode: the next click in the viewport spawns `type` there. */
@@ -599,6 +615,11 @@ export interface StudioStore {
   setBrushPaintColor: (color: string) => void;
   setSnapToGrid: (snap: boolean) => void;
   setGridSize: (size: number) => void;
+  setSnapInvert: (invert: boolean) => void;
+  /** v1.1: the EFFECTIVE snap state right now (snapToGrid XOR snapInvert).
+   *  Drag handlers should consult THIS, not snapToGrid directly, so the
+   *  hold-G-to-invert keybind works mid-drag. */
+  isSnappingActive: () => boolean;
   getObjectById: (id: string) => StudioObject | undefined;
   getChildren: (parentId: string | null) => StudioObject[];
   getGroupLeafPartIds: (groupId: string) => string[];
@@ -645,9 +666,7 @@ export interface StudioStore {
   addBaseplate: () => void;
   /** Create the 7 default character body parts (head, torso, arms, legs, face). */
   addDefaultCharacterParts: () => void;
-  /** v13.7: create the CharacterRoot part (the editable hitbox + spawn marker)
-   *  if it doesn't exist yet. Safe to call any time. */
-  ensureCharacterRoot: () => void;
+  // v1.3: ensureCharacterRoot was DELETED with the CharacterRoot part.
   // World settings
   setWorldSettings: (updates: Partial<WorldSettings>) => void;
   // Avatar
@@ -883,143 +902,11 @@ function _pushUndo(get: () => StudioStore, set: (partial: Partial<StudioStore> |
   set({ undoStack, redoStack: [] });
 }
 
-// ═══════════════════════════════════════════════════════════════════
-// v13.7: CharacterRoot <-> character body-part sync helpers
-//
-// The CharacterRoot is a REAL part whose size IS the hitbox. To keep the
-// invariant "the collision matches the character you see":
-//   - Resizing the root  -> the body parts scale by the same ratio
-//   - Rotating the root  -> the body parts rotate with it (rigid, around
-//     the character's center)
-//   - Editing body parts -> the root auto-refits to the new body bounds,
-//     but ONLY while it's still in auto-fit mode (any manual root resize/
-//     rotate takes control and stops the auto-refit).
-// All helpers operate ON the newObjects map inside an ongoing set() call,
-// so everything lands in one atomic store update (and one undo entry).
-// ═══════════════════════════════════════════════════════════════════
-
-function syncCharacterPartsToRootScale(
-  newObjects: Map<string, StudioObject>,
-  oldSize: { x: number; y: number; z: number },
-  newSize: { x: number; y: number; z: number },
-): void {
-  const rx = oldSize.x > 0.001 ? newSize.x / oldSize.x : 1;
-  const ry = oldSize.y > 0.001 ? newSize.y / oldSize.y : 1;
-  const rz = oldSize.z > 0.001 ? newSize.z / oldSize.z : 1;
-  if (!Number.isFinite(rx) || !Number.isFinite(ry) || !Number.isFinite(rz)) return;
-  newObjects.forEach((obj, id) => {
-    if (!isPart(obj) || !obj.isCharacterPart) return;
-    newObjects.set(id, {
-      ...obj,
-      // Body-part positions are LOCAL to the character's feet origin (0,0,0):
-      // scale them with the same ratios so the whole body resizes together.
-      position: {
-        x: obj.position.x * rx,
-        y: obj.position.y * ry,
-        z: obj.position.z * rz,
-      },
-      size: {
-        x: clampPartSizeValue(obj.size.x * rx),
-        y: clampPartSizeValue(obj.size.y * ry),
-        z: clampPartSizeValue(obj.size.z * rz),
-      },
-    } as StudioPart);
-  });
-}
-
-/** Smallest signed angle difference, wrapped to [-180, 180]. */
-function _deltaDeg(a: number, b: number): number {
-  let d = (a - b) % 360;
-  if (d > 180) d -= 360;
-  if (d < -180) d += 360;
-  return d;
-}
-
-function rotateCharacterPartsToRoot(
-  newObjects: Map<string, StudioObject>,
-  oldRot: { x: number; y: number; z: number },
-  newRot: { x: number; y: number; z: number },
-  rootHeight: number,
-): void {
-  // Rotate by the DELTA (gizmo drags write absolute rotations every frame -
-  // applying the absolute rotation again each frame would compound it).
-  const dx = _deltaDeg(newRot.x, oldRot.x) * Math.PI / 180;
-  const dy = _deltaDeg(newRot.y, oldRot.y) * Math.PI / 180;
-  const dz = _deltaDeg(newRot.z, oldRot.z) * Math.PI / 180;
-  if (Math.abs(dx) < 1e-9 && Math.abs(dy) < 1e-9 && Math.abs(dz) < 1e-9) return;
-
-  // Rotation matrix from the euler delta (XYZ order - matches how the gizmo
-  // and properties panel compose single-axis rotations).
-  const cx = Math.cos(dx), sx = Math.sin(dx);
-  const cy = Math.cos(dy), sy = Math.sin(dy);
-  const cz = Math.cos(dz), sz = Math.sin(dz);
-  // R = Rz * Ry * Rx
-  const r00 = cz * cy, r01 = cz * sy * sx - sz * cx, r02 = cz * sy * cx + sz * sx;
-  const r10 = sz * cy, r11 = sz * sy * sx + cz * cx, r12 = sz * sy * cx - cz * sx;
-  const r20 = -sy,    r21 = cy * sx,               r22 = cy * cx;
-
-  // Rotate around the character's center (local space: feet at y=0).
-  const cyw = rootHeight / 2;
-
-  newObjects.forEach((obj, id) => {
-    if (!isPart(obj) || !obj.isCharacterPart) return;
-    const px = obj.position.x, py = obj.position.y - cyw, pz = obj.position.z;
-    newObjects.set(id, {
-      ...obj,
-      position: {
-        x: r00 * px + r01 * py + r02 * pz,
-        y: r10 * px + r11 * py + r12 * pz + cyw,
-        z: r20 * px + r21 * py + r22 * pz,
-      },
-      rotation: {
-        x: normalizeRotationValue(obj.rotation.x + _deltaDeg(newRot.x, oldRot.x)),
-        y: normalizeRotationValue(obj.rotation.y + _deltaDeg(newRot.y, oldRot.y)),
-        z: normalizeRotationValue(obj.rotation.z + _deltaDeg(newRot.z, oldRot.z)),
-      },
-    } as StudioPart);
-  });
-}
-
-function refitCharacterRootToParts(newObjects: Map<string, StudioObject>): void {
-  let rootId: string | null = null;
-  let rootAutoFit = false;
-  newObjects.forEach((obj, id) => {
-    if (isPart(obj) && obj.isCharacterRoot) {
-      rootId = id;
-      rootAutoFit = obj.characterRootAutoFit !== false;
-    }
-  });
-  if (!rootId || !rootAutoFit) return;
-
-  // Axis-aligned bounds over the character parts (rotated parts use their
-  // AABB approximation - close enough for a hitbox).
-  let minX = Infinity, minY = Infinity, minZ = Infinity;
-  let maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
-  let any = false;
-  newObjects.forEach((obj) => {
-    if (!isPart(obj) || !obj.isCharacterPart) return;
-    any = true;
-    const hw = obj.size.x / 2, hh = obj.size.y / 2, hd = obj.size.z / 2;
-    minX = Math.min(minX, obj.position.x - hw); maxX = Math.max(maxX, obj.position.x + hw);
-    minY = Math.min(minY, obj.position.y - hh); maxY = Math.max(maxY, obj.position.y + hh);
-    minZ = Math.min(minZ, obj.position.z - hd); maxZ = Math.max(maxZ, obj.position.z + hd);
-  });
-  if (!any) return;
-
-  const root = newObjects.get(rootId!) as StudioPart;
-  const newSize = {
-    x: clampPartSizeValue(maxX - minX),
-    y: clampPartSizeValue(maxY - minY),
-    z: clampPartSizeValue(maxZ - minZ),
-  };
-  // Keep the FEET anchored: the root center shifts so its bottom stays put.
-  const oldBottom = root.position.y - root.size.y / 2;
-  newObjects.set(rootId!, {
-    ...root,
-    size: newSize,
-    position: { x: root.position.x, y: oldBottom + newSize.y / 2, z: root.position.z },
-  } as StudioPart);
-}
+// v1.3 (user request): the CharacterRoot <-> body-part sync helpers
+// (syncCharacterPartsToRootScale / rotateCharacterPartsToRoot /
+// refitCharacterRootToParts) were DELETED along with the CharacterRoot
+// part itself. Character body parts are still fully editable - they just
+// no longer auto-scale/refit to a root hitbox.
 
 export const useStudioStore = create<StudioStore>((set, get) => ({
   objects: new Map<string, StudioObject>(),
@@ -1097,6 +984,7 @@ export const useStudioStore = create<StudioStore>((set, get) => ({
   showGrid: true,
   snapToGrid: true,
   gridSize: 1,
+  snapInvert: false,
   showExplorer: true,
   showProperties: true,
   showOutput: true,
@@ -1286,32 +1174,8 @@ export const useStudioStore = create<StudioStore>((set, get) => ({
           }
         }
         newObjects.set(id, { ...obj, ...mergedUpdates } as StudioObject);
-
-        // ── v13.7: CharacterRoot <-> character body parts stay in sync ──
-        // Resizing/rotating the root transforms the whole character with it
-        // (the hitbox always matches the body you see). Editing body parts
-        // auto-refits the root while it's still in auto-fit mode.
-        if (isPart(obj)) {
-          if (obj.isCharacterRoot) {
-            const newSize = mergedUpdates.size as { x: number; y: number; z: number } | undefined;
-            const newRot = mergedUpdates.rotation as { x: number; y: number; z: number } | undefined;
-            let tookManualControl = false;
-            if (newSize && (newSize.x !== obj.size.x || newSize.y !== obj.size.y || newSize.z !== obj.size.z)) {
-              syncCharacterPartsToRootScale(newObjects, obj.size, newSize);
-              tookManualControl = true;
-            }
-            if (newRot && (newRot.x !== obj.rotation.x || newRot.y !== obj.rotation.y || newRot.z !== obj.rotation.z)) {
-              rotateCharacterPartsToRoot(newObjects, obj.rotation, newRot, (newSize ?? obj.size).y);
-              tookManualControl = true;
-            }
-            if (tookManualControl) {
-              const rootUpdated = newObjects.get(id) as StudioPart;
-              newObjects.set(id, { ...rootUpdated, characterRootAutoFit: false } as StudioPart);
-            }
-          } else if (obj.isCharacterPart && (mergedUpdates.size || mergedUpdates.position)) {
-            refitCharacterRootToParts(newObjects);
-          }
-        }
+        // v1.3: the CharacterRoot <-> body-part sync block was deleted with
+        // the CharacterRoot part itself (body parts are plain editable parts).
       }
       return { objects: newObjects };
     });
@@ -1929,6 +1793,15 @@ export const useStudioStore = create<StudioStore>((set, get) => ({
 
   setSnapToGrid: (snap) => set({ snapToGrid: snap }),
 
+  setSnapInvert: (invert) => set({ snapInvert: invert }),
+
+  isSnappingActive: () => {
+    const s = get();
+    // XOR: snapping is active when snapToGrid is on AND G is NOT held,
+    // OR when snapToGrid is off AND G IS held (temporary snap on).
+    return s.snapToGrid !== s.snapInvert;
+  },
+
   // ─── v13.6: transform gestures (editor drag lag fix) ───
   beginTransformGesture: () => {
     const state = get();
@@ -1982,6 +1855,150 @@ export const useStudioStore = create<StudioStore>((set, get) => ({
       }
       return { objects: newObjects };
     });
+  },
+
+  // ─── v1.2 (user request): editable group transforms ───
+  // The Properties panel for a group shows Position (AABB center), Size
+  // (AABB extents), Rotation (first child). When the user types into those
+  // fields, these helpers compute per-leaf updates and apply them via
+  // transformPartsBulk so the whole group moves/scales/rotates together.
+  setGroupPosition: (groupId, newCenter) => {
+    const state = get();
+    const group = state.objects.get(groupId);
+    if (!group || !('children' in group)) return;
+    const leaves = group.children
+      .map((cid) => state.objects.get(cid))
+      .filter((o): o is StudioPart => !!o && isPart(o));
+    if (leaves.length === 0) return;
+    // AABB of all leaves (current center).
+    let minX = Infinity, minY = Infinity, minZ = Infinity;
+    let maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
+    for (const p of leaves) {
+      const hx = p.size.x / 2, hy = p.size.y / 2, hz = p.size.z / 2;
+      minX = Math.min(minX, p.position.x - hx); maxX = Math.max(maxX, p.position.x + hx);
+      minY = Math.min(minY, p.position.y - hy); maxY = Math.max(maxY, p.position.y + hy);
+      minZ = Math.min(minZ, p.position.z - hz); maxZ = Math.max(maxZ, p.position.z + hz);
+    }
+    const oldCenter = { x: (minX + maxX) / 2, y: (minY + maxY) / 2, z: (minZ + maxZ) / 2 };
+    const dx = newCenter.x - oldCenter.x;
+    const dy = newCenter.y - oldCenter.y;
+    const dz = newCenter.z - oldCenter.z;
+    if (!Number.isFinite(dx) || !Number.isFinite(dy) || !Number.isFinite(dz)) return;
+    // Begin a gesture so this is ONE undo entry (not one per leaf).
+    state.beginTransformGesture();
+    try {
+      state.transformPartsBulk(leaves.map((p) => ({
+        id: p.id,
+        position: { x: p.position.x + dx, y: p.position.y + dy, z: p.position.z + dz },
+      })));
+    } finally {
+      state.endTransformGesture();
+    }
+  },
+
+  setGroupSize: (groupId, newSize) => {
+    const state = get();
+    const group = state.objects.get(groupId);
+    if (!group || !('children' in group)) return;
+    const leaves = group.children
+      .map((cid) => state.objects.get(cid))
+      .filter((o): o is StudioPart => !!o && isPart(o));
+    if (leaves.length === 0) return;
+    // AABB extents (current).
+    let minX = Infinity, minY = Infinity, minZ = Infinity;
+    let maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
+    for (const p of leaves) {
+      const hx = p.size.x / 2, hy = p.size.y / 2, hz = p.size.z / 2;
+      minX = Math.min(minX, p.position.x - hx); maxX = Math.max(maxX, p.position.x + hx);
+      minY = Math.min(minY, p.position.y - hy); maxY = Math.max(maxY, p.position.y + hy);
+      minZ = Math.min(minZ, p.position.z - hz); maxZ = Math.max(maxZ, p.position.z + hz);
+    }
+    const oldW = Math.max(maxX - minX, 0.001);
+    const oldH = Math.max(maxY - minY, 0.001);
+    const oldD = Math.max(maxZ - minZ, 0.001);
+    const pivot = { x: (minX + maxX) / 2, y: (minY + maxY) / 2, z: (minZ + maxZ) / 2 };
+    // Per-axis scale factor (newSize / oldSize), guarded against divide-by-zero.
+    const sx = Number.isFinite(newSize.x) && newSize.x > 0.001 ? newSize.x / oldW : 1;
+    const sy = Number.isFinite(newSize.y) && newSize.y > 0.001 ? newSize.y / oldH : 1;
+    const sz = Number.isFinite(newSize.z) && newSize.z > 0.001 ? newSize.z / oldD : 1;
+    state.beginTransformGesture();
+    try {
+      state.transformPartsBulk(leaves.map((p) => {
+        // Scale each leaf's size by the per-axis factor (clamped to min).
+        const newPartSize = {
+          x: clampPartSizeValue(p.size.x * sx),
+          y: clampPartSizeValue(p.size.y * sy),
+          z: clampPartSizeValue(p.size.z * sz),
+        };
+        // Position scales relative to pivot (so the whole group grows
+        // around its center, just like the gizmo's group scale path).
+        const rel = { x: p.position.x - pivot.x, y: p.position.y - pivot.y, z: p.position.z - pivot.z };
+        return {
+          id: p.id,
+          size: newPartSize,
+          position: { x: pivot.x + rel.x * sx, y: pivot.y + rel.y * sy, z: pivot.z + rel.z * sz },
+        };
+      }));
+    } finally {
+      state.endTransformGesture();
+    }
+  },
+
+  setGroupRotation: (groupId, newRotation) => {
+    const state = get();
+    const group = state.objects.get(groupId);
+    if (!group || !('children' in group)) return;
+    const leaves = group.children
+      .map((cid) => state.objects.get(cid))
+      .filter((o): o is StudioPart => !!o && isPart(o));
+    if (leaves.length === 0) return;
+    // AABB center = rotation pivot.
+    let minX = Infinity, minY = Infinity, minZ = Infinity;
+    let maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
+    for (const p of leaves) {
+      const hx = p.size.x / 2, hy = p.size.y / 2, hz = p.size.z / 2;
+      minX = Math.min(minX, p.position.x - hx); maxX = Math.max(maxX, p.position.x + hx);
+      minY = Math.min(minY, p.position.y - hy); maxY = Math.max(maxY, p.position.y + hy);
+      minZ = Math.min(minZ, p.position.z - hz); maxZ = Math.max(maxZ, p.position.z + hz);
+    }
+    const pivot = { x: (minX + maxX) / 2, y: (minY + maxY) / 2, z: (minZ + maxZ) / 2 };
+    // Use the first child's rotation as the "current" rotation (the panel
+    // shows the first child's rotation as a representative value).
+    const firstChild = leaves[0];
+    const oldRot = firstChild.rotation;
+    // Compute per-axis delta in radians.
+    const ddx = (newRotation.x - oldRot.x) * Math.PI / 180;
+    const ddy = (newRotation.y - oldRot.y) * Math.PI / 180;
+    const ddz = (newRotation.z - oldRot.z) * Math.PI / 180;
+    // Build the delta rotation as a quaternion.
+    const dQuat = new THREE.Quaternion().setFromEuler(new THREE.Euler(ddx, ddy, ddz, 'XYZ'));
+    state.beginTransformGesture();
+    try {
+      state.transformPartsBulk(leaves.map((p) => {
+        // Rotate each leaf's position around the pivot.
+        const rel = new THREE.Vector3(p.position.x - pivot.x, p.position.y - pivot.y, p.position.z - pivot.z);
+        rel.applyQuaternion(dQuat);
+        // Add the rotation delta to the leaf's own rotation.
+        const leafQuat = new THREE.Quaternion().setFromEuler(new THREE.Euler(
+          p.rotation.x * Math.PI / 180,
+          p.rotation.y * Math.PI / 180,
+          p.rotation.z * Math.PI / 180,
+        ));
+        leafQuat.premultiply(dQuat);
+        const leafEuler = new THREE.Euler().setFromQuaternion(leafQuat, 'XYZ');
+        return {
+          id: p.id,
+          position: { x: pivot.x + rel.x, y: pivot.y + rel.y, z: pivot.z + rel.z },
+          rotation: {
+            x: normalizeRotationValue(leafEuler.x * 180 / Math.PI),
+            y: normalizeRotationValue(leafEuler.y * 180 / Math.PI),
+            z: normalizeRotationValue(leafEuler.z * 180 / Math.PI),
+          },
+        };
+      }));
+    } finally {
+      state.endTransformGesture();
+    }
   },
 
   // ─── v13.6: click-to-place spawning ───
@@ -2514,105 +2531,9 @@ export const useStudioStore = create<StudioStore>((set, get) => ({
     for (const part of parts) newObjects.set(part.id, part);
     set({ objects: newObjects, objectsVersion: state.objectsVersion + 1 });
     state.addConsoleMessage('info', `Created character body parts (${parts.length} parts)`);
-
-    // v13.7: every character rig gets a CharacterRoot part (the editable
-    // hitbox + spawn marker) sized to EXACTLY match these body parts.
-    get().ensureCharacterRoot();
-  },
-
-  // ─── v13.7: CharacterRoot (the character's editable hitbox part) ───
-  // A real StudioPart: its size IS the physics hitbox, its position is the
-  // spawn point, and it can be selected / moved / rotated / resized with the
-  // same gizmos as every other part. The default size matches the default
-  // body parts exactly (arm span x full height x torso depth) - "what you
-  // see is what collides".
-  ensureCharacterRoot: () => {
-    const state = get();
-    let hasRoot = false;
-    let needsCollideFix = false;
-    let rootIdToFix: string | null = null;
-    state.objects.forEach((obj) => {
-      if (isPart(obj) && obj.isCharacterRoot) {
-        hasRoot = true;
-        // 1.0 migration: the root marker must never be a collider (old saves
-        // / a properties-panel toggle could leave canCollide=true, creating
-        // an invisible player-sized wall at the spawn point during play).
-        if (obj.canCollide) {
-          needsCollideFix = true;
-          rootIdToFix = obj.id;
-        }
-      }
-    });
-    if (hasRoot) {
-      if (needsCollideFix && rootIdToFix) {
-        const newObjects = new Map(state.objects);
-        const root = newObjects.get(rootIdToFix);
-        if (root && isPart(root)) {
-          newObjects.set(rootIdToFix, { ...root, canCollide: false } as StudioPart);
-          set({ objects: newObjects });
-          state.addConsoleMessage('info', 'CharacterRoot: CanCollide disabled (the hitbox is built from this part, it is never a collider itself)');
-        }
-      }
-      return;
-    }
-
-    // Default hitbox: exact bounds of the DEFAULT character body parts
-    // (same formulas as addDefaultCharacterParts - keep them in sync).
-    const S = 2.0 / 2.55;
-    const TORSO_W = 0.875 * S, TORSO_D = 0.6 * S;
-    const ARM_W = 0.4375 * S, ARM_GAP = 0.02 * S;
-    const HEAD_H = 0.625 * S;
-    const LEG_H = 0.875 * S, TORSO_H = 1.0 * S, HEAD_GAP = 0.05 * S;
-    const width = TORSO_W + 2 * (ARM_W + ARM_GAP);       // full arm span
-    const height = LEG_H + TORSO_H + HEAD_GAP + HEAD_H;  // top of head
-    const depth = TORSO_D;                               // torso depth
-
-    // Spawn: on top of the spawn part if there is one, else on the
-    // baseplate's surface, else the world spawn setting.
-    let feet = { x: 0, y: 0.5, z: 0 };
-    let baseplate: StudioPart | null = null;
-    state.objects.forEach((obj) => {
-      if (!isPart(obj)) return;
-      if (obj.isSpawnPoint) {
-        feet = { x: obj.position.x, y: obj.position.y + obj.size.y / 2, z: obj.position.z };
-      }
-      if (obj.isBaseplate) baseplate = obj;
-    });
-    if (!baseplate && feet.y === 0.5) {
-      // No spawn part found either - fall back to the world spawn setting.
-      feet = { ...state.worldSettings.spawnPointPosition };
-    }
-
-    partCounter++;
-    const rootPart: StudioPart = {
-      id: generateId(),
-      name: 'CharacterRoot',
-      type: 'Block',
-      // Center position; the character's FEET are at position.y - size.y/2.
-      position: { x: feet.x, y: feet.y + height / 2, z: feet.z },
-      size: { x: width, y: height, z: depth },
-      rotation: { x: 0, y: 0, z: 0 },
-      color: '#22d3ee',
-      material: 'Neon',
-      transparency: 0.88, // translucent cyan ghost box around the character
-      reflectance: 0,
-      anchored: true,
-      canCollide: false, // never a part-body: the play engine builds the real hitbox from it
-      friction: 0.5,
-      elasticity: 0.2,
-      density: 1.0,
-      children: [],
-      parentId: null,
-      bodyMovers: [],
-      effects: [],
-      isCharacterRoot: true,
-      characterRootAutoFit: true,
-      showInWorld: true,
-    };
-    const newObjects = new Map(state.objects);
-    newObjects.set(rootPart.id, rootPart);
-    set({ objects: newObjects, objectsVersion: state.objectsVersion + 1 });
-    state.addConsoleMessage('info', 'Created CharacterRoot (character hitbox + spawn point)');
+    // v1.3: the CharacterRoot part is gone - the character spawns at the
+    // Spawn part (or the world's Spawn Position setting) and uses the
+    // standard hitbox (DEFAULT_CHARACTER_HITBOX_SIZE).
   },
 
   setWorldSettings: (updates) =>
@@ -2865,6 +2786,7 @@ export const useStudioStore = create<StudioStore>((set, get) => ({
       showGrid: true,
       snapToGrid: true,
       gridSize: 1,
+      snapInvert: false,
       universes: new Map<string, UniverseData>([
         ['place_default', { id: 'place_default', name: 'Start', objects: [], joints: [] }],
       ]),

@@ -85,6 +85,9 @@ async function loadSound(name: string): Promise<AudioBuffer | null> {
     explosion: '/sounds/effects/explosion.mp3',
     scary_laugh: '/sounds/effects/scary_laugh.mp3',
     used_tool: '/sounds/effects/used_tool.wav',
+    // v1.1: the new UI click sound for the candy buttons across the app
+    // (login, join, play, sidebar, signout, exit, avatar, leave game).
+    click: '/sounds/effects/click.mp3',
   };
 
   const path = paths[name];
@@ -145,11 +148,23 @@ export async function playSound(name: string, volume: number = 0.5): Promise<voi
       explosion: 80,
       scary_laugh: 330,
       used_tool: 520,
+      click: 660,
     };
     osc.frequency.value = freqs[name] || 440;
     osc.start();
     osc.stop(ctx.currentTime + 0.15);
   } catch {}
+}
+
+/**
+ * v1.1: play the UI click sound. Fire and forget (no await) so a button
+ * click handler never waits for audio. Safe to call from any user-gesture
+ * handler; safe to call before the AudioContext has been unlocked (it
+ * resumes the context first). Volume is intentionally low so it stays a
+ * subtle accent, not a slam.
+ */
+export function playClickSound(volume: number = 0.35): void {
+  void playSound('click', volume);
 }
 
 /**

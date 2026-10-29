@@ -17,6 +17,8 @@
 
 import express from "express";
 import { createServer } from "http";
+import { existsSync } from "node:fs";
+import { join } from "node:path";
 import { Server, Socket } from "socket.io";
 import { config, assertSecrets, SERVER_VERSION } from "../shared/config";
 import { verifyTicket } from "../shared/jwt";
@@ -49,6 +51,22 @@ const INTERNAL_HEADERS = {
 //   { ..., "registered": true/false, "mainUrl": "...", "lastRegisterError": "..." }
 let registered = false;
 let lastRegisterError = "";
+// v1.3: check the world-runtime worker bundle EXISTS at boot. A missing
+// bundle makes every instance silently run relay-only (no server physics -
+// exactly the "game servers don't run physics" report), so /health now
+// screams about it too.
+// (Same resolution order as world-sims.resolveWorkerPath: compiled dist/
+// layout first, then the tsx dev layout.)
+const workerBundleOk = existsSync(join(__dirname, "world-runtime.bundle.js"))
+  || existsSync(join(__dirname, "..", "..", "dist", "gamehost", "world-runtime.bundle.js"));
+if (!workerBundleOk) {
+  console.error(
+    "[gamehost] ✗✗✗ dist/gamehost/world-runtime.bundle.js IS MISSING! " +
+    "Every game instance will run RELAY-ONLY (no server physics, no part " +
+    "movement, remote players frozen). FIX: run `npm run build` (or " +
+    "`node scripts/build-world-runtime.mjs`) BEFORE starting the gamehost.",
+  );
+}
 
 // ═══════════════════════════════════════════
 // HTTP server (shared with Socket.IO)
@@ -82,6 +100,9 @@ function healthHandler(_req: express.Request, res: express.Response) {
     registered,
     mainUrl: MAIN,
     lastRegisterError: lastRegisterError || null,
+    // v1.3: false = the physics worker bundle is missing and every
+    // instance runs relay-only (no server physics!).
+    physicsWorkerBundle: workerBundleOk,
     timestamp: new Date().toISOString(),
   });
 }

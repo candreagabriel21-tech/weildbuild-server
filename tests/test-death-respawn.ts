@@ -57,14 +57,8 @@ const studioState = {
       transparency: 0, reflectance: 0, anchored: true, canCollide: true,
       friction: 0.5, elasticity: 0.2, density: 1, isBaseplate: true,
       children: [], parentId: null, bodyMovers: [], effects: [], rules: [] },
-    // CharacterRoot (spawn point) — Alice's spawn slot (join #0)
-    { id: 'root', name: 'CharacterRoot', type: 'Block',
-      position: { x: 5, y: 1.5, z: 5 }, rotation: { x: 0, y: 0, z: 0 },
-      size: { x: 1.2, y: 3, z: 1.2 }, color: '#4a90d9', material: 'Plastic',
-      transparency: 0, reflectance: 0, anchored: true, canCollide: false,
-      friction: 0.5, elasticity: 0.2, density: 1,
-      isCharacterRoot: true, isCharacterPart: false,
-      children: [], parentId: null, bodyMovers: [], effects: [], rules: [] },
+    // v1.3 (CharacterRoot removed): the explicit studioState.spawnPoint below
+    // drives the spawn point (Alice joins at slot #0 = the spawn itself).
     // KILL BRICK: sits exactly at Alice's spawn feet position (small enough
     // that Bob's ring-1 spawn slot stays clear of it). Its
     // when_touched(player) rule kills whoever steps on it.

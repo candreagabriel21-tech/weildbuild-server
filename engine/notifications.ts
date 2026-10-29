@@ -150,6 +150,90 @@ export function requestWebNotificationPermission(): Promise<NotificationPermissi
   return Notification.requestPermission().catch(() => Notification.permission as NotificationPermission);
 }
 
+// ─── v1.1: device-level desktop-notifications user preference ───
+//
+// The Web Notification API has NO way to revoke permission from JS - once
+// the user grants it, only the browser's site-settings page can take it
+// back. So the Settings toggle used to "lock on" the moment the user
+// granted permission (clicking it again was a no-op).
+//
+// The fix: keep a device-side boolean ("do you want us to actually fire
+// desktop notifications?") SEPARATE from the OS permission. The toggle
+// now flips this boolean. We still consult the OS permission before
+// firing any notification - the user can disable us here even while the
+// browser still has "granted" stored.
+
+const DESKTOP_NOTIF_PREF_KEY = "wb-desktop-notifications-enabled";
+
+/** Read the user's preference (true unless explicitly disabled). */
+export function desktopNotificationsUserPref(): boolean {
+  if (typeof window === "undefined") return false;
+  try {
+    const raw = localStorage.getItem(DESKTOP_NOTIF_PREF_KEY);
+    if (raw === null) {
+      // Default: ON if the browser has already granted permission
+      // (the user opted in at some point), OFF otherwise.
+      return webNotificationPermission() === "granted";
+    }
+    return raw === "1";
+  } catch {
+    return false;
+  }
+}
+
+/** Persist the user's preference. */
+export function setDesktopNotificationsUserPref(enabled: boolean): void {
+  if (typeof window === "undefined") return;
+  try {
+    localStorage.setItem(DESKTOP_NOTIF_PREF_KEY, enabled ? "1" : "0");
+  } catch { /* storage may be blocked - the pref still applies this session */ }
+  // Notify any listeners (the Settings toggle) that the pref changed.
+  window.dispatchEvent(new CustomEvent("wb:desktop-notif-pref-changed", { detail: enabled }));
+}
+
+/**
+ * The full state used by Settings UI: do we have the OS permission, AND
+ * has the user enabled them on this device?
+ */
+export function desktopNotificationsEffective(): boolean {
+  return webNotificationPermission() === "granted" && desktopNotificationsUserPref();
+}
+
+/**
+ * Toggle the desktop notifications preference. Returns the resulting
+ * effective state ("granted AND user-enabled").
+ *
+ * Flow:
+ *  - If user is enabling AND browser hasn't been asked yet: ask the
+ *    browser. On "granted", flip the user pref to true. On "denied" or
+ *    "default", do nothing (the OS prompt was dismissed or blocked).
+ *  - If user is enabling AND browser already granted: just flip the
+ *    user pref to true (no-op for the OS).
+ *  - If user is disabling: flip the user pref to false. The OS
+ *    permission stays untouched (browsers don't let us revoke it from
+ *    JS anyway).
+ */
+export async function toggleDesktopNotifications(enable: boolean): Promise<boolean> {
+  if (!webNotificationsSupported()) return false;
+  if (enable) {
+    if (Notification.permission === "default") {
+      const result = await requestWebNotificationPermission();
+      if (result === "granted") {
+        setDesktopNotificationsUserPref(true);
+        return true;
+      }
+      return false; // user dismissed or blocked the OS prompt
+    }
+    if (Notification.permission === "granted") {
+      setDesktopNotificationsUserPref(true);
+      return true;
+    }
+    return false; // "denied" - the user needs to fix this in browser settings
+  }
+  setDesktopNotificationsUserPref(false);
+  return false;
+}
+
 /**
  * Fire a native OS notification if the user allowed it. Tagged so the same
  * sender collapses into one OS notification instead of stacking.
@@ -162,7 +246,11 @@ export function maybeShowWebNotification(
   tag: string,
   nav?: NavigateTarget
 ): void {
+  // v1.1: also consult the device-side user pref (Settings toggle). The OS
+  // permission alone is not enough - the user must have explicitly kept
+  // desktop notifications enabled here too.
   if (!webNotificationsSupported() || Notification.permission !== "granted") return;
+  if (!desktopNotificationsUserPref()) return;
   try {
     const n = new Notification(title, {
       body,

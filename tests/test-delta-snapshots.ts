@@ -108,16 +108,17 @@ const studioState = {
   objects: [
     { id: 'base', name: 'Baseplate', type: 'Block',
       position: { x: 0, y: -0.5, z: 0 }, rotation: { x: 0, y: 0, z: 0 },
-      size: { x: 100, y: 1, z: 100 }, color: '#3d6666', material: 'Plastic',
+      size: { x: 200, y: 1, z: 200 }, color: '#3d6666', material: 'Plastic',
       transparency: 0, reflectance: 0, anchored: true, canCollide: true,
       friction: 0.5, elasticity: 0.2, density: 1, isBaseplate: true,
       children: [], parentId: null, bodyMovers: [], effects: [], rules: [] },
-    { id: 'root', name: 'CharacterRoot', type: 'Block',
-      position: { x: 0, y: 1.5, z: 0 }, rotation: { x: 0, y: 0, z: 0 },
-      size: { x: 1.2, y: 3, z: 1.2 }, color: '#4a90d9', material: 'Plastic',
+    // v1.3 (CharacterRoot removed): a Spawn part drives the spawn point.
+    { id: 'spawn', name: 'Spawn', type: 'Spawn',
+      position: { x: 0, y: 0, z: 0 }, rotation: { x: 0, y: 0, z: 0 },
+      size: { x: 1, y: 1, z: 1 }, color: '#4a90d9', material: 'Plastic',
       transparency: 0, reflectance: 0, anchored: true, canCollide: false,
       friction: 0.5, elasticity: 0.2, density: 1,
-      isCharacterRoot: true, isCharacterPart: false,
+      isSpawnPoint: true, isCharacterPart: false,
       children: [], parentId: null, bodyMovers: [], effects: [], rules: [] },
     // Unanchored crate high above the baseplate: falls + settles on join.
     { id: 'crate', name: 'Crate', type: 'Block',

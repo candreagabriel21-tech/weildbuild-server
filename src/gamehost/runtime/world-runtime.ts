@@ -117,9 +117,11 @@ interface RuntimePlayer {
 
 const SIM_HZ = 30;
 // Parts + player entries stream in DELTA snapshots at 30 Hz. Player
-// entries only actually change when a 0.25 s report lands (4 Hz per
-// player), so the wire cost stays tiny while parts keep the dense
-// stream client-side interpolation runs on.
+// entries only actually change when a client report lands (v1.3: up to
+// 20 Hz per player - reports fire on movement, capped at one per 0.05 s,
+// with a slow 2 Hz keepalive while standing still), so the wire cost
+// stays reasonable while parts keep the dense stream client-side
+// interpolation runs on.
 const SNAPSHOT_HZ = 30;
 // v6.2.1: aligned with the client's DEATH_DURATION (StudioPlayViewport
 // startDeath) - the local and remote death animations now end together with
@@ -127,8 +129,10 @@ const SNAPSHOT_HZ = 30;
 // instead of 0.45s of dead air.
 const DEATH_ANIMATION_SECONDS = 1.35;
 // ─── v6.2.6: Roblox-style report cadence + light checks ───
-/** How often each client reports its character state (0.25 s). */
-const PLAYER_REPORT_HZ = 4;
+/** v1.3: the client's report rate (documentation only - the server applies
+ * reports as they arrive). Clients now report on movement (capped at
+ * 20 Hz = one per 0.05 s) with a 2 Hz keepalive while idle. */
+const PLAYER_REPORT_HZ = 20;
 /** Light check: one report may not move the player more than this many
  * studs from the last accepted position (user: "moving 500 studs in a
  * frame"). Generous by design - it catches blatant teleports, nothing
@@ -216,7 +220,22 @@ async function main(): Promise<void> {
   studioState.globalVariables ??= {};
   studioState.avatar ??= {};
   restoreStudioState(studioState);
-  const spawnPoint = studioState.spawnPoint ?? { x: 0, y: 5, z: 0 };
+  // v1.3 (CharacterRoot removed): spawn precedence is the explicit
+  // studioState.spawnPoint (the .wbworld export's spawn_point) > the first
+  // Spawn part (feet on its top surface) > {0,5,0}. Published games don't
+  // set spawnPoint, so the Spawn part is the normal path.
+  let spawnPoint = studioState.spawnPoint ?? null;
+  if (!spawnPoint) {
+    for (const obj of studioState.objects) {
+      const p = obj as any;
+      if (p && p.isSpawnPoint && p.position) {
+        const top = p.size ? p.size.y / 2 : 0;
+        spawnPoint = { x: p.position.x, y: p.position.y + top, z: p.position.z };
+        break;
+      }
+    }
+  }
+  if (!spawnPoint) spawnPoint = { x: 0, y: 5, z: 0 };
 
   // Server-authoritative mode ON + play mode ON (the engine only runs
   // while isPlaying).
@@ -240,7 +259,7 @@ async function main(): Promise<void> {
 
   const queue: StudioPart[] = [];
   useStudioStore.getState().objects.forEach((obj) => {
-    if (isPart(obj) && !(obj as StudioPart).isCharacterPart && !(obj as StudioPart).isCharacterRoot && (obj as StudioPart).showInWorld !== false) {
+    if (isPart(obj) && !(obj as StudioPart).isCharacterPart && (obj as StudioPart).showInWorld !== false) {
       queue.push(obj as StudioPart);
     }
   });
@@ -263,20 +282,17 @@ async function main(): Promise<void> {
   });
 
   // ─── Players ───
+  // v1.3 (user request): the CharacterRoot part was DELETED. The spawn
+  // point comes from the studioState's spawnPoint (the wbworld export's
+  // spawn_point, computed by findStudioSpawn: Spawn part > world setting)
+  // and every player uses the standard pill dims (same defaults as the
+  // client's createCharacterPillBody).
   const players = new Map<string, RuntimePlayer>();
-  const characterRoot = Array.from(useStudioStore.getState().objects.values())
-    .find((obj) => isPart(obj) && (obj as StudioPart).isCharacterRoot) as StudioPart | undefined;
-  const rootSize = characterRoot?.size;
-  const rootRot = characterRoot?.rotation;
-  const spawnFeet = characterRoot
-    ? { x: characterRoot.position.x, y: characterRoot.position.y - characterRoot.size.y / 2, z: characterRoot.position.z }
-    : { x: spawnPoint.x, y: spawnPoint.y, z: spawnPoint.z };
+  const spawnFeet = { x: spawnPoint.x, y: spawnPoint.y, z: spawnPoint.z };
   // Pill dims for touch checks / void checks (same clamps the client's
   // createCharacterPillBody applies - see physics.ts).
-  const playerHeight = rootSize ? Math.max(0.4, Math.min(64, rootSize.y)) : 2;
-  const playerHalfW = rootSize
-    ? Math.max(0.05, Math.min(32, Math.min(rootSize.x, rootSize.z) / 2))
-    : 0.4;
+  const playerHeight = 2;
+  const playerHalfW = 0.4;
 
   // Spawn spacing: joining players land on a widening ring around the
   // spawn point (like classic lobby games) so overlapping characters
@@ -306,7 +322,7 @@ async function main(): Promise<void> {
       x: slot.x,
       y: slot.y,
       z: slot.z,
-      yaw: rootRot?.y ? (rootRot.y * Math.PI) / 180 : 0,
+      yaw: 0,
       walking: false,
       jumping: false,
       sprint: false,
@@ -596,7 +612,7 @@ async function main(): Promise<void> {
       // the LIVE physics transforms, plus joints and global variables.
       const objects: any[] = [];
       useStudioStore.getState().objects.forEach((obj: any) => {
-        if (!isPart(obj) || obj.isCharacterPart || obj.isCharacterRoot) return;
+        if (!isPart(obj) || obj.isCharacterPart) return;
         const rec: any = { ...obj };
         const pb = world.bodies.get(obj.id);
         if (pb) {
@@ -814,7 +830,7 @@ async function main(): Promise<void> {
       slowPassAccum = 0;
       const objectsNow = useStudioStore.getState().objects;
       objectsNow.forEach((obj: any) => {
-        if (!isPart(obj) || obj.isCharacterPart || obj.isCharacterRoot) return;
+        if (!isPart(obj) || obj.isCharacterPart) return;
         const pb = world.bodies.get(obj.id);
         if (!pb) {
           // Part created during play: give it a body now.
@@ -849,7 +865,7 @@ async function main(): Promise<void> {
       const gone: string[] = [];
       world.bodies.forEach((pb, id) => {
         const obj = objectsNow.get(id);
-        if (!obj || !isPart(obj) || obj.isCharacterPart || obj.isCharacterRoot) gone.push(id);
+        if (!obj || !isPart(obj) || obj.isCharacterPart) gone.push(id);
       });
       if (gone.length > 0) {
         world.removeBodiesBulk(gone);

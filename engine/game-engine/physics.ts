@@ -47,13 +47,11 @@ const GROUP_CHARACTER = 4;
 const MASK_COLLIDABLE = -1; // interacts with everything
 const MASK_NON_COLLIDABLE = 0; // interacts with nothing
 
-// ─── v13.7: CharacterRoot hitbox ───
-// The CharacterRoot is a REAL, EDITABLE part in the studio store now: its
-// size IS the hitbox size, its rotation rotates the hitbox, and its position
-// is where the character spawns. This default matches the default character
-// body parts EXACTLY (arm span x full height x torso depth) so "what you
-// see is what collides" out of the box. Resizing the CharacterRoot resizes
-// the visible character with it (see studio-store updateObject).
+// ─── Character hitbox ───
+// v1.3 (user request): the CharacterRoot part was DELETED. The character
+// now always uses this STANDARD hitbox (arm span x full height x torso
+// depth of the default character rig) and spawns at the Spawn part (or
+// the world's Spawn Position setting).
 export const DEFAULT_CHARACTER_HITBOX_SIZE = { x: 1.4, y: 2.0, z: 0.48 };
 
 // ─── Helper Functions ───
@@ -65,6 +63,53 @@ function signedClamp(value: number, maxAbs: number): number {
 
 function effectiveMass(mass: number): number {
   return Math.max(mass, 0.01);
+}
+
+// ─── v1.3: RopeConstraint (a REAL rope - max distance only) ───
+//
+// The old rope used CANNON.DistanceConstraint, which is a BILATERAL
+// equality: it enforces the distance BOTH ways - it pushes the parts
+// apart when they get closer than `length` (a rigid rod, not a rope).
+//
+// A real rope is a UNILATERAL (max-distance) constraint: the parts may
+// swing freely CLOSER than the length (the rope goes slack and sags),
+// but can never get FARTHER apart than the length (the rope pulls them
+// back). In cannon-es terms the DistanceConstraint's equation multiplier
+// is NEGATIVE when the bodies must be pulled together and POSITIVE when
+// they must be pushed apart - so clamping the equation's force range to
+// [-maxForce, 0] keeps the pull and removes the push. Everything else
+// (the midpoint anchor geometry in update()) is identical to
+// DistanceConstraint.
+export class RopeConstraint extends CANNON.Constraint {
+  /** The maximum distance the two bodies may reach (studs). */
+  length: number;
+  distanceEquation: CANNON.ContactEquation;
+
+  constructor(bodyA: CANNON.Body, bodyB: CANNON.Body, length: number, maxForce = 1e6) {
+    super(bodyA, bodyB);
+    this.length = Math.max(length, 0.05);
+    const eq = this.distanceEquation = new CANNON.ContactEquation(bodyA, bodyB);
+    this.equations.push(eq);
+    // ONE-SIDED clamp - this is the whole "rope vs rod" difference:
+    //   negative multiplier = pulls the bodies together (a taut rope)
+    //   positive multiplier = pushes the bodies apart  (a rigid rod)
+    // Allowing only the negative side makes the constraint slack when the
+    // parts are closer than `length`, and taut (max pull) when stretched.
+    eq.minForce = -maxForce;
+    eq.maxForce = 0;
+  }
+
+  update(): void {
+    const bodyA = this.bodyA;
+    const bodyB = this.bodyB;
+    const eq = this.distanceEquation;
+    const halfLen = this.length * 0.5;
+    const normal = eq.ni;
+    bodyB.position.vsub(bodyA.position, normal);
+    normal.normalize();
+    normal.scale(halfLen, eq.ri);
+    normal.scale(-halfLen, eq.rj);
+  }
 }
 
 // ─── Physics Body (mirrors old interface) ───
@@ -465,14 +510,66 @@ export class PhysicsWorld {
     let shape: CANNON.Shape;
     switch (part.type) {
       case 'Sphere': {
-        const radius = Math.max(part.size.x, part.size.y, part.size.z) / 2;
-        shape = new CANNON.Sphere(Math.max(radius, 0.01));
+        // v1.1 FIX (user report: "the sphere can be stretched, but its
+        // collision doesn't match what it is visually"):
+        // The visual mesh is a UNIT SphereGeometry scaled by mesh.scale to
+        // (size.x, size.y, size.z) - so a stretched sphere renders as an
+        // ellipsoid. The old collision used CANNON.Sphere(max(size.x,y,z)/2)
+        // which is a perfect sphere of the LARGEST dimension: it poked
+        // past the thin ends of the visual ellipsoid by up to half a stud.
+        //
+        // Switched to CANNON.Box matching the AABB - WYSIWYG with the
+        // face-handle resize the editor uses (the handles sit at the AABB
+        // corners). A real ellipsoid ConvexPolyhedron would be smoother,
+        // but it's overkill for the studio and the box is exactly what
+        // every other part type does for collision anyway.
+        const hx = Math.max(part.size.x / 2, 0.005);
+        const hy = Math.max(part.size.y / 2, 0.005);
+        const hz = Math.max(part.size.z / 2, 0.005);
+        shape = new CANNON.Box(new CANNON.Vec3(hx, hy, hz));
         break;
       }
       case 'Cylinder': {
-        const cylRadius = Math.max(part.size.x, part.size.z) / 2;
-        const cylHeight = part.size.y;
-        shape = new CANNON.Cylinder(Math.max(cylRadius, 0.01), Math.max(cylRadius, 0.01), Math.max(cylHeight, 0.01), 12);
+        // v1.1 FIX (same class of bug as Sphere): the visual mesh is a
+        // unit CylinderGeometry scaled by (size.x, size.y, size.z), but
+        // the old cannon Cylinder used max(x,z)/2 for BOTH radii - so X != Z
+        // stretching produced a visual ellipsoid-cylinder but a circular
+        // cannon cylinder that poked out. Now using an 8-segment
+        // ConvexPolyhedron that approximates the stretched cylinder
+        // (close enough for a blocky sandbox engine; matches the AABB on
+        // X and Z, leaves the round top/bottom caps approximately).
+        const hx = Math.max(part.size.x / 2, 0.005);
+        const hy = Math.max(part.size.y / 2, 0.005);
+        const hz = Math.max(part.size.z / 2, 0.005);
+        const sides = 8;
+        const verts: CANNON.Vec3[] = [];
+        for (let i = 0; i < sides; i++) {
+          const a = (i / sides) * Math.PI * 2;
+          const cx = Math.cos(a) * hx;
+          const cz = Math.sin(a) * hz;
+          verts.push(new CANNON.Vec3(cx,  hy, cz)); // top ring
+          verts.push(new CANNON.Vec3(cx, -hy, cz)); // bottom ring
+        }
+        const faces: number[][] = [];
+        // top cap (triangle fan)
+        for (let i = 0; i < sides; i++) {
+          const a = i * 2;
+          const b = ((i + 1) % sides) * 2;
+          faces.push([a, b, b + 1, a + 1]);
+        }
+        // bottom cap (reversed winding)
+        for (let i = 0; i < sides; i++) {
+          const a = i * 2 + 1;
+          const b = ((i + 1) % sides) * 2 + 1;
+          faces.push([a, a - 1, b - 1, b]);
+        }
+        // side quads
+        for (let i = 0; i < sides; i++) {
+          const a = i * 2;
+          const b = ((i + 1) % sides) * 2;
+          faces.push([a, a + 1, b + 1, b]);
+        }
+        shape = new CANNON.ConvexPolyhedron({ vertices: verts, faces });
         break;
       }
       case 'Wedge': {
@@ -659,8 +756,13 @@ export class PhysicsWorld {
           hinge.setMotorMaxForce(joint.motorMaxTorque ?? 10);
           constraint = hinge;
         } else if (joint.type === 'Rope') {
-          // The rope's length is stored in motorMaxTorque (legacy schema).
-          constraint = new CANNON.DistanceConstraint(bodyA, bodyB, joint.motorMaxTorque ?? 5, 1e6);
+          // v1.3: ropes are REAL ropes now (max-distance only - see
+          // RopeConstraint above). Parts can swing closer together (the
+          // rope goes slack), but never farther apart than the length.
+          // `joint.length` is the v1.3 field; old saves smuggled the
+          // length into motorMaxTorque, so it stays as the fallback.
+          const ropeLength = joint.length ?? joint.motorMaxTorque ?? 5;
+          constraint = new RopeConstraint(bodyA, bodyB, ropeLength, 1e6);
         } else {
           continue;
         }

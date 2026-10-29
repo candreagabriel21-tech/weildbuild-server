@@ -50,7 +50,12 @@ export interface WorldSnapshot {
 const SIM_SWEEP_MS = 5000;
 
 /** Resolve the bundled worker file for both the compiled (dist/) and the
- * dev (src/ via tsx) layouts. */
+ * dev (src/ via tsx) layouts. v1.3: throws a LOUD, actionable error when
+ * the bundle is missing - a missing bundle used to make every instance
+ * silently fall back to relay-only (parts frozen, remote players frozen,
+ * no game:state snapshots), which is exactly the "game servers don't run
+ * physics" report. Build it with `npm run build` (or
+ * `node scripts/build-world-runtime.mjs`). */
 function resolveWorkerPath(): string {
   const candidates = [
     join(__dirname, "world-runtime.bundle.js"),            // dist/gamehost/*.js
@@ -59,7 +64,21 @@ function resolveWorkerPath(): string {
   for (const c of candidates) {
     if (existsSync(c)) return c;
   }
-  return candidates[0];
+  const msg =
+    "[world-sims] ✗✗✗ dist/gamehost/world-runtime.bundle.js IS MISSING! " +
+    "Without it every game instance silently degrades to RELAY-ONLY mode: " +
+    "no server physics, no part movement, no game:state snapshots (remote " +
+    "players frozen). FIX: run `npm run build` (or " +
+    "`node scripts/build-world-runtime.mjs`) on the gamehost BEFORE starting it.";
+  // Loud at boot: an error log line that cannot be missed + a health flag.
+  console.error(msg);
+  (globalThis as any).__wbWorkerBundleMissing = true;
+  throw new Error(msg);
+}
+
+/** v1.3: health flag - true when the worker bundle was missing at boot. */
+export function workerBundleMissing(): boolean {
+  return !!(globalThis as any).__wbWorkerBundleMissing;
 }
 
 export class WorldSimManager {
@@ -136,7 +155,21 @@ export class WorldSimManager {
     }
 
     // 2. Boot the worker.
-    const worker = new Worker(resolveWorkerPath());
+    // v1.3: resolveWorkerPath() THROWS when the bundle is missing (a loud,
+    // actionable error - it used to return a dead path silently). Wrap the
+    // boot so the error is logged PER INSTANCE and the socket layer falls
+    // back to relay-only instead of an unhandled rejection.
+    let worker: Worker;
+    try {
+      worker = new Worker(resolveWorkerPath());
+    } catch (e: unknown) {
+      console.error(
+        `[world-sims] instance ${instance.id} (game ${instance.gameId}) CANNOT START the simulation:`,
+        e instanceof Error ? e.message : e,
+      );
+      console.error(`[world-sims] instance ${instance.id} runs RELAY-ONLY (no server physics). Build the bundle and restart!`);
+      return;
+    }
     const sim: SimEntry = {
       worker,
       ready: false,

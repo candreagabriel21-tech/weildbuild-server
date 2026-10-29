@@ -28,7 +28,7 @@
 // Singleplayer / Test Play never touches this module (netcode.mode stays
 // 'local' and every field stays null/empty).
 
-import { PLAYER_REPORT_HZ } from './game-engine/character-constants';
+import { PLAYER_REPORT_HZ, PLAYER_KEEPALIVE_HZ } from './game-engine/character-constants';
 
 /** One state report the owning client sends about ITS OWN character. */
 export interface PlayerStateReport {
@@ -178,6 +178,9 @@ export function reportClick(partId: string): void {
 
 let stateSender: StateSender | null = null;
 let lastReportSentAt = 0;
+// v1.3: the last report actually sent (for the send-on-change detection
+// in reportPlayerState).
+let lastSentReport: PlayerStateReport | null = null;
 
 let selfCorrection: SelfCorrection | null = null;
 let partCorrections: PartCorrection[] = [];
@@ -206,17 +209,36 @@ export function setStateSender(sender: StateSender | null): void {
 
 /**
  * v6.2.6: called by the play viewport every frame - throttled to
- * PLAYER_REPORT_HZ (the 0.25 s cadence of the user's plan). The local
- * character IS the simulation; this just tells the server where it is so
- * it can relay it (and run its light checks).
+ * PLAYER_REPORT_HZ. v1.3 (user request): the upload now fires AS SOON AS
+ * the player's position/rotation/anim state changes (capped at one report
+ * per 1/PLAYER_REPORT_HZ = 0.05 s), with a slow PLAYER_KEEPALIVE_HZ
+ * keepalive when standing perfectly still, instead of the old flat 4 Hz
+ * timer. The local character IS the simulation; this just tells the server
+ * where it is so it can relay it (and run its light checks).
  */
 export function reportPlayerState(report: PlayerStateReport): void {
   if (!stateSender) return;
   const now = typeof performance !== 'undefined' ? performance.now() : Date.now();
   // lastReportSentAt === 0 means "never sent" (performance.now() can be
   // small early in a process - 0 must not look like a fresh send).
-  if (lastReportSentAt !== 0 && now - lastReportSentAt < 1000 / PLAYER_REPORT_HZ - 2) return;
+  if (lastReportSentAt !== 0) {
+    const sinceLast = now - lastReportSentAt;
+    if (sinceLast < 1000 / PLAYER_REPORT_HZ - 2) return; // over the 20 Hz cap
+    // Has anything changed since the last sent report? If not, only send
+    // the slow keepalive.
+    const changed =
+      !lastSentReport ||
+      Math.abs(report.x - lastSentReport.x) > 0.01 ||
+      Math.abs(report.y - lastSentReport.y) > 0.01 ||
+      Math.abs(report.z - lastSentReport.z) > 0.01 ||
+      Math.abs(report.yaw - lastSentReport.yaw) > 0.5 ||
+      report.walking !== lastSentReport.walking ||
+      report.jumping !== lastSentReport.jumping ||
+      report.sprint !== lastSentReport.sprint;
+    if (!changed && sinceLast < 1000 / PLAYER_KEEPALIVE_HZ - 2) return;
+  }
   lastReportSentAt = now;
+  lastSentReport = { ...report };
   stateSender(report);
 }
 
