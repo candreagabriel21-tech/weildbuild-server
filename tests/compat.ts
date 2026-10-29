@@ -2,8 +2,11 @@
 // Password compatibility test — MUST pass before deployment
 // ═══════════════════════════════════════════════════════════
 // Verifies the ported scrypt algorithm produces/verifies the
-// exact same hashes as the original app, using the known
-// WeildBuild admin credentials from the original schema.sql.
+// same hashes as the original app. The ADMIN_* constants below
+// are HISTORICAL TEST VECTORS from the original supabase
+// schema.sql (pure crypto fixtures for algorithm compatibility —
+// they are NOT live credentials; no account is seeded with them
+// anywhere, see prisma/seed.ts).
 // No database needed — pure crypto check.
 
 import { scryptSync, timingSafeEqual, createHash, randomBytes } from "crypto";

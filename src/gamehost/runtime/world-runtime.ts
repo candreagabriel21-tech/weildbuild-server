@@ -106,6 +106,9 @@ interface RuntimePlayer {
   /** Forced position waiting to ride the next snapshot (spawn slot /
    * respawn / teleport rule). Consumed when broadcast. */
   pendingTp: { x: number; y: number; z: number } | null;
+  /** simClock time until which below-voidY reports are treated as stale
+   * leftovers of the death that just ended (see RESPAWN_VOID_GRACE_SECONDS). */
+  respawnGraceUntil: number;
   /** Consecutive rejected reports (light-check strikes - diagnostics). */
   strikes: number;
   /** Part ids currently touched (when_touched re-arm). */
@@ -131,6 +134,16 @@ const PLAYER_REPORT_HZ = 4;
  * frame"). Generous by design - it catches blatant teleports, nothing
  * else. Terminal fall (50 studs/s) covers 12.5 studs per period. */
 const PLAYER_LIGHT_CHECK_STUDS = 500;
+/** v6.2.9 VOID DOUBLE-DEATH FIX: after the authority respawns a player,
+ * the owner's in-flight 0.25 s reports can still carry the DEATH SPOT
+ * (below voidY) for a network-beat - its local death animation ends
+ * slightly after ours, and the dyingTimer guard has already flipped to
+ * 0. Those stale reports used to re-arm the void check and kill the
+ * player a SECOND time at the spawn point (double explosion + double
+ * death wait, user report). During this grace window after a respawn,
+ * reports that would drag the record back into the void are dropped
+ * (a genuinely post-teleport report is above voidY by definition). */
+const RESPAWN_VOID_GRACE_SECONDS = 0.75;
 
 // ─── v6.2.2: idle + interest management ───
 /** Parts farther than this from EVERY player are not streamed in
@@ -300,6 +313,7 @@ async function main(): Promise<void> {
       hp: useStudioStore.getState().playState.characterMaxHealth || 100,
       dyingTimer: 0,
       pendingTp: slot, // the joiner's local body teleports to its slot
+      respawnGraceUntil: 0,
       strikes: 0,
       touched: new Set(),
     });
@@ -320,6 +334,13 @@ async function main(): Promise<void> {
     }
     // While dying the authority owns the transform (the death spot).
     if (p.dyingTimer > 0) return;
+    // v6.2.9 VOID DOUBLE-DEATH FIX: a just-respawned player's in-flight
+    // reports can still carry the pre-respawn death spot (below voidY) -
+    // the client's local death animation ends a network-beat after ours.
+    // Drop below-void reports during the grace window instead of letting
+    // them re-arm the void check (which killed the player a second time
+    // at the spawn point). No strike: the report is stale, not malicious.
+    if (simClock < p.respawnGraceUntil && y + playerHeight / 2 < world.voidY) return;
     // Light check 2 (user's example): a report may not teleport the
     // player more than PLAYER_LIGHT_CHECK_STUDS in one 0.25 s period.
     const dx = x - p.x, dy = y - p.y, dz = z - p.z;
@@ -367,9 +388,23 @@ async function main(): Promise<void> {
     p.hp = useStudioStore.getState().playState.characterMaxHealth || 100;
     p.dyingTimer = 0;
     p.pendingTp = { ...spawnFeet }; // the owner teleports; others snap
+    // v6.2.8 DOUBLE-DEATH FIX: move the SERVER's record of the player to
+    // the spawn point too (pendingTp alone only fixes the BROADCAST). The
+    // old code left p.x/p.y/p.z at the death spot — for a VOID death that
+    // is still below voidY, so the void check in the very same stepSim
+    // frame re-killed the just-respawned player: they exploded a SECOND
+    // time at the spawn point and waited through another full death
+    // animation ("you die again when you respawn" + the delayed respawn).
+    p.x = spawnFeet.x;
+    p.y = spawnFeet.y;
+    p.z = spawnFeet.z;
     p.walking = false;
     p.jumping = false;
     p.sprint = false;
+    // v6.2.9: the record fix above is not enough on its own - the owner's
+    // in-flight reports still carry the death spot for a network-beat
+    // after this (see RESPAWN_VOID_GRACE_SECONDS). Arm the grace window.
+    p.respawnGraceUntil = simClock + RESPAWN_VOID_GRACE_SECONDS;
   }
 
   // ─── v6.2.1: per-player rule effects ───
@@ -658,7 +693,10 @@ async function main(): Promise<void> {
         if (p.dyingTimer <= 0) respawn(p);
       }
       // Void death: the authority still owns "fell off the world".
-      if (p.dyingTimer <= 0 && p.y + playerHeight / 2 < world.voidY) {
+      // v6.2.8: only for LIVING players (hp > 0) — a just-respawned
+      // player (dyingTimer just hit 0, hp restored) must never be
+      // re-killed by a stale below-voidY record.
+      if (p.dyingTimer <= 0 && p.hp > 0 && p.y + playerHeight / 2 < world.voidY) {
         p.hp = 0;
         p.dyingTimer = DEATH_ANIMATION_SECONDS;
       }
