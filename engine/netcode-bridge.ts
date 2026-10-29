@@ -47,12 +47,19 @@ export interface PlayerStateReport {
 }
 
 /** Authority-owned state for the LOCAL player inside a snapshot.
- * v6.2.6: position is NOT here anymore - the client IS the simulation of
- * its own character; the server only owns the life state. */
+ * v6.2.6: position is NOT used to drive movement anymore - the client IS
+ * the simulation of its own character - but the entry's last reported
+ * position rides along so the play viewport can sanity-check death flags
+ * (a stale replayed dying=true after a link gap points at the OLD death
+ * spot, far from the live body - see StudioPlayViewport). */
 export interface SelfCorrection {
   seq: number;
   /** Body yaw (radians) - informational echo of the last accepted report. */
   yaw: number;
+  /** The authority's record of our position (feet). Diagnostic only. */
+  x: number;
+  y: number;
+  z: number;
   /** Authoritative health (server-owned in multiplayer). */
   hp: number;
   /** True during the server-side death animation. */
@@ -283,6 +290,9 @@ export function pushSnapshot(data: {
     selfCorrection = {
       seq: s.seq,
       yaw: s.yaw,
+      x: typeof s.x === 'number' ? s.x : 0,
+      y: typeof s.y === 'number' ? s.y : 0,
+      z: typeof s.z === 'number' ? s.z : 0,
       hp: s.hp,
       dying: s.dying,
       tp,

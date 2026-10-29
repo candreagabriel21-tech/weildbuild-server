@@ -712,7 +712,14 @@ async function main(): Promise<void> {
       // v6.2.8: only for LIVING players (hp > 0) — a just-respawned
       // player (dyingTimer just hit 0, hp restored) must never be
       // re-killed by a stale below-voidY record.
-      if (p.dyingTimer <= 0 && p.hp > 0 && p.y + playerHeight / 2 < world.voidY) {
+      // v6.4: the respawn grace window covers this check too (a stale
+      // below-void record can slip in between respawn() writing the spawn
+      // position and the next accepted report; without the grace the void
+      // check could re-kill the player a second time AT THE SPAWN - the
+      // reported "die again when you respawn" bug).
+      if (p.dyingTimer <= 0 && p.hp > 0
+        && simClock >= p.respawnGraceUntil
+        && p.y + playerHeight / 2 < world.voidY) {
         p.hp = 0;
         p.dyingTimer = DEATH_ANIMATION_SECONDS;
       }

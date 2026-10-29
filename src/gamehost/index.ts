@@ -24,7 +24,7 @@ import { config, assertSecrets, SERVER_VERSION } from "../shared/config";
 import { verifyTicket } from "../shared/jwt";
 import { corsOrigin } from "../shared/http";
 import { GameInstanceManager, GameInstance } from "./instances";
-import { WorldSimManager } from "./world-sims";
+import { WorldSimManager, tryBuildWorkerBundle } from "./world-sims";
 
 assertSecrets("gamehost");
 
@@ -55,16 +55,27 @@ let lastRegisterError = "";
 // bundle makes every instance silently run relay-only (no server physics -
 // exactly the "game servers don't run physics" report), so /health now
 // screams about it too.
-// (Same resolution order as world-sims.resolveWorkerPath: compiled dist/
-// layout first, then the tsx dev layout.)
+// v6.4 SELF-HEAL: before reporting anything, the host tries to BUILD the
+// missing bundle itself (esbuild is a production dependency) - so even a
+// Render service whose Build Command never ran `npm run build` heals on
+// its first boot instead of running relay-only forever.
 const workerBundleOk = existsSync(join(__dirname, "world-runtime.bundle.js"))
-  || existsSync(join(__dirname, "..", "..", "dist", "gamehost", "world-runtime.bundle.js"));
+  || existsSync(join(__dirname, "..", "..", "dist", "gamehost", "world-runtime.bundle.js"))
+  || (() => {
+    try {
+      return tryBuildWorkerBundle();
+    } catch (e) {
+      console.error("[gamehost] worker bundle self-heal threw:", e instanceof Error ? e.message : e);
+      return false;
+    }
+  })();
 if (!workerBundleOk) {
   console.error(
     "[gamehost] ✗✗✗ dist/gamehost/world-runtime.bundle.js IS MISSING! " +
     "Every game instance will run RELAY-ONLY (no server physics, no part " +
-    "movement, remote players frozen). FIX: run `npm run build` (or " +
-    "`node scripts/build-world-runtime.mjs`) BEFORE starting the gamehost.",
+    "movement, remote players frozen). FIX: set the Build Command to " +
+    "`npm install && npm run build` (or run `node scripts/build-world-runtime.mjs`) " +
+    "BEFORE starting the gamehost.",
   );
 }
 

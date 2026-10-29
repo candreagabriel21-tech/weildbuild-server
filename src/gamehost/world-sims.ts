@@ -23,8 +23,9 @@
 // SIMULATION side and its lifecycle (workers die with their instance).
 
 import { Worker } from "node:worker_threads";
+import { execFileSync } from "node:child_process";
 import { existsSync } from "node:fs";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { config } from "../shared/config";
 import { decryptWbworldBuffer, bufferFromBase64 } from "../shared/wbworld";
 import type { GameInstance, GameInstanceManager } from "./instances";
@@ -49,6 +50,57 @@ export interface WorldSnapshot {
 
 const SIM_SWEEP_MS = 5000;
 
+/** The worker bundle's candidate paths (same order resolveWorkerPath checks). */
+function bundleCandidates(): string[] {
+  return [
+    join(__dirname, "world-runtime.bundle.js"),            // dist/gamehost/*.js
+    join(__dirname, "..", "..", "dist", "gamehost", "world-runtime.bundle.js"), // src/gamehost/*.ts (tsx dev)
+  ];
+}
+
+function bundleExists(): boolean {
+  return bundleCandidates().some((c) => existsSync(c));
+}
+
+// ─── v6.4 SELF-HEAL: never run relay-only because of a missing bundle ───
+// The user reported "the servers still don't run any physics" from a Render
+// deployment. The classic cause: the service's Build Command does not run
+// `npm run build` (it was created before render.yaml, or was edited), so
+// dist/gamehost/world-runtime.bundle.js never got built - and a missing
+// bundle silently degrades EVERY instance to relay-only (parts frozen, no
+// game:state snapshots). esbuild is a production dependency ON PURPOSE (see
+// package.json), so the gamehost can build the bundle itself at boot in
+// ~0.2 s. The script syncs engine/ from ../platform when the sibling exists
+// and otherwise uses the committed copy - exactly like a deploy build.
+let selfHealTried = false;
+export function tryBuildWorkerBundle(): boolean {
+  if (bundleExists()) return true;
+  if (selfHealTried) return bundleExists(); // once per process, ever
+  selfHealTried = true;
+  try {
+    const serverRoot = resolve(__dirname, "..", "..");
+    const script = join(serverRoot, "scripts", "build-world-runtime.mjs");
+    if (!existsSync(script)) {
+      console.error("[world-sims] bundle missing AND scripts/build-world-runtime.mjs not found - cannot self-heal");
+      return bundleExists();
+    }
+    console.warn("[world-sims] ✗ worker bundle missing - building it now (esbuild, on-the-fly self-heal)...");
+    execFileSync(process.execPath, [script], {
+      cwd: serverRoot,
+      stdio: "inherit",
+      timeout: 120000,
+    });
+    console.warn("[world-sims] ✓ self-heal build finished");
+  } catch (e: unknown) {
+    console.error(
+      "[world-sims] on-the-fly bundle build FAILED:",
+      e instanceof Error ? e.message : e,
+    );
+    console.error("[world-sims] instances will run RELAY-ONLY. Set the Render Build Command to `npm install && npm run build`!");
+  }
+  return bundleExists();
+}
+
 /** Resolve the bundled worker file for both the compiled (dist/) and the
  * dev (src/ via tsx) layouts. v1.3: throws a LOUD, actionable error when
  * the bundle is missing - a missing bundle used to make every instance
@@ -57,10 +109,10 @@ const SIM_SWEEP_MS = 5000;
  * physics" report. Build it with `npm run build` (or
  * `node scripts/build-world-runtime.mjs`). */
 function resolveWorkerPath(): string {
-  const candidates = [
-    join(__dirname, "world-runtime.bundle.js"),            // dist/gamehost/*.js
-    join(__dirname, "..", "..", "dist", "gamehost", "world-runtime.bundle.js"), // src/gamehost/*.ts (tsx dev)
-  ];
+  // v6.4: self-heal FIRST - if the bundle is missing, try to build it
+  // (once). Only when that genuinely fails do we throw the loud error.
+  if (!bundleExists()) tryBuildWorkerBundle();
+  const candidates = bundleCandidates();
   for (const c of candidates) {
     if (existsSync(c)) return c;
   }
