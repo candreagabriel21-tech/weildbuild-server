@@ -10,8 +10,7 @@
 //      does nothing when the database is already up to date)
 //   2. If the database is COMPLETELY empty (zero user accounts,
 //      i.e. a brand-new Neon project) it also runs the seed
-//      (the official shop items; admin accounts come from
-//      ADMIN_USERNAME/ADMIN_PASSWORD env vars — see bootstrapAdmin)
+//      (default admin account + 34 shop items)
 //
 // NOTES
 //   • Only the MAIN SERVER calls this — never add it to realtime
@@ -21,13 +20,10 @@
 //     database. Every step is wrapped in try/catch: a database
 //     hiccup can never take the server down — it just retries on
 //     the next boot.
-//   • v2.1 SECURITY: the seed no longer creates a default admin
-//     account (no hardcoded passwords in the repo, ever). The
-//     first admin is bootstrapped from ENVIRONMENT VARIABLES:
-//     ADMIN_USERNAME + ADMIN_PASSWORD. It is created only when the
-//     account does not exist yet — an existing account's password
-//     is NEVER overwritten, so a password changed in-app stays
-//     changed across redeploys and restarts.
+//   • The seed is upsert-based but it RE-ASSERTS the default
+//     admin password, so it must only run on a truly empty
+//     database (users == 0). That keeps it from ever resetting a
+//     password you changed.
 //   • NEW in v1.8.1 — OFFICIAL ITEM RE-SYNC on every boot: the
 //     34 official catalog items from data/items/*.json are
 //     upserted on EVERY start (not just empty databases), so a
@@ -40,7 +36,6 @@ import { exec } from "child_process";
 import { promisify } from "util";
 import { join } from "path";
 import { readdirSync, readFileSync, existsSync } from "fs";
-import { randomBytes, scryptSync } from "crypto";
 import { prisma } from "./client";
 import { ITEM_COLORS } from "../shared/item-colors";
 
@@ -193,91 +188,6 @@ async function migrateGamesToPlain(): Promise<void> {
   }
 }
 
-// ─────────────────────────────────────────────────────────────
-// v2.1 ADMIN BOOTSTRAP (from environment variables)
-// ─────────────────────────────────────────────────────────────
-// The old seed baked a default admin (WeildBuild / a fixed
-// password) into the repository — anyone reading the code could
-// log into every deployment that forgot to change it. The admin
-// now comes exclusively from env vars:
-//
-//   ADMIN_USERNAME  e.g. "WeildBuild"
-//   ADMIN_PASSWORD  a strong password you choose
-//
-// Semantics (runs on EVERY boot, not just empty databases):
-//   • account missing  → created as top_admin with that password
-//   • account exists    → role re-asserted as top_admin, but the
-//                         PASSWORD IS NEVER OVERWRITTEN, so a
-//                         password changed in Settings stays
-//                         changed (the "password resets itself"
-//                         bug).
-//   • env vars unset    → nothing happens; a clear one-line hint
-//                         is printed once for the operator.
-function bootstrapAdminFromEnv(): void {
-  const adminUsername = (process.env.ADMIN_USERNAME || "").trim();
-  const adminPassword = process.env.ADMIN_PASSWORD || "";
-
-  if (!adminUsername || !adminPassword) {
-    console.log(
-      "[db-setup] No ADMIN_USERNAME/ADMIN_PASSWORD set — no admin bootstrapped.\n" +
-        "    To create the first admin: set both env variables on your host\n" +
-        "    (Render → Environment) and restart the server. The account is only\n" +
-        "    created if it doesn't exist yet; its password is never overwritten."
-    );
-    return;
-  }
-
-  prisma.user
-    .findUnique({ where: { username: adminUsername }, select: { username: true } })
-    .then(async (existing) => {
-      if (existing) {
-        // Re-assert the ROLE only — never the password (Settings must win).
-        await prisma.user.update({
-          where: { username: adminUsername },
-          data: { adminRole: "top_admin" },
-        });
-        console.log(
-          `[db-setup] Admin account "${adminUsername}" already exists — top_admin role re-asserted (password untouched).`
-        );
-        return;
-      }
-
-      if (adminPassword.length < 6) {
-        console.warn(
-          "[db-setup] ADMIN_PASSWORD is shorter than 6 characters — admin account NOT created. Set a stronger one and restart."
-        );
-        return;
-      }
-
-      // Same hashing as src/db/users.ts secureHashPassword.
-      const salt = randomBytes(16).toString("hex");
-      const key = scryptSync(adminPassword, salt, 64, { N: 16384, r: 8, p: 1 });
-      const hash = key.toString("hex");
-      const userKey = "Admin" + randomBytes(3).toString("hex");
-      await prisma.user.create({
-        data: {
-          username: adminUsername,
-          password: hash,
-          salt,
-          hashVersion: 1,
-          userKey,
-          avatar: { shirt: "SHIRT-1", left_leg: "PANTS-1", right_leg: "PANTS-1", face: "FACE-1", skin: "#f8ff6d" } as any,
-          webuy: 999999,
-          itemsOwned: ["FACE-1", "SHIRT-1", "PANTS-1"],
-          description: "Official WeildBuild admin account.",
-          adminRole: "top_admin",
-          banned: { is_banned: false, reason: "" } as any,
-          notifications: [] as any,
-          visualSettings: { dark_mode: true, ui_scale: 1, animations: true, reduce_motion: false } as any,
-        },
-      });
-      console.log(`[db-setup] Admin account "${adminUsername}" created (top_admin) from ADMIN_USERNAME/ADMIN_PASSWORD env vars.`);
-    })
-    .catch((err: any) => {
-      console.warn(`[db-setup] Admin bootstrap failed (non-fatal, retried on next boot): ${String(err?.message ?? err).split("\n")[0]}`);
-    });
-}
-
 export async function ensureDatabase(): Promise<void> {
   console.log("─".repeat(58));
   console.log("[db-setup] Automatic database setup started (v1.3.1)");
@@ -304,11 +214,15 @@ export async function ensureDatabase(): Promise<void> {
     const users = await prisma.user.count();
     if (users === 0) {
       console.log(
-        "[db-setup] Empty database detected — seeding the official shop items…"
+        "[db-setup] Empty database detected — seeding the default admin\n" +
+          "    account (WeildBuild) and the shop items…"
       );
       const seeded = await runWithRetries("npx tsx prisma/seed.ts", "seed");
       if (seeded) {
-        console.log("[db-setup] Seed complete (shop items only).");
+        console.log(
+          "[db-setup] Seed complete. Default admin login: WeildBuild\n" +
+            "    (password from prisma/seed.ts — change it after first login!)"
+        );
       }
     } else {
       console.log(
@@ -319,10 +233,6 @@ export async function ensureDatabase(): Promise<void> {
     const msg = String(err?.message ?? err).split("\n")[0];
     console.warn(`[db-setup] Could not check for seeding (non-fatal): ${msg}`);
   }
-
-  // v2.1: admin bootstrap from ADMIN_USERNAME/ADMIN_PASSWORD env vars.
-  // Create-if-missing (role re-asserted, password NEVER overwritten).
-  bootstrapAdminFromEnv();
 
   // v1.8.1: ALWAYS re-sync the official catalog (idempotent upserts).
   // This is what pushes catalog edits (names/descriptions/prices/colors)

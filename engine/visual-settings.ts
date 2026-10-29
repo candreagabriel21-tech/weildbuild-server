@@ -36,23 +36,14 @@ export interface VisualSettings {
 // v1.9.3: applying the volume needs the shared audio context (sounds.ts).
 import { setMasterVolume } from "./sounds";
 
-const KEY = "wb-visual-settings-v2";
+const KEY = "wb-visual-settings";
 export const VISUAL_SETTINGS_CHANGED = "wb:visual-settings-changed";
 
 export const DEFAULT_VISUAL_SETTINGS: VisualSettings = {
-  // v2.0 RETRO THEME: the platform's default look is now the bright
-  // "Classic" (light) theme - the old-Roblox inspired paper style. The
-  // key was bumped from wb-visual-settings to wb-visual-settings-v2 so
-  // existing devices (seeded with the old dark default) start fresh
-  // with the new look; anyone who prefers night can flip the toggle
-  // in Settings and that choice is kept from then on.
-  dark_mode: false,
+  dark_mode: true,
   animations: true,
   reduce_motion: false,
-  // v2.1 (user request): new accounts default to the LEFT sidebar (and
-  // "top" is gone from the options entirely - the top bar + page cards
-  // overlapped it). Existing devices keep whatever they saved.
-  sidebar_position: "left",
+  sidebar_position: "right",
   ui_scale: 1,
   // v1.9.4 (user request): volume starts at 100%, not 80%.
   volume: 100,
@@ -93,11 +84,8 @@ export function loadVisualSettings(serverSeed?: Partial<VisualSettings> | null):
       const parsed = JSON.parse(raw);
       return { ...DEFAULT_VISUAL_SETTINGS, ...parsed };
     }
-    // First read on this device → seed from the server profile.
-    // v2.0: dark_mode is intentionally NOT taken from the old server
-    // seed either - the retro Classic look is the new default, and the
-    // old profile value almost always says "dark" (the old default).
-    const seeded = { ...DEFAULT_VISUAL_SETTINGS, ...(serverSeed || {}), dark_mode: DEFAULT_VISUAL_SETTINGS.dark_mode };
+    // First read on this device → seed from the server profile
+    const seeded = { ...DEFAULT_VISUAL_SETTINGS, ...(serverSeed || {}) };
     localStorage.setItem(KEY, JSON.stringify(seeded));
     return seeded;
   } catch {
