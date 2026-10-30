@@ -1,26 +1,18 @@
 // ═══════════════════════════════════════════════════════════════════
-// WeildBuild — v6.4 CSP death/respawn + per-player rule effects test
+// WeildBuild — v6.2.1 death/respawn + per-player rule effects test
 // ═══════════════════════════════════════════════════════════════════
-// Regression test for the two reported game-breaking bugs, reworked for
-// the v6.4 CSP architecture (the server SIMULATES the player's body
-// itself - no client state reports needed):
+// Regression test for the two reported game-breaking bugs:
 //
-//   1. "When a player dies, everyone dies" - kill_player used to write
+//   1. "When a player dies, everyone dies" — kill_player used to write
 //      the single shared playState.characterHealth, which the worker
 //      mirrored onto EVERY player. Now the engine queues a per-player
 //      effect naming the TOUCHING player, and only that player dies.
 //
-//   2. "They never respawn properly" - rule-driven deaths never set the
-//      server's dyingTimer, so respawn() never ran. Now killPlayer()
-//      starts the death cycle and the authority respawns the player at
-//      spawn with full hp.
-//
-// v6.4 CSP: there are NO pstate reports anymore. The server simulates
-// the player's body itself; Alice spawns ON the kill brick (her slot #0
-// is the spawn point itself), the touch check fires immediately, the
-// death cycle runs, respawn teleports her back to spawn (still on the
-// brick), and the cycle repeats. Bob (slot #1, on the ring) is clear
-// of the brick and never dies.
+//   2. "They never respawn properly" — rule-driven deaths never set the
+//      server's dyingTimer, so respawn() never ran (hp stayed 0 forever,
+//      other players never even saw the death). Now killPlayer() starts
+//      the death cycle and the authority respawns the player at spawn
+//      with full hp.
 //
 // Usage: npx tsx tests/test-death-respawn.ts
 // (run `node scripts/build-world-runtime.mjs` first)
@@ -65,8 +57,10 @@ const studioState = {
       transparency: 0, reflectance: 0, anchored: true, canCollide: true,
       friction: 0.5, elasticity: 0.2, density: 1, isBaseplate: true,
       children: [], parentId: null, bodyMovers: [], effects: [], rules: [] },
-    // KILL BRICK: sits exactly at Alice's spawn feet position (small
-    // enough that Bob's ring-1 spawn slot stays clear of it). Its
+    // v1.3 (CharacterRoot removed): the explicit studioState.spawnPoint below
+    // drives the spawn point (Alice joins at slot #0 = the spawn itself).
+    // KILL BRICK: sits exactly at Alice's spawn feet position (small enough
+    // that Bob's ring-1 spawn slot stays clear of it). Its
     // when_touched(player) rule kills whoever steps on it.
     { id: 'lava', name: 'LavaBrick', type: 'Block',
       position: { x: 5, y: 0.1, z: 5 }, rotation: { x: 0, y: 0, z: 0 },
@@ -91,6 +85,7 @@ const studioState = {
 
 async function main(): Promise<void> {
   const worker = new Worker(bundle);
+  let reportTimer: NodeJS.Timeout | null = null;
   try {
     worker.postMessage({ t: 'init', studioState, maxPlayers: 4 });
     await waitMessage(worker, (m) => m?.t === 'ready');
@@ -98,11 +93,17 @@ async function main(): Promise<void> {
 
     // Two players join. Alice (join #0) spawns ON the kill brick;
     // Bob (join #1) lands on the ring, clear of it.
-    // v6.4 CSP: no reports - the server simulates both bodies. Alice's
-    // body is created at the spawn point (on the lava brick), so the
-    // touch check fires the moment she joins.
     worker.postMessage({ t: 'playerJoin', socketId: 's-alice', username: 'Alice' });
     worker.postMessage({ t: 'playerJoin', socketId: 's-bob', username: 'Bob' });
+
+    // v6.2.6: the clients own their characters - Alice's client reports her
+    // standing ON the lava brick (the owning simulation), Bob's reports him
+    // on his ring slot. The authority's touch checks run against the
+    // REPORTED positions, exactly like the real client flow.
+    reportTimer = setInterval(() => {
+      worker.postMessage({ t: 'pstate', socketId: 's-alice', x: 5, y: 0, z: 5, yaw: 0, walking: false, jumping: false, sprint: false });
+      worker.postMessage({ t: 'pstate', socketId: 's-bob', x: 5, y: 0, z: 6.6, yaw: 0, walking: false, jumping: false, sprint: false });
+    }, 250);
 
     const findPlayer = (snap: any, id: string) =>
       Array.isArray(snap?.players) ? snap.players.find((p: any) => p.socketId === id) : undefined;
@@ -156,6 +157,7 @@ async function main(): Promise<void> {
 
     console.log('\n✓ death/respawn + per-player effects: ALL PASS');
   } finally {
+    if (reportTimer) clearInterval(reportTimer);
     worker.postMessage({ t: 'stop' });
     await new Promise((r) => setTimeout(r, 300));
     try { await worker.terminate(); } catch { /* already gone */ }

@@ -1,78 +1,62 @@
 // ═══════════════════════════════════════════════════════════════════
-// WeildBuild — netcode bridge (v6.4 CSP, client side)
+// WeildBuild — netcode bridge (v1.3, client side)
 // ═══════════════════════════════════════════════════════════════════
 // The channel between the GamePlayer's Socket.IO connection and the
-// play viewport's frame loop, for CLIENT-SIDE PREDICTION with a
-// SERVER-AUTHORITATIVE player simulation:
+// play viewport's frame loop, for ROBLOX-STYLE multiplayer (v6.2.6):
 //
-//   INPUT FLOW (client -> server, ~20 Hz):
-//     StudioPlayViewport reads the keyboard/joystick -> calls
-//     reportPlayerInput({x, z, jump, sprint, yaw}). The bridge throttles
-//     to PLAYER_REPORT_HZ, assigns an incrementing `seq`, and emits
-//     "game:input" through the state sender. The server integrates this
-//     against the DYNAMIC cannon body (the authority).
+//   STATE FLOW (client → server, 4 Hz):
+//     GamePlayerCharacter → reportPlayerState() → the sender GamePlayer
+//     installed → socket.emit("game:pstate", ...). Each client SIMULATES
+//     ITS OWN character locally (the full singleplayer feel - instant
+//     input, local walls, local jumps) and reports position/yaw/anim to
+//     the authority every 0.25 s (PLAYER_REPORT_HZ). The server applies
+//     light checks (PLAYER_LIGHT_CHECK_STUDS), keeps the last accepted
+//     report as that player's position, and relays it to everyone else.
 //
-//   PREDICTION (local):
-//     The viewport runs the SAME movement math (character-constants.ts)
-//     against its own local body. Input is INSTANT (0 ms latency). The
-//     viewport records each prediction (seq -> pos, vel) into a ring
-//     buffer so it can be compared against the authority later.
-//
-//   RECONCILIATION (server -> client, 30 Hz delta snapshots):
-//     • OTHER players: timestamped samples -> buffered interpolation at
-//       REMOTE_INTERP_DELAY_MS (smooth even when someone lags).
-//     • YOUR OWN entry: the server's authoritative position + `ackSeq`
-//       (the last input seq the server has applied). reconcileSelf()
-//       finds the prediction at ackSeq, computes the divergence, and
-//       returns one of:
-//         - null: divergence tiny (<= RECONCILE_IGNORE_STUDS). Ignore.
-//         - { kind: 'drift', offset, dist, ackSeq }: small divergence
-//           (0.75 < dist <= 3.0). Apply gradually over many frames
-//           (15% per frame, smoothed away invisibly over ~10-20 frames).
-//         - { kind: 'snap', offset, dist, ackSeq }: large divergence
-//           (> 3.0 studs). Hard snap (teleport + zero velocity) - the
-//           rule teleport or kill-brick respawn.
+//   STATE FLOW (server → client, 30 Hz delta snapshots):
+//     • OTHER players: timestamped samples → buffered interpolation at
+//       REMOTE_INTERP_DELAY_MS (smooth even when someone lags - the
+//       samples are dense relative to the 0.25 s report cadence).
+//     • YOUR OWN entry: the authority does NOT drive your movement (you
+//       are the simulation). It only contributes what it alone can know:
+//       hp, the dying flag (rules + void deaths + the respawn timer) and
+//       one-shot `tp` forced positions (spawn slot, respawn, teleport
+//       rules) that teleport the local body.
 //     • PARTS: the authority simulates every part; corrections stream to
-//       the local proxies.
+//       the local proxies (see Viewport3D - no local part simulation).
 //
 // Singleplayer / Test Play never touches this module (netcode.mode stays
 // 'local' and every field stays null/empty).
 
 import { PLAYER_REPORT_HZ, PLAYER_KEEPALIVE_HZ } from './game-engine/character-constants';
 
-/** v6.4 CSP: one INPUT report the owning client sends about ITS OWN
- * controls. The direction (x,z) is camera-relative and unit length (or
- * zero). The server integrates this against the dynamic body using the
- * same math the local prediction runs. */
-export interface PlayerInputReport {
-  /** The bridge-assigned sequence number (incrementing per sent report).
-   * The server echoes the latest applied one back as `ackSeq` so the
-   * client can find the matching prediction. */
-  seq: number;
-  /** Camera-relative walk direction (unit length or 0,0). */
+/** One state report the owning client sends about ITS OWN character. */
+export interface PlayerStateReport {
+  /** Feet position (the visible body root). */
   x: number;
+  y: number;
   z: number;
-  /** True on the frame the jump key went down (edge-triggered). */
-  jump: boolean;
-  /** True while the sprint modifier is held. */
-  sprint: boolean;
-  /** Body yaw (radians) - the latest reported camera/look yaw. */
+  /** Body yaw (radians). */
   yaw: number;
+  /** Anim flags (the jump flag must come from a latch - see
+   * createJumpLatch in character-constants - so remote viewers see
+   * exactly one jump rising edge per hop). */
+  walking: boolean;
+  jumping: boolean;
+  sprint: boolean;
 }
 
 /** Authority-owned state for the LOCAL player inside a snapshot.
- * v6.4 CSP: position + ackSeq ARE used to drive reconciliation. When the
- * server's authoritative position diverges from the client's prediction
- * (at the server's last applied input seq), the viewport applies a
- * GRADUAL correction (drift path) or a hard snap. */
+ * v6.2.6: position is NOT used to drive movement anymore - the client IS
+ * the simulation of its own character - but the entry's last reported
+ * position rides along so the play viewport can sanity-check death flags
+ * (a stale replayed dying=true after a link gap points at the OLD death
+ * spot, far from the live body - see StudioPlayViewport). */
 export interface SelfCorrection {
   seq: number;
-  /** v6.4 CSP: the last input seq the server has applied. The viewport
-   * looks up its prediction at this seq to compute the divergence. */
-  ackSeq: number;
-  /** Body yaw (radians) - the authority's record of our facing. */
+  /** Body yaw (radians) - informational echo of the last accepted report. */
   yaw: number;
-  /** The authority's record of our position (feet). */
+  /** The authority's record of our position (feet). Diagnostic only. */
   x: number;
   y: number;
   z: number;
@@ -87,56 +71,19 @@ export interface SelfCorrection {
   receivedAt: number;
 }
 
-/** A prediction sample (the local body's state right after sending input
- * seq N). Used by reconcileSelf to compute divergence at the server's
- * ackSeq. */
-export interface PredictionSample {
-  seq: number;
-  x: number;
-  y: number;
-  z: number;
-  vx: number;
-  vy: number;
-  vz: number;
-  /** performance.now() ms when this sample was recorded. */
-  t: number;
-}
-
-/** The result of reconcileSelf: how the viewport should react to the
- * authority's record at ackSeq. */
-export type ReconcileResult =
-  | { kind: 'drift'; offset: [number, number, number]; dist: number; ackSeq: number }
-  | { kind: 'snap'; offset: [number, number, number]; dist: number; ackSeq: number };
-
-/** Divergence at or below this many studs is ignored entirely. Set HIGH
- * (3.0) because the prediction uses the SAME math as the server, so
- * real divergence is tiny. The only time it exceeds 3 studs is a rule
- * teleport, kill-brick respawn, or being shoved by a part. Ignoring
- * everything below 3.0 means: no drift correction, no oscillation, no
- * choppiness. The prediction just runs freely. */
-export const RECONCILE_IGNORE_STUDS = 3.0;
-/** Divergence above this triggers a HARD snap (teleport body + zero
- * velocity). Set equal to RECONCILE_IGNORE_STUDS so there is no "drift"
- * zone in between - the previous drift approach caused oscillation
- * (the drift was recorded in the prediction history, making each
- * successive reconcile compute a wrong offset). Now it's binary:
- * ignore or snap. */
-export const RECONCILE_SNAP_STUDS = 3.0;
-
 // ─── v6.2.5 + v6.2.6: entity interpolation (REMOTE players) ───
-// Remote characters render from a TIMESTAMPED buffer of the 30 Hz relay,
-// sampled at a fixed delay behind arrival time. The delay must cover the
-// ~33 ms snapshot period plus arrival jitter, so the render clock always
-// sits between two live samples - "if someone lags it's still smooth"
-// (the user's plan). 100 ms = 33 ms + 67 ms jitter budget for the
-// denser 30 Hz stream the server emits under CSP.
-export const REMOTE_INTERP_DELAY_MS = 100;
+// Remote characters render from a TIMESTAMPED buffer of the 4 Hz report
+// relay, sampled at a fixed delay behind arrival time. The delay must
+// cover the 250 ms report period plus arrival jitter, so the render clock
+// always sits between two live samples - "if someone lags it's still
+// smooth" (the user's plan). 300 ms = 250 + 50 jitter budget.
+export const REMOTE_INTERP_DELAY_MS = 300;
 /** Consecutive samples farther apart than this are NOT interpolated
  * across (a delta-stream gap - an idle player simply stops being
  * broadcast until the 2 s keyframe - must not become a slow creep
  * between two distant positions): the earlier sample is held, and the
- * buffer is trimmed on the next push. 500 ms = a long idle gap; a
- * standing player holds still, a moving one interpolates. */
+ * buffer is trimmed on the next push. 500 ms = two missed report
+ * periods; a standing player holds still, a moving one interpolates. */
 export const INTERP_GAP_CAP_MS = 500;
 /** A pair of samples this far apart (studs) is a teleport/respawn: hold
  * the old position, then snap exactly when the render clock reaches the
@@ -219,7 +166,7 @@ export interface PartCorrection {
   rz: number;
 }
 
-type InputSender = (report: PlayerInputReport) => void;
+type StateSender = (report: PlayerStateReport) => void;
 type ClickSender = (partId: string) => void;
 
 let clickSender: ClickSender | null = null;
@@ -236,14 +183,11 @@ export function reportClick(partId: string): void {
 
 // ─── The bridge singleton (plain module state - one game at a time) ───
 
-let inputSender: InputSender | null = null;
+let stateSender: StateSender | null = null;
 let lastReportSentAt = 0;
-// v6.4 CSP: the per-session incrementing input seq counter. The server
-// echoes the latest applied one back as `ackSeq` in every snapshot.
-let inputSeqCounter = 0;
 // v1.3: the last report actually sent (for the send-on-change detection
-// in reportPlayerInput).
-let lastSentReport: Omit<PlayerInputReport, 'seq'> | null = null;
+// in reportPlayerState).
+let lastSentReport: PlayerStateReport | null = null;
 
 let selfCorrection: SelfCorrection | null = null;
 let partCorrections: PartCorrection[] = [];
@@ -258,14 +202,6 @@ let fxQueue: Array<{ name: string; volume: number }> = [];
 // only the life-state ownership changes).
 let lastSnapshotAt = 0;
 
-// v6.4 CSP: the prediction ring buffer. Each entry is the local body's
-// state right AFTER sending input seq N. reconcileSelf finds the entry
-// with seq <= ackSeq and computes the divergence. Capped at 240 entries
-// (= 12 s at 20 Hz - any older prediction is long since irrelevant).
-const PREDICTION_HISTORY_CAP = 240;
-let predictionHistory: PredictionSample[] = [];
-let lastReconcile: { kind: 'drift' | 'snap'; dist: number; ackSeq: number; at: number } | null = null;
-
 /** How long ago the last server snapshot arrived (ms). Infinity = never. */
 export function serverSnapshotAgeMs(): number {
   if (lastSnapshotAt === 0) return Infinity;
@@ -274,21 +210,21 @@ export function serverSnapshotAgeMs(): number {
 }
 
 /** Installed by GamePlayer while a server-hosted session is live. */
-export function setStateSender(sender: InputSender | null): void {
-  inputSender = sender;
+export function setStateSender(sender: StateSender | null): void {
+  stateSender = sender;
 }
 
 /**
- * v6.4 CSP: called by the play viewport every frame - throttled to
- * PLAYER_REPORT_HZ. Sends the INPUT state (the desired movement, NOT the
- * body's position). v1.3 (user request): the upload now fires AS SOON AS
- * the player's input changes (capped at one report per 1/PLAYER_REPORT_HZ
- * = 0.05 s), with a slow PLAYER_KEEPALIVE_HZ keepalive when standing
- * perfectly still. The local character predicts instantly off this same
- * input; the server integrates the same against its authoritative body.
+ * v6.2.6: called by the play viewport every frame - throttled to
+ * PLAYER_REPORT_HZ. v1.3 (user request): the upload now fires AS SOON AS
+ * the player's position/rotation/anim state changes (capped at one report
+ * per 1/PLAYER_REPORT_HZ = 0.05 s), with a slow PLAYER_KEEPALIVE_HZ
+ * keepalive when standing perfectly still, instead of the old flat 4 Hz
+ * timer. The local character IS the simulation; this just tells the server
+ * where it is so it can relay it (and run its light checks).
  */
-export function reportPlayerInput(report: Omit<PlayerInputReport, 'seq'>): void {
-  if (!inputSender) return;
+export function reportPlayerState(report: PlayerStateReport): void {
+  if (!stateSender) return;
   const now = typeof performance !== 'undefined' ? performance.now() : Date.now();
   // lastReportSentAt === 0 means "never sent" (performance.now() can be
   // small early in a process - 0 must not look like a fresh send).
@@ -300,89 +236,17 @@ export function reportPlayerInput(report: Omit<PlayerInputReport, 'seq'>): void 
     const changed =
       !lastSentReport ||
       Math.abs(report.x - lastSentReport.x) > 0.01 ||
+      Math.abs(report.y - lastSentReport.y) > 0.01 ||
       Math.abs(report.z - lastSentReport.z) > 0.01 ||
-      report.jump !== lastSentReport.jump ||
-      report.sprint !== lastSentReport.sprint ||
-      Math.abs(report.yaw - lastSentReport.yaw) > 0.5;
+      Math.abs(report.yaw - lastSentReport.yaw) > 0.5 ||
+      report.walking !== lastSentReport.walking ||
+      report.jumping !== lastSentReport.jumping ||
+      report.sprint !== lastSentReport.sprint;
     if (!changed && sinceLast < 1000 / PLAYER_KEEPALIVE_HZ - 2) return;
   }
   lastReportSentAt = now;
   lastSentReport = { ...report };
-  inputSeqCounter += 1;
-  inputSender({ seq: inputSeqCounter, ...report });
-}
-
-/** The seq of the last input the bridge sent (0 before the first send). */
-export function getLastInputSeq(): number {
-  return inputSeqCounter;
-}
-
-/**
- * v6.4 CSP: record a prediction sample (the local body's state right
- * AFTER sending input seq). The viewport calls this every frame after
- * stepping the local body. The history is capped; older entries are
- * dropped. reconcileSelf() looks up the entry matching the server's
- * ackSeq to compute the divergence.
- */
-export function recordPrediction(
-  seq: number,
-  pos: [number, number, number],
-  vel: [number, number, number],
-): void {
-  if (seq <= 0) return; // before the first input - nothing to reconcile against
-  const now = typeof performance !== 'undefined' ? performance.now() : Date.now();
-  predictionHistory.push({ seq, x: pos[0], y: pos[1], z: pos[2], vx: vel[0], vy: vel[1], vz: vel[2], t: now });
-  if (predictionHistory.length > PREDICTION_HISTORY_CAP) {
-    predictionHistory.splice(0, predictionHistory.length - PREDICTION_HISTORY_CAP);
-  }
-}
-
-/**
- * v6.4 CSP: reconcile the local prediction at the server's last applied
- * input seq (`ackSeq`) against the authority's position. Returns:
- *   - null: divergence <= RECONCILE_IGNORE_STUDS (ignore - it is inside
- *     the tick-quantization + solver-drift noise floor).
- *   - { kind: 'drift', offset, dist, ackSeq }: small divergence (up to
- *     RECONCILE_SNAP_STUDS) - the viewport applies the offset GRADUALLY
- *     over many frames (15% per frame, smoothed away invisibly).
- *   - { kind: 'snap', offset, dist, ackSeq }: large divergence - hard
- *     snap (teleport + zero velocity). Rule teleports, kill-brick
- *     respawns, and the first spawn-slot tp land here.
- * The offset is `serverPos - predictedPos` at the time of ackSeq.
- */
-export function reconcileSelf(ackSeq: number, serverPos: [number, number, number]): ReconcileResult | null {
-  if (ackSeq <= 0) return null;
-  // Find the prediction at the server's ackSeq. The history is in
-  // ascending seq order; pick the entry with the largest seq <= ackSeq
-  // (the prediction that was active when the server applied ackSeq).
-  let pred: PredictionSample | null = null;
-  for (let i = predictionHistory.length - 1; i >= 0; i--) {
-    if (predictionHistory[i].seq <= ackSeq) { pred = predictionHistory[i]; break; }
-  }
-  if (!pred) return null; // no matching prediction - history already trimmed
-  const dx = serverPos[0] - pred.x;
-  const dy = serverPos[1] - pred.y;
-  const dz = serverPos[2] - pred.z;
-  const dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
-  lastReconcile = { kind: dist > RECONCILE_SNAP_STUDS ? 'snap' : 'drift', dist, ackSeq, at: typeof performance !== 'undefined' ? performance.now() : Date.now() };
-  if (dist <= RECONCILE_IGNORE_STUDS) return null;
-  // Hard snap: teleport the body to the server's authoritative position.
-  // With RECONCILE_IGNORE_STUDS == RECONCILE_SNAP_STUDS, there is no drift
-  // zone - the prediction either matches closely enough to ignore, or it's
-  // a real misprediction that needs a hard snap. This eliminates the
-  // oscillation that the drift approach caused (the drift was recorded in
-  // the prediction history, making each successive reconcile compute a
-  // wrong offset).
-  while (predictionHistory.length > 0 && predictionHistory[0].seq <= ackSeq) {
-    predictionHistory.shift();
-  }
-  lastReconcile = { kind: 'snap', dist, ackSeq, at: typeof performance !== 'undefined' ? performance.now() : Date.now() };
-  return { kind: 'snap', offset: [dx, dy, dz], dist, ackSeq };
-}
-
-/** The last reconcile result the bridge produced (diagnostics only). */
-export function getLastReconcile(): { kind: 'drift' | 'snap'; dist: number; ackSeq: number; at: number } | null {
-  return lastReconcile;
+  stateSender(report);
 }
 
 /** Latest authority-owned state for the local player (null in singleplayer). */
@@ -408,7 +272,7 @@ export function drainFx(): Array<{ name: string; volume: number }> {
 
 /** Called by GamePlayer on every server snapshot. */
 export function pushSnapshot(data: {
-  self?: { socketId: string; ackSeq?: number; x?: number; y?: number; z?: number; yaw: number; hp: number; dying: boolean; seq: number; tp?: number[] | { x: number; y: number; z: number } };
+  self?: { socketId: string; x?: number; y?: number; z?: number; yaw: number; hp: number; dying: boolean; seq: number; tp?: number[] | { x: number; y: number; z: number } };
   parts?: PartCorrection[];
   fx?: Array<{ name: string; volume: number }>;
 }): void {
@@ -425,7 +289,6 @@ export function pushSnapshot(data: {
     }
     selfCorrection = {
       seq: s.seq,
-      ackSeq: typeof s.ackSeq === 'number' ? s.ackSeq : 0,
       yaw: s.yaw,
       x: typeof s.x === 'number' ? s.x : 0,
       y: typeof s.y === 'number' ? s.y : 0,
@@ -448,14 +311,10 @@ export function pushSnapshot(data: {
 
 /** Reset everything (session start/end). */
 export function resetNetcodeBridge(): void {
-  inputSender = null;
+  stateSender = null;
   selfCorrection = null;
   partCorrections = [];
   fxQueue = [];
   lastReportSentAt = 0;
   lastSnapshotAt = 0;
-  inputSeqCounter = 0;
-  lastSentReport = null;
-  predictionHistory = [];
-  lastReconcile = null;
 }

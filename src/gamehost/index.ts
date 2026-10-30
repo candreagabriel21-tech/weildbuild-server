@@ -520,13 +520,18 @@ io.on("connection", (socket) => {
   });
 
   // ── game:pstate { instanceId, x, y, z, yaw, walking, jumping, sprint } ──
-  // v6.4 CSP: silently dropped. The server now SIMULATES each player's
-  // movement itself (driven by game:input below), so client-side state
-  // reports are obsolete - the body's transform is the authority. Old
-  // clients still emitting pstate keep working (their input stream drives
-  // the server body; the pstate is simply ignored).
-  socket.on("game:pstate", (_payload: unknown) => {
+  // v6.2.6: THE player channel of the Roblox-style model. Each client
+  // simulates its OWN character locally (the full singleplayer feel) and
+  // reports its state every 0.25 s; the worker applies light checks
+  // (PLAYER_LIGHT_CHECK_STUDS), keeps the last accepted report as that
+  // player's position, and relays it to everyone else in the snapshots.
+  socket.on("game:pstate", (payload: unknown) => {
+    const p = asRecord(payload);
+    const instance = resolvePlayerInstance(socket.id, p.instanceId);
+    if (!instance) return;
+    if (!instance.players.has(socket.id)) return;
     socket.data.lastSeen = Date.now(); // duplicate guard liveness
+    worldSims.pstate(instance.id, socket.id, p);
   });
 
   // ── game:syncWorld ──
@@ -570,16 +575,12 @@ io.on("connection", (socket) => {
     );
   });
 
-  // ── game:input { instanceId, x, z, jump, sprint, yaw, seq } ──
-  // v6.4 CSP: THE player channel. Each client streams its current INPUT
-  // state (camera-relative direction, jump press, sprint, yaw) at ~20 Hz.
-  // The server integrates these against the dynamic cannon body (the
-  // authority), mirrors the body's settled position into snapshots, and
-  // echoes back `ackSeq` so the client can reconcile its local prediction.
-  // The client-side prediction runs the SAME movement math (shared via
-  // character-constants.ts); small divergence is smoothed GRADUALLY (15%
-  // per frame), large divergence (rule teleports, kill-brick respawns)
-  // snaps hard - that is the smooth-walking-but-no-cheating goal of CSP.
+  // ── game:input { instanceId, x, z, jump, sprint, yaw } ──
+  // v6.2.6 LEGACY: the old authority-side movement channel. The server no
+  // longer simulates characters (each client owns its own body now and
+  // reports via game:pstate), so these are accepted and silently ignored -
+  // old clients keep working, their characters simply run client-side
+  // like everyone's.
   socket.on("game:input", (payload: unknown) => {
     const p = asRecord(payload);
     const instance = resolvePlayerInstance(socket.id, p.instanceId);

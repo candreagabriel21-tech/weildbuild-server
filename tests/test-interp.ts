@@ -1,9 +1,9 @@
 // ═══════════════════════════════════════════════════════════════════
-// WeildBuild — v6.4 CSP entity interpolation + input throttle test
+// WeildBuild — v6.2.6 entity interpolation + report throttle test
 // ═══════════════════════════════════════════════════════════════════
 // Regression test for the client-side interpolation core that remote
 // character rendering runs on (sampleInterp in netcode-bridge) plus the
-// input throttle (reportPlayerInput):
+// 0.25 s state-report throttle (reportPlayerState):
 //
 //   • Positions interpolate LINEARLY between two timestamped samples
 //     (never a chase, never a sawtooth).
@@ -13,8 +13,8 @@
 //   • A teleport-class distance holds the old position and snaps exactly
 //     when the render clock reaches the new sample - never streaks.
 //   • Yaw interpolates through the SHORTEST ARC.
-//   • reportPlayerInput rides the PLAYER_REPORT_HZ (20 Hz) throttle - the
-//     v6.4 CSP input cadence.
+//   • reportPlayerState rides the PLAYER_REPORT_HZ (4 Hz) throttle - the
+//     0.25 s cadence of the Roblox-style model.
 //
 // Usage: npx tsx tests/test-interp.ts
 // (imports the synced engine copy - run `npm run build` first)
@@ -23,12 +23,8 @@ import assert from "node:assert";
 import {
   sampleInterp,
   resetNetcodeBridge,
-  reportPlayerInput,
+  reportPlayerState,
   setStateSender,
-  reconcileSelf,
-  recordPrediction,
-  RECONCILE_IGNORE_STUDS,
-  RECONCILE_SNAP_STUDS,
   REMOTE_INTERP_DELAY_MS,
   INTERP_GAP_CAP_MS,
   INTERP_TELEPORT_STUDS,
@@ -43,7 +39,7 @@ function main(): void {
   {
     const buf: InterpSample[] = [
       { t: 1000, x: 0, y: 0, z: 0, yaw: 0 },
-      { t: 1250, x: 10, y: 0, z: 0, yaw: 0 }, // 250 ms apart
+      { t: 1250, x: 10, y: 0, z: 0, yaw: 0 }, // 250 ms apart: the 4 Hz report cadence
     ];
     const mid = sampleInterp(buf, 1125, INTERP_GAP_CAP_MS, INTERP_TELEPORT_STUDS);
     assert.ok(mid, "mid-sample must resolve");
@@ -58,7 +54,7 @@ function main(): void {
     assert.ok(Math.abs(vSample!.vy - 10) < 1e-6, `vy expected 10 studs/s, got ${vSample!.vy}`);
   }
 
-  // ── 2. Empty buffer -> null; ends hold ──
+  // ── 2. Empty buffer → null; ends hold ──
   {
     assert.strictEqual(sampleInterp([], 1000, INTERP_GAP_CAP_MS, INTERP_TELEPORT_STUDS), null,
       "empty buffer must sample to null");
@@ -73,7 +69,7 @@ function main(): void {
   }
 
   // ── 3. A time gap HOLDS - no creep between distant samples ──
-  // The remote gap cap is 500 ms.
+  // The remote gap cap is 500 ms (two missed 0.25 s report periods).
   {
     const buf: InterpSample[] = [
       { t: 1000, x: 0, y: 0, z: 0, yaw: 0 },
@@ -107,51 +103,27 @@ function main(): void {
       `yaw halfway between 3.0 and -3.0 must be near +/-PI (shortest arc), got ${mid.yaw}`);
   }
 
-  // ── 6. reportPlayerInput rides the 20 Hz throttle + assigns seq ──
+  // ── 6. reportPlayerState rides the 4 Hz throttle ──
   void (async () => {
     resetNetcodeBridge();
-    const sent: Array<{ seq: number; x: number; jump: boolean }> = [];
-    setStateSender((r) => sent.push({ seq: r.seq, x: r.x, jump: !!r.jump }));
-    const PERIOD = 1000 / PLAYER_REPORT_HZ; // 50 ms at 20 Hz
-    reportPlayerInput({ x: 1, z: 0, jump: false, sprint: false, yaw: 0 });
-    reportPlayerInput({ x: 2, z: 0, jump: false, sprint: false, yaw: 0 });
+    const sent: Array<{ x: number; jumping: boolean }> = [];
+    setStateSender((r) => sent.push({ x: r.x, jumping: !!r.jumping }));
+    const PERIOD = 1000 / PLAYER_REPORT_HZ; // 250 ms
+    reportPlayerState({ x: 1, y: 0, z: 0, yaw: 0, walking: true, jumping: false, sprint: false });
+    reportPlayerState({ x: 2, y: 0, z: 0, yaw: 0, walking: true, jumping: false, sprint: false });
     assert.strictEqual(sent.length, 1,
       `a second report inside the ${PERIOD.toFixed(0)}ms window must be throttled (got ${sent.length})`);
-    assert.strictEqual(sent[0].seq, 1, "the first sent report carries seq=1 (the incrementing CSP counter)");
     await sleep(PERIOD + 40);
-    reportPlayerInput({ x: 3, z: 0, jump: false, sprint: false, yaw: 0 });
+    reportPlayerState({ x: 3, y: 0, z: 0, yaw: 0, walking: false, jumping: true, sprint: false });
     assert.strictEqual(sent.length, 2, "after the period elapses the next report goes out");
-    assert.strictEqual(sent[1].seq, 2, "the second sent report carries seq=2 (counter keeps incrementing)");
+    assert.strictEqual(sent[1].jumping, true, "the anim flags ride the report verbatim");
     setStateSender(null);
-    reportPlayerInput({ x: 4, z: 0, jump: false, sprint: false, yaw: 0 });
+    reportPlayerState({ x: 4, y: 0, z: 0, yaw: 0, walking: false, jumping: false, sprint: false });
     assert.strictEqual(sent.length, 2, "no sender installed = nothing is sent");
     resetNetcodeBridge();
 
-    // ── 7. reconcileSelf: ignore vs snap thresholds ──
-    // v6.4: RECONCILE_IGNORE_STUDS == RECONCILE_SNAP_STUDS (3.0), so there
-    // is no drift zone. Divergence <= 3.0 is ignored; > 3.0 snaps.
-    resetNetcodeBridge();
-    // No prediction history -> null (nothing to compare against).
-    assert.strictEqual(reconcileSelf(1, [0, 0, 0]), null, "no matching prediction -> null");
-    // Record predictions at seq 1, 2, 3.
-    recordPrediction(1, [0, 0, 0], [0, 0, 0]);
-    recordPrediction(2, [1, 0, 0], [0, 0, 0]);
-    recordPrediction(3, [2, 0, 0], [0, 0, 0]);
-    // Small divergence (0.5 studs) -> ignored.
-    const ignore = reconcileSelf(3, [2.5, 0, 0]);
-    assert.strictEqual(ignore, null, `divergence <= RECONCILE_IGNORE_STUDS (${RECONCILE_IGNORE_STUDS} studs) is ignored`);
-    // Medium divergence (1.5 studs) -> also ignored (no drift zone).
-    const ignore2 = reconcileSelf(3, [3.5, 0, 0]);
-    assert.strictEqual(ignore2, null, `divergence <= RECONCILE_IGNORE_STUDS is ignored (no drift zone)`);
-    // Snap divergence (5 studs) -> snap path.
-    const snap = reconcileSelf(3, [7, 0, 0]);
-    assert.ok(snap && snap.kind === 'snap',
-      `divergence > RECONCILE_SNAP_STUDS (${RECONCILE_SNAP_STUDS} studs) is the snap path (got ${snap?.kind})`);
-    assert.ok(Math.abs(snap!.offset[0] - 5) < 1e-6, `snap offset = server - predicted (got ${snap!.offset[0]})`);
-    resetNetcodeBridge();
-
-    console.log('✓ entity interpolation + input throttle + reconcile: ALL PASS');
-    console.log(`  (remote delay ${REMOTE_INTERP_DELAY_MS}ms, gap cap ${INTERP_GAP_CAP_MS}ms, teleport ${INTERP_TELEPORT_STUDS} studs, input ${PLAYER_REPORT_HZ} Hz, ignore ${RECONCILE_IGNORE_STUDS} studs, snap ${RECONCILE_SNAP_STUDS} studs)`);
+    console.log('✓ entity interpolation + report throttle: ALL PASS');
+    console.log(`  (remote delay ${REMOTE_INTERP_DELAY_MS}ms, gap cap ${INTERP_GAP_CAP_MS}ms, teleport ${INTERP_TELEPORT_STUDS} studs, report ${PLAYER_REPORT_HZ} Hz)`);
   })().catch((e) => {
     console.error('✗ interp test FAILED:', e?.message || e);
     process.exit(1);
@@ -159,4 +131,3 @@ function main(): void {
 }
 
 main();
-
