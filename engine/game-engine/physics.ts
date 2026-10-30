@@ -1104,6 +1104,35 @@ export class PhysicsWorld {
   }
 
   /**
+   * v6.4 CSP SMOOTH CORRECTION: nudge the character hitbox toward
+   * `feetPosition` WITHOUT zeroing the velocity. Used by the reconcile
+   * step for SMALL divergences (between RECONCILE_IGNORE_STUDS and
+   * RECONCILE_SNAP_STUDS): the body's velocity is preserved so the
+   * player keeps moving smoothly, only the position is gently nudged
+   * toward the server's authoritative spot. The visible position is
+   * set directly (no lerp) so the next render frame reflects the
+   * correction immediately; subsequent frames continue predicting
+   * with the existing velocity (no stop-and-go).
+   *
+   * For LARGE divergences (rule teleport, kill-brick respawn, getting
+   * pushed by a part), use teleportCharacterBody instead - those need
+   * a hard reset (velocity zeroed) because the body is in a completely
+   * different state.
+   */
+  nudgeCharacterBody(feetPosition: { x: number; y: number; z: number }) {
+    if (!this.characterBody) return;
+    this.characterBody.position.set(
+      feetPosition.x,
+      feetPosition.y + this.characterHeight / 2,
+      feetPosition.z,
+    );
+    // Do NOT touch velocity - the body keeps moving with its current
+    // velocity, which is what makes this a SMOOTH correction.
+    this.characterBody.previousPosition.copy(this.characterBody.position);
+    this.characterBody.interpolatedPosition.copy(this.characterBody.position);
+  }
+
+  /**
    * Ground check for the character hitbox: a short ray straight down from the
    * body center (the character's own hitbox is excluded from the ray).
    */

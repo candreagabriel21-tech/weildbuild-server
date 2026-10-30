@@ -231,11 +231,30 @@ let lastSnapshotAt = 0;
 // cost of a misprediction, usually invisible because the math is identical).
 
 /** Threshold (studs) below which a mismatch is silently ignored - the
- * prediction was close enough. Above this the local body snaps to the
- * server's authoritative position. 0.5 studs is roughly 3 server ticks
- * of motion at walk speed (5 studs/s) - enough to absorb tick-alignment
- * noise without rubberbanding on every snapshot. */
-export const RECONCILE_SNAP_STUDS = 0.5;
+ * prediction was close enough. The server ticks at 30 Hz; at walk speed
+ * 10.8 studs/s, ONE server tick = 0.36 studs. So tick quantization alone
+ * can produce up to ~0.5 studs of divergence between the client's
+ * interpolated position and the server's last-tick position - we must
+ * not snap on that, or the player rubberbands every snapshot (the
+ * "choppy / teleporting instead of walking" report). 0.75 studs absorbs
+ * tick quantization + a small buffer for floating-point drift. */
+export const RECONCILE_IGNORE_STUDS = 0.75;
+/** Threshold (studs) above which a hard snap fires (the local body
+ * teleports to the server position, velocity zeroed). This is for REAL
+ * mispredictions: rule teleports, kill-brick respawns, getting shoved
+ * by a part - those move the body multiple studs in one snapshot and
+ * MUST be hard-corrected or the prediction will drift forever.
+ *
+ * Below this but above RECONCILE_IGNORE_STUDS, a SMOOTH nudge fires:
+ * the body's position is moved to the server position WITHOUT zeroing
+ * the velocity, so the player keeps moving smoothly (no stop-and-go)
+ * while still correcting the divergence. This is the "smoothening"
+ * layer between "ignore" and "snap".
+ *
+ * 3.0 studs is comfortably above any tick-quantization or solver-drift
+ * divergence (typically <1 stud) but well below real mispredictions
+ * (rule teleports move the body 10+ studs). */
+export const RECONCILE_SNAP_STUDS = 3.0;
 /** The maximum number of prediction history entries we keep. One per
  * render frame at 60 Hz = 60/s, so 240 entries = 4 seconds of history.
  * The server's ack usually lags by ~RTT/2 (typically 50-150 ms); keeping
@@ -341,12 +360,16 @@ export function recordPrediction(seq: number, pos: [number, number, number], vel
  * authoritative state. Called by the play viewport when a fresh self
  * entry arrives (it reads from getSelfCorrection each frame).
  *
- * Returns the snap target (server's authoritative position + the seq
- * for diagnostics) when a misprediction exceeded RECONCILE_SNAP_STUDS,
- * or null when the prediction was correct (or the server's ack is older
- * than our oldest history entry - we can't compare, so we skip). The
- * viewport applies the snap by teleporting the local body; the next
- * prediction frame continues from there.
+ * Returns one of three outcomes:
+ *   - { kind: 'snap', target, dist, ackSeq } - HARD snap: teleport the
+ *     body to target, zero velocity (real misprediction, e.g. rule
+ *     teleport). The viewport calls teleportCharacterBody(target).
+ *   - { kind: 'nudge', target, dist, ackSeq } - SMOOTH nudge: move the
+ *     body to target WITHOUT touching velocity (small divergence that
+ *     still needs correcting, e.g. slight solver drift). The viewport
+ *     calls nudgeCharacterBody(target).
+ *   - null - the prediction was correct (or the server's ack is older
+ *     than our oldest history entry - we can't compare, so we skip).
  *
  * Why no replay (re-running pending inputs from ackSeq+1 to current)?
  * The prediction math on the server is identical to the client (same
@@ -360,7 +383,7 @@ export function recordPrediction(seq: number, pos: [number, number, number], vel
  * release between ackSeq and current); the next frame catches that up.
  */
 export function reconcileSelf(ackSeq: number, serverPos: [number, number, number]): {
-  snapped: boolean;
+  kind: 'snap' | 'nudge';
   dist: number;
   target: [number, number, number];
   ackSeq: number;
@@ -391,16 +414,27 @@ export function reconcileSelf(ackSeq: number, serverPos: [number, number, number
   while (predictionHistory.length > 0 && predictionHistory[0].seq <= ackSeq) {
     predictionHistory.shift();
   }
-  if (dist <= RECONCILE_SNAP_STUDS) {
-    // Prediction was correct (or close enough). No snap.
-    lastReconcile = { ackSeq, dist, snapped: false, at: typeof performance !== 'undefined' ? performance.now() : Date.now() };
+  const now = typeof performance !== 'undefined' ? performance.now() : Date.now();
+  if (dist <= RECONCILE_IGNORE_STUDS) {
+    // Prediction was correct (or close enough). No correction needed.
+    lastReconcile = { ackSeq, dist, snapped: false, at: now };
     return null;
   }
-  // Misprediction! Snap the local body to the server's authoritative
-  // position. The viewport applies this; the next prediction frame
-  // continues from there.
-  lastReconcile = { ackSeq, dist, snapped: true, at: typeof performance !== 'undefined' ? performance.now() : Date.now() };
-  return { snapped: true, dist, target: [serverPos[0], serverPos[1], serverPos[2]], ackSeq };
+  if (dist > RECONCILE_SNAP_STUDS) {
+    // LARGE misprediction - hard snap. The viewport teleports the body
+    // to the server position and zeros the velocity (a real
+    // misprediction means the velocity is wrong too).
+    lastReconcile = { ackSeq, dist, snapped: true, at: now };
+    return { kind: 'snap', dist, target: [serverPos[0], serverPos[1], serverPos[2]], ackSeq };
+  }
+  // SMALL-to-MEDIUM divergence - smooth nudge. Move the body to the
+  // server position WITHOUT zeroing velocity, so the player keeps
+  // moving smoothly. This is the "smoothening" the user asked for:
+  // small drift is corrected without the stop-and-go of a hard snap.
+  // (Marked as snapped:false so the diagnostics don't count these as
+  // rubberbands - a nudge is invisible by design.)
+  lastReconcile = { ackSeq, dist, snapped: false, at: now };
+  return { kind: 'nudge', dist, target: [serverPos[0], serverPos[1], serverPos[2]], ackSeq };
 }
 
 /** The latest reconcile result (for diagnostics / tests). */
