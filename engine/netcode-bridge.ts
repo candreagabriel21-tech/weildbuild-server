@@ -76,16 +76,6 @@ export interface SelfCorrection {
   x: number;
   y: number;
   z: number;
-  /** v6.4.1: the authority's record of our body velocity. The viewport
-   * gently lerps the local body's velocity toward this every frame
-   * (15% per frame). This is the key fix for the "edge falling" +
-   * "sprint freaking out" issues: when the server sees the player
-   * falling but the client doesn't (tick quantization + interpolation
-   * delay), the velocity sync closes the gap BEFORE the position
-   * diverges past the snap threshold. */
-  vx: number;
-  vy: number;
-  vz: number;
   /** Authoritative health (server-owned in multiplayer). */
   hp: number;
   /** True during the server-side death animation. */
@@ -118,21 +108,20 @@ export type ReconcileResult =
   | { kind: 'drift'; offset: [number, number, number]; dist: number; ackSeq: number }
   | { kind: 'snap'; offset: [number, number, number]; dist: number; ackSeq: number };
 
-/** Divergence at or below this many studs is ignored entirely. Set to
- * 5.0 to cover the sprint case (sprint speed 18.36 studs/s; a 100ms
- * snapshot delay produces ~1.8 studs of divergence during the
- * acceleration ramp, which can briefly exceed 3.0). 5.0 is still well
- * below rule teleports (10+ studs) so real mispredictions still snap.
- * Combined with velocity sync (the body lerps toward the server's vy
- * every frame), the prediction diverges far less than before, so 5.0
- * is a generous safety margin that absorbs ALL normal movement noise
- * (walking, sprinting, jumping, falling, edge cases). */
-export const RECONCILE_IGNORE_STUDS = 5.0;
+/** Divergence at or below this many studs is ignored entirely. Set HIGH
+ * (3.0) because the prediction uses the SAME math as the server, so
+ * real divergence is tiny. The only time it exceeds 3 studs is a rule
+ * teleport, kill-brick respawn, or being shoved by a part. Ignoring
+ * everything below 3.0 means: no drift correction, no oscillation, no
+ * choppiness. The prediction just runs freely. */
+export const RECONCILE_IGNORE_STUDS = 3.0;
 /** Divergence above this triggers a HARD snap (teleport body + zero
  * velocity). Set equal to RECONCILE_IGNORE_STUDS so there is no "drift"
- * zone in between - the prediction either matches closely enough to
- * ignore, or it's a real misprediction that needs a hard snap. */
-export const RECONCILE_SNAP_STUDS = 5.0;
+ * zone in between - the previous drift approach caused oscillation
+ * (the drift was recorded in the prediction history, making each
+ * successive reconcile compute a wrong offset). Now it's binary:
+ * ignore or snap. */
+export const RECONCILE_SNAP_STUDS = 3.0;
 
 // ─── v6.2.5 + v6.2.6: entity interpolation (REMOTE players) ───
 // Remote characters render from a TIMESTAMPED buffer of the 30 Hz relay,
@@ -329,23 +318,11 @@ export function getLastInputSeq(): number {
 }
 
 /**
- * v6.4 CSP: record a prediction sample. The viewport calls this every
- * frame after stepping the local body. v6.4.1 FIX: we keep only the
- * FIRST prediction per seq (the one recorded right after the input
- * was first applied). This is critical because the server processes
- * input seq N at the moment it ARRIVES (about RTT/2 after the client
- * sent it), which corresponds to the client's FIRST prediction with
- * that seq - NOT the latest one. Keeping only the first means the
- * reconcile compares the right prediction against the server's state.
- *
- * Before this fix, we kept every frame's prediction (multiple per seq
- * since inputs are sent at 20Hz but predictions recorded at 60Hz), and
- * reconcileSelf picked the latest with seq <= ackSeq - which was a
- * FUTURE prediction (the body had already moved several frames past
- * the input application point). That caused the comparison to always
- * show the client "ahead" of the server, triggering false snaps.
- *
- * The history is capped; older entries are dropped.
+ * v6.4 CSP: record a prediction sample (the local body's state right
+ * AFTER sending input seq). The viewport calls this every frame after
+ * stepping the local body. The history is capped; older entries are
+ * dropped. reconcileSelf() looks up the entry matching the server's
+ * ackSeq to compute the divergence.
  */
 export function recordPrediction(
   seq: number,
@@ -353,11 +330,6 @@ export function recordPrediction(
   vel: [number, number, number],
 ): void {
   if (seq <= 0) return; // before the first input - nothing to reconcile against
-  // v6.4.1: skip if we already have a prediction for this seq - keep
-  // the FIRST one (the one right after the input was applied).
-  if (predictionHistory.length > 0 && predictionHistory[predictionHistory.length - 1].seq === seq) {
-    return;
-  }
   const now = typeof performance !== 'undefined' ? performance.now() : Date.now();
   predictionHistory.push({ seq, x: pos[0], y: pos[1], z: pos[2], vx: vel[0], vy: vel[1], vz: vel[2], t: now });
   if (predictionHistory.length > PREDICTION_HISTORY_CAP) {
@@ -436,7 +408,7 @@ export function drainFx(): Array<{ name: string; volume: number }> {
 
 /** Called by GamePlayer on every server snapshot. */
 export function pushSnapshot(data: {
-  self?: { socketId: string; ackSeq?: number; x?: number; y?: number; z?: number; vel?: number[]; yaw: number; hp: number; dying: boolean; seq: number; tp?: number[] | { x: number; y: number; z: number } };
+  self?: { socketId: string; ackSeq?: number; x?: number; y?: number; z?: number; yaw: number; hp: number; dying: boolean; seq: number; tp?: number[] | { x: number; y: number; z: number } };
   parts?: PartCorrection[];
   fx?: Array<{ name: string; volume: number }>;
 }): void {
@@ -451,8 +423,6 @@ export function pushSnapshot(data: {
       const o = s.tp as { x: number; y: number; z: number };
       tp = { x: Number(o.x) || 0, y: Number(o.y) || 0, z: Number(o.z) || 0 };
     }
-    // v6.4.1: parse the velocity array (server sends [vx, vy, vz]).
-    const vel = Array.isArray(s.vel) ? s.vel : [0, 0, 0];
     selfCorrection = {
       seq: s.seq,
       ackSeq: typeof s.ackSeq === 'number' ? s.ackSeq : 0,
@@ -460,9 +430,6 @@ export function pushSnapshot(data: {
       x: typeof s.x === 'number' ? s.x : 0,
       y: typeof s.y === 'number' ? s.y : 0,
       z: typeof s.z === 'number' ? s.z : 0,
-      vx: Number(vel[0]) || 0,
-      vy: Number(vel[1]) || 0,
-      vz: Number(vel[2]) || 0,
       hp: s.hp,
       dying: s.dying,
       tp,

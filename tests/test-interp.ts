@@ -143,11 +143,11 @@ function main(): void {
     // Medium divergence (1.5 studs) -> also ignored (no drift zone).
     const ignore2 = reconcileSelf(3, [3.5, 0, 0]);
     assert.strictEqual(ignore2, null, `divergence <= RECONCILE_IGNORE_STUDS is ignored (no drift zone)`);
-    // Snap divergence (6 studs, > 5.0 threshold) -> snap path.
-    const snap = reconcileSelf(3, [8, 0, 0]);
+    // Snap divergence (5 studs) -> snap path.
+    const snap = reconcileSelf(3, [7, 0, 0]);
     assert.ok(snap && snap.kind === 'snap',
       `divergence > RECONCILE_SNAP_STUDS (${RECONCILE_SNAP_STUDS} studs) is the snap path (got ${snap?.kind})`);
-    assert.ok(Math.abs(snap!.offset[0] - 6) < 1e-6, `snap offset = server - predicted (got ${snap!.offset[0]})`);
+    assert.ok(Math.abs(snap!.offset[0] - 5) < 1e-6, `snap offset = server - predicted (got ${snap!.offset[0]})`);
     resetNetcodeBridge();
 
     console.log('✓ entity interpolation + input throttle + reconcile: ALL PASS');
