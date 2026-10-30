@@ -183,16 +183,15 @@ async function main(): Promise<void> {
     // (checked implicitly: player must appear in each, else the client
     // prune logic would drop them - verify at least once more here)
 
-    // ── 5. Movement resumes the delta stream (v6.4 CSP: the owning client
-    //    sends input messages every ~50 ms - each input drives the
-    //    authoritative body, so deltas flow at the input cadence) ──
+    // ── 5. Movement resumes the delta stream (v6.4 CSP: the server
+    //    simulates the player's body from input - each input changes the
+    //    body's transform, so deltas flow at the input cadence) ──
     let seq = 0;
+    let walkX = 0;
     const walk = setInterval(() => {
-      seq++;
-      worker.postMessage({
-        t: 'input', socketId: 's-alice',
-        x: 1, z: 0, jump: false, sprint: false, yaw: 0, seq,
-      });
+      seq += 1;
+      walkX += 1; // (just a counter, not used by the worker - direction is)
+      worker.postMessage({ t: 'input', socketId: 's-alice', x: 1, z: 0, jump: false, sprint: false, yaw: 0, seq });
     }, 50);
     const movingCount = await countSnapshots(worker, 1000);
     clearInterval(walk);

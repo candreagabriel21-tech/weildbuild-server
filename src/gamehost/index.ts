@@ -520,18 +520,13 @@ io.on("connection", (socket) => {
   });
 
   // ── game:pstate { instanceId, x, y, z, yaw, walking, jumping, sprint } ──
-  // v6.2.6 LEGACY / v6.4 NO-OP. The old client-owned-position channel is
-  // no longer used (the server-authoritative simulation drives the player's
-  // body from `game:input` messages now). Still accepted so older clients
-  // do not error - their characters simply do not move on the authority
-  // (they should update to the new client that sends inputs).
-  socket.on("game:pstate", (payload: unknown) => {
-    const p = asRecord(payload);
-    const instance = resolvePlayerInstance(socket.id, p.instanceId);
-    if (!instance) return;
-    if (!instance.players.has(socket.id)) return;
+  // v6.4 CSP: silently dropped. The server now SIMULATES each player's
+  // movement itself (driven by game:input below), so client-side state
+  // reports are obsolete - the body's transform is the authority. Old
+  // clients still emitting pstate keep working (their input stream drives
+  // the server body; the pstate is simply ignored).
+  socket.on("game:pstate", (_payload: unknown) => {
     socket.data.lastSeen = Date.now(); // duplicate guard liveness
-    // v6.4: silently dropped. worldSims.pstate() would no-op too.
   });
 
   // ── game:syncWorld ──
@@ -576,15 +571,15 @@ io.on("connection", (socket) => {
   });
 
   // ── game:input { instanceId, x, z, jump, sprint, yaw, seq } ──
-  // v6.4 CSP: THE player channel. The owning client sends its current
-  // input state with a monotonically increasing seq. The worker runs the
-  // SAME movement math the client prediction runs (character-constants.ts)
-  // and acks the latest seq in the next snapshot for that player. The
-  // client uses ackSeq to reconcile its prediction history. A jump press
-  // fires the instant the message arrives at the worker (not the next
-  // tick), so the only input latency is the network one-way trip (~RTT/2
-  // before the server even sees it) - the client prediction makes the
-  // VISIBLE latency 0 ms (the local body moves the frame the key is pressed).
+  // v6.4 CSP: THE player channel. Each client streams its current INPUT
+  // state (camera-relative direction, jump press, sprint, yaw) at ~20 Hz.
+  // The server integrates these against the dynamic cannon body (the
+  // authority), mirrors the body's settled position into snapshots, and
+  // echoes back `ackSeq` so the client can reconcile its local prediction.
+  // The client-side prediction runs the SAME movement math (shared via
+  // character-constants.ts); small divergence is smoothed GRADUALLY (15%
+  // per frame), large divergence (rule teleports, kill-brick respawns)
+  // snaps hard - that is the smooth-walking-but-no-cheating goal of CSP.
   socket.on("game:input", (payload: unknown) => {
     const p = asRecord(payload);
     const instance = resolvePlayerInstance(socket.id, p.instanceId);

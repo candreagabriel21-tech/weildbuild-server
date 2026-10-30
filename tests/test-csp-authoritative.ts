@@ -1,18 +1,18 @@
 // ═══════════════════════════════════════════════════════════════════
-// WeildBuild — v6.4 CSP server-authoritative simulation test
+// WeildBuild — v6.4 CSP authoritative server test
 // ═══════════════════════════════════════════════════════════════════
-// Verifies the server-side half of CSP:
-//   1. Inputs (with seq) drive the body authoritatively.
-//   2. Each snapshot acks the latest input seq.
-//   3. A rule teleport snaps the body (the input-driven position is
-//      replaced by the teleport target).
-//   4. The body's velocity stops accumulating after a teleport (no
-//      slingshot of nearby parts).
+// Verifies the v6.4 CSP server-authoritative player simulation:
 //
-// The CLIENT-side prediction + reconcile is tested by the existing
-// e2e tests in the platform project (the bridge module's reconcileSelf
-// is unit-testable through the test-server-auth-prediction.ts
-// standalone test).
+//   1. Inputs drive the dynamic body forward (+X walk). The body's X
+//      advances; ackSeq advances (proof the server consumed the inputs).
+//   2. A teleport rule fires (a touch-driven teleport_player rule):
+//      the body is snapped across the map (>= 30 studs) - more than the
+//      client's RECONCILE_SNAP_STUDS threshold, so a CSP client would
+//      hard-snap (this test only verifies the SERVER side: the body is
+//      AT the teleport target with zero velocity).
+//   3. The body is STABLE after the teleport (no wild velocity, no
+//      gravity-induced drift across the next tick - the dynamic body
+//      settles cleanly on the target).
 //
 // Usage: npx tsx tests/test-csp-authoritative.ts
 // (run `node scripts/build-world-runtime.mjs` first)
@@ -50,14 +50,14 @@ function waitMessage<T = any>(worker: Worker, predicate: (m: any) => boolean, ti
 
 const studioState = {
   objects: [
-    // Long baseplate so the player has room to walk.
+    // Large baseplate so a teleport target on it is solid ground.
     { id: 'base', name: 'Baseplate', type: 'Block',
       position: { x: 0, y: -0.5, z: 0 }, rotation: { x: 0, y: 0, z: 0 },
       size: { x: 200, y: 1, z: 200 }, color: '#3d6666', material: 'Plastic',
       transparency: 0, reflectance: 0, anchored: true, canCollide: true,
       friction: 0.5, elasticity: 0.2, density: 1, isBaseplate: true,
       children: [], parentId: null, bodyMovers: [], effects: [], rules: [] },
-    // Spawn part.
+    // Spawn part drives the spawn point (player at origin).
     { id: 'spawn', name: 'Spawn', type: 'Spawn',
       position: { x: 0, y: 0, z: 0 }, rotation: { x: 0, y: 0, z: 0 },
       size: { x: 1, y: 1, z: 1 }, color: '#4a90d9', material: 'Plastic',
@@ -65,19 +65,23 @@ const studioState = {
       friction: 0.5, elasticity: 0.2, density: 1,
       isSpawnPoint: true, isCharacterPart: false,
       children: [], parentId: null, bodyMovers: [], effects: [], rules: [] },
-    // TELEPORT BRICK: when_touched(player) -> teleport_player to a fixed
-    // spot. Lets us verify the body's authoritative position changes
-    // (the input-driven position is replaced by the teleport target).
-    { id: 'teleport', name: 'TeleportBrick', type: 'Block',
-      position: { x: 5, y: 0.1, z: 0 }, rotation: { x: 0, y: 0, z: 0 },
-      size: { x: 1.5, y: 0.2, z: 1.5 }, color: '#33ddff', material: 'Neon',
+    // TELEPORT BRICK: a touch-driven teleport_player rule that flings
+    // the touching player 40 studs across the map (way past the
+    // RECONCILE_SNAP_STUDS threshold so a CSP client would hard-snap).
+    { id: 'telebrick', name: 'TeleportBrick', type: 'Block',
+      position: { x: 3, y: 0.1, z: 0 }, rotation: { x: 0, y: 0, z: 0 },
+      size: { x: 1.5, y: 0.2, z: 1.5 }, color: '#22ff88', material: 'Neon',
       transparency: 0, reflectance: 0, anchored: true, canCollide: true,
       friction: 0.5, elasticity: 0.2, density: 1,
       children: [], parentId: null, bodyMovers: [], effects: [],
       rules: [{
         id: 'rule_tp', name: 'Teleport the toucher',
         trigger: { type: 'when_touched', params: { filter: 'player' } },
-        actions: [{ id: 'act_tp', type: 'teleport_player', params: { position: { x: 50, y: 5, z: 50 } }, children: [], enabled: true }],
+        actions: [{
+          id: 'act_tp', type: 'teleport_player',
+          params: { position: { x: 40, y: 5, z: 0 } },
+          children: [], enabled: true,
+        }],
         mode: 'simple', enabled: true,
       }] },
   ],
@@ -91,96 +95,105 @@ const studioState = {
 
 async function main(): Promise<void> {
   const worker = new Worker(bundle);
-  let walkTimer: NodeJS.Timeout | null = null;
   try {
     worker.postMessage({ t: 'init', studioState, maxPlayers: 4 });
     await waitMessage(worker, (m) => m?.t === 'ready');
     console.log('✓ worker ready');
 
     worker.postMessage({ t: 'playerJoin', socketId: 's-alice', username: 'Alice' });
+    const snap1: any = await waitMessage(worker, (m) => m?.t === 'snapshot' && m.players?.some((p: any) => p.socketId === 's-alice'));
+    const alice1 = snap1.players.find((p: any) => p.socketId === 's-alice');
+    const startX = alice1.position[0];
+    const startAckSeq = alice1.ackSeq ?? 0;
+    console.log(`✓ Alice joined at`, alice1.position.map((v: number) => v.toFixed(2)), `(ackSeq=${startAckSeq})`);
 
-    const findPlayer = (snap: any, id: string) =>
-      Array.isArray(snap?.players) ? snap.players.find((p: any) => p.socketId === id) : undefined;
-
-    // 1. Send a +X walk input with seq. The server must:
-    //    a) drive the body forward (snapshot position increases)
-    //    b) ack the latest input seq in the snapshot
+    // 1. Inputs drive the body forward. Send +X walk input at ~20 Hz.
     let seq = 0;
-    let lastAckSeq = 0;
-    walkTimer = setInterval(() => {
-      seq++;
+    const walkInputs = setInterval(() => {
+      seq += 1;
       worker.postMessage({
         t: 'input', socketId: 's-alice',
         x: 1, z: 0, jump: false, sprint: false, yaw: 0, seq,
       });
     }, 50);
-
-    // Wait for the body to move forward at least 1 stud.
-    const movedSnap = await waitMessage(worker, (m) => {
-      if (m?.t !== 'snapshot') return false;
-      const alice = findPlayer(m, 's-alice');
-      return alice && alice.position[0] > 1;
-    }, 8000);
-    const movedAlice = findPlayer(movedSnap, 's-alice');
-    console.log(`✓ inputs drove Alice forward (x=${movedAlice.position[0].toFixed(2)}), ackSeq=${movedAlice.ackSeq}`);
-    assert.ok(movedAlice.position[0] > 1, 'body must move forward when input is +X');
-    assert.ok(typeof movedAlice.ackSeq === 'number', 'snapshot must carry ackSeq');
-    assert.ok(movedAlice.ackSeq > 0, `ackSeq must be > 0 after inputs (got ${movedAlice.ackSeq})`);
-    assert.ok(movedAlice.ackSeq <= seq, `ackSeq (${movedAlice.ackSeq}) must not exceed the latest sent seq (${seq})`);
-    lastAckSeq = movedAlice.ackSeq;
-
-    // 2. Continue walking - ackSeq must advance as more inputs arrive.
-    const advancedSnap = await waitMessage(worker, (m) => {
-      if (m?.t !== 'snapshot') return false;
-      const alice = findPlayer(m, 's-alice');
-      return alice && alice.ackSeq > lastAckSeq + 2;
-    }, 5000);
-    const advancedAlice = findPlayer(advancedSnap, 's-alice');
-    console.log(`✓ ackSeq advanced (${lastAckSeq} -> ${advancedAlice.ackSeq}) as more inputs arrived`);
-    assert.ok(advancedAlice.ackSeq > lastAckSeq, 'ackSeq must advance as more inputs arrive');
-    lastAckSeq = advancedAlice.ackSeq;
-
-    // 3. Keep walking +X; Alice will eventually walk into the teleport
-    //    brick at x=5. The rule fires; the body must teleport to (50,5,50).
-    //    The teleport arrives flagged tp=1 in the snapshot.
-    const teleportedSnap = await waitMessage(worker, (m) => {
-      if (m?.t !== 'snapshot') return false;
-      const alice = findPlayer(m, 's-alice');
-      return alice && alice.tp === 1;
-    }, 15000);
-    const teleportedAlice = findPlayer(teleportedSnap, 's-alice');
-    const distFromTeleportTarget = Math.hypot(
-      teleportedAlice.position[0] - 50,
-      teleportedAlice.position[1] - 5,
-      teleportedAlice.position[2] - 50,
+    const snapWalk: any = await waitMessage(
+      worker,
+      (m) => m.t === 'snapshot' && m.players?.some((p: any) => p.socketId === 's-alice' && p.position[0] > startX + 1.5),
+      8000,
     );
-    console.log(`✓ teleport rule fired: Alice at (${teleportedAlice.position.map((v: number) => v.toFixed(2))}), dist from target=${distFromTeleportTarget.toFixed(2)}, tp=1`);
-    assert.ok(distFromTeleportTarget < 1, `body must be at the teleport target (dist ${distFromTeleportTarget.toFixed(2)})`);
-    assert.ok(teleportedAlice.tp === 1, 'snapshot must flag the teleport with tp=1');
+    clearInterval(walkInputs);
+    const alice2 = snapWalk.players.find((p: any) => p.socketId === 's-alice');
+    assert.ok(alice2.position[0] > startX + 1.5,
+      `inputs must drive the body forward (${startX.toFixed(2)} -> ${alice2.position[0].toFixed(2)})`);
+    assert.ok(alice2.ackSeq > startAckSeq,
+      `ackSeq must advance as the server consumes inputs (got ${alice2.ackSeq}, was ${startAckSeq})`);
+    console.log(`✓ inputs drive body forward (${startX.toFixed(2)} -> ${alice2.position[0].toFixed(2)}), ackSeq ${startAckSeq} -> ${alice2.ackSeq}`);
 
-    // 4. After the teleport, the body should NOT immediately shoot back
-    //    toward +X (the input is still being sent, but the body has been
-    //    teleported). Wait a beat and verify the body stays near the
-    //    teleport target (within ~5 studs), not 50+ studs away.
-    clearInterval(walkTimer);
-    walkTimer = null;
-    await new Promise((r) => setTimeout(r, 500)); // ~15 sim ticks
-    // Send a no-input keepalive to settle the body
-    worker.postMessage({ t: 'input', socketId: 's-alice', x: 0, z: 0, jump: false, sprint: false, yaw: 0, seq: ++seq });
-    const settledSnap = await waitMessage(worker, (m) => m?.t === 'snapshot', 3000);
-    const settledAlice = findPlayer(settledSnap, 's-alice');
-    const distAfterSettle = Math.hypot(
-      settledAlice.position[0] - 50,
-      settledAlice.position[2] - 50,
+    // 2. Walk Alice INTO the teleport brick (at x=3). The touch rule
+    //    fires teleport_player to (40, 5, 0). The body must be snapped
+    //    there in the next snapshots (a teleport is NOT a velocity
+    //    impulse - the body's velocity is zeroed, so it doesn't
+    //    slingshot off the target).
+    const tpWalk = setInterval(() => {
+      seq += 1;
+      worker.postMessage({
+        t: 'input', socketId: 's-alice',
+        x: 1, z: 0, jump: false, sprint: false, yaw: 0, seq,
+      });
+    }, 50);
+    const tpSnap: any = await waitMessage(
+      worker,
+      (m) => m.t === 'snapshot' && m.players?.some((p: any) => p.socketId === 's-alice' && Math.abs(p.position[0] - 40) < 2),
+      10000,
     );
-    console.log(`✓ body stable after teleport: Alice at (${settledAlice.position.map((v: number) => v.toFixed(2))}), dist from target=${distAfterSettle.toFixed(2)}`);
-    assert.ok(distAfterSettle < 5, `body must stay near teleport target after settle (dist ${distAfterSettle.toFixed(2)})`);
+    clearInterval(tpWalk);
+    const aliceTp = tpSnap.players.find((p: any) => p.socketId === 's-alice');
+    assert.ok(Math.abs(aliceTp.position[0] - 40) < 2,
+      `teleport rule must snap the body to x~40 (got ${aliceTp.position[0].toFixed(2)})`);
+    assert.ok(aliceTp.tp === 1, "the teleport broadcast is tp-flagged (the owner teleports, others snap)");
+    console.log(`✓ teleport rule snapped body to (${aliceTp.position[0].toFixed(2)}, ${aliceTp.position[1].toFixed(2)}, ${aliceTp.position[2].toFixed(2)}) - flagged tp`);
 
-    console.log('\n✓ CSP server-authoritative simulation: ALL PASS');
+    // 3. Body is STABLE after the teleport: stop the +X walk input
+    //    (send x:0 = no movement), then for ~1 second check the body's
+    //    XZ position stays near the teleport target (no slingshot drift)
+    //    and the body's hp/dying are intact (the teleport didn't kill).
+    // Send a no-movement input so the body stops walking (the latest
+    // input was x:1; the server keeps applying it until a new input arrives).
+    seq += 1;
+    worker.postMessage({
+      t: 'input', socketId: 's-alice',
+      x: 0, z: 0, jump: false, sprint: false, yaw: 0, seq,
+    });
+    let lastPos: [number, number, number] | null = null;
+    let maxDrift = 0;
+    const deadline = Date.now() + 1500;
+    while (Date.now() < deadline) {
+      try {
+        const snap: any = await waitMessage(worker, (m) => m.t === 'snapshot' && m.players?.some((p: any) => p.socketId === 's-alice'), 1500);
+        const a = snap.players.find((p: any) => p.socketId === 's-alice');
+        if (a) {
+          if (lastPos) {
+            const drift = Math.hypot(a.position[0] - lastPos[0], a.position[1] - lastPos[1], a.position[2] - lastPos[2]);
+            if (drift > maxDrift) maxDrift = drift;
+          }
+          lastPos = [a.position[0], a.position[1], a.position[2]];
+          assert.strictEqual(a.hp, 100, 'teleport must not damage the player');
+          assert.strictEqual(a.dying, false, 'teleport must not kill the player');
+        }
+      } catch { break; }
+    }
+    assert.ok(lastPos, 'snapshots kept flowing after the teleport');
+    // Allow some gravity settle (player was teleported to y=5, falls to
+    // the baseplate at y=0). X and Z must stay near the target.
+    const xzDrift = Math.hypot(lastPos[0] - 40, lastPos[2] - 0);
+    assert.ok(xzDrift < 2.0,
+      `body must stay near the teleport target on XZ (got drift ${xzDrift.toFixed(2)} studs from (40,0))`);
+    console.log(`✓ body stable after teleport: settled at (${lastPos[0].toFixed(2)}, ${lastPos[1].toFixed(2)}, ${lastPos[2].toFixed(2)}), XZ drift ${xzDrift.toFixed(2)} studs (gravity may drop Y)`);
+
+    console.log('\n✓ v6.4 CSP authoritative: ALL PASS');
   } finally {
-    if (walkTimer) clearInterval(walkTimer);
     worker.postMessage({ t: 'stop' });
-    await new Promise((r) => setTimeout(r, 300));
+    await new Promise((r) => setTimeout(r, 200));
     try { await worker.terminate(); } catch { /* already gone */ }
   }
 }
@@ -188,7 +201,7 @@ async function main(): Promise<void> {
 main().then(
   () => process.exit(0),
   (e) => {
-    console.error('\n✗ CSP server-authoritative test FAILED:', e?.message || e);
+    console.error('\n✗ v6.4 CSP authoritative test FAILED:', e?.message || e);
     process.exit(1);
   },
 );

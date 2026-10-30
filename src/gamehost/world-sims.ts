@@ -368,12 +368,11 @@ export class WorldSimManager {
     });
   }
 
-  /** v6.4 CSP: one input message from an owning client (its current
-   * input state + a monotonically increasing seq). The worker overwrites
-   * that player's p.input every message and acks the seq in the next
-   * snapshot for that player (the client uses ackSeq to reconcile its
-   * prediction history). A jump press fires the instant the message
-   * arrives at the worker, not at the next tick. */
+  /** One input tick from a player (~20 Hz). Payload already sanitized by
+   * the worker; here we only validate the basics to keep it cheap.
+   * v6.4 CSP: the payload carries a `seq` (the client's incrementing
+   * input counter); the server echoes it back in every snapshot as
+   * `ackSeq` so the client can reconcile its prediction. */
   input(instanceId: string, socketId: string, payload: Record<string, unknown>): void {
     const sim = this.sims.get(instanceId);
     if (!sim || !sim.ready || sim.disposed) return;
