@@ -1050,6 +1050,15 @@ async function main(): Promise<void> {
         p.pendingTp = null;
         tp = true;
       }
+      // v6.4.1: read the body's velocity ONCE here (the loop already
+      // exists; the body lookup is cheap but we don't want to do it
+      // 3x for vel[0/1/2]). The velocity rides the snapshot so the
+      // client can sync the body's momentum - this is the fix for the
+      // "edge falling" + "sprint freaking out" issues (see below).
+      const pbody = world.getNamedCharacterBody(p.socketId);
+      const velX = pbody ? pbody.velocity.x : 0;
+      const velY = pbody ? pbody.velocity.y : 0;
+      const velZ = pbody ? pbody.velocity.z : 0;
       // v6.4 CSP: derive anim flags from the simulated velocity + the
       // jump latch (the legacy file's logic). The owner's latch produces
       // exactly one rising + one falling edge per hop.
@@ -1084,6 +1093,20 @@ async function main(): Promise<void> {
         username: p.username,
         position: [x, y, z],
         rotation: [0, p.yaw, 0],
+        // v6.4.1: send the authoritative velocity so the client can sync
+        // the body's momentum (not just position). This is the key fix
+        // for the "edge falling" + "sprint freaking out" issues: when
+        // the server sees the player falling (vy < 0) but the client
+        // hasn't started falling yet (still predicting grounded), the
+        // velocity sync closes the gap BEFORE the position diverges past
+        // the snap threshold. Without this, the client keeps predicting
+        // "grounded, vy=0" while the server sees "falling, vy=-5", and
+        // 200ms later the position divergence exceeds the threshold ->
+        // snap. With velocity sync, the client's body gets vy=-5
+        // immediately, so both simulations fall together and the
+        // position stays aligned. (Minecraft + Source Engine both send
+        // velocity alongside position.)
+        vel: [velX, velY, velZ],
         anim,
         hp,
         ackSeq,
