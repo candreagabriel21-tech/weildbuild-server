@@ -183,18 +183,21 @@ async function main(): Promise<void> {
     // (checked implicitly: player must appear in each, else the client
     // prune logic would drop them - verify at least once more here)
 
-    // ── 5. Movement resumes the delta stream (v6.2.6: the owning client
-    //    reports its position every 0.25 s - each report changes the relayed
-    //    entry, so deltas flow at the report cadence) ──
-    let walkX = 0;
+    // ── 5. Movement resumes the delta stream (v6.4 CSP: the owning client
+    //    sends input messages every ~50 ms - each input drives the
+    //    authoritative body, so deltas flow at the input cadence) ──
+    let seq = 0;
     const walk = setInterval(() => {
-      walkX += 1.4;
-      worker.postMessage({ t: 'pstate', socketId: 's-alice', x: walkX, y: 0, z: 0, yaw: 0, walking: true, jumping: false, sprint: false });
-    }, 250);
+      seq++;
+      worker.postMessage({
+        t: 'input', socketId: 's-alice',
+        x: 1, z: 0, jump: false, sprint: false, yaw: 0, seq,
+      });
+    }, 50);
     const movingCount = await countSnapshots(worker, 1000);
     clearInterval(walk);
     assert.ok(movingCount >= 3, `reporting player streams deltas (got ${movingCount}/s)`);
-    console.log(`✓ reports resume the delta stream: ${movingCount} snapshots in 1s`);
+    console.log(`✓ inputs resume the delta stream: ${movingCount} snapshots in 1s`);
 
     // ── 6. Leave -> full silence again ──
     worker.postMessage({ t: 'playerLeave', socketId: 's-alice' });

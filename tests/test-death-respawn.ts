@@ -14,6 +14,11 @@
 //      the death cycle and the authority respawns the player at spawn
 //      with full hp.
 //
+// v6.4 CSP: the server simulates the player's body itself. Alice joins
+// at the spawn point (which sits exactly on the kill brick); the
+// server-authoritative body settles onto the brick and the touch check
+// fires immediately. No client reports needed.
+//
 // Usage: npx tsx tests/test-death-respawn.ts
 // (run `node scripts/build-world-runtime.mjs` first)
 
@@ -85,7 +90,6 @@ const studioState = {
 
 async function main(): Promise<void> {
   const worker = new Worker(bundle);
-  let reportTimer: NodeJS.Timeout | null = null;
   try {
     worker.postMessage({ t: 'init', studioState, maxPlayers: 4 });
     await waitMessage(worker, (m) => m?.t === 'ready');
@@ -96,14 +100,10 @@ async function main(): Promise<void> {
     worker.postMessage({ t: 'playerJoin', socketId: 's-alice', username: 'Alice' });
     worker.postMessage({ t: 'playerJoin', socketId: 's-bob', username: 'Bob' });
 
-    // v6.2.6: the clients own their characters - Alice's client reports her
-    // standing ON the lava brick (the owning simulation), Bob's reports him
-    // on his ring slot. The authority's touch checks run against the
-    // REPORTED positions, exactly like the real client flow.
-    reportTimer = setInterval(() => {
-      worker.postMessage({ t: 'pstate', socketId: 's-alice', x: 5, y: 0, z: 5, yaw: 0, walking: false, jumping: false, sprint: false });
-      worker.postMessage({ t: 'pstate', socketId: 's-bob', x: 5, y: 0, z: 6.6, yaw: 0, walking: false, jumping: false, sprint: false });
-    }, 250);
+    // v6.4 CSP: the server simulates both bodies itself. Alice's body
+    // settles ON the lava brick (touch fires immediately); Bob's body
+    // settles on his ring slot (clear of the lava). No client reports
+    // are needed.
 
     const findPlayer = (snap: any, id: string) =>
       Array.isArray(snap?.players) ? snap.players.find((p: any) => p.socketId === id) : undefined;
@@ -157,7 +157,6 @@ async function main(): Promise<void> {
 
     console.log('\n✓ death/respawn + per-player effects: ALL PASS');
   } finally {
-    if (reportTimer) clearInterval(reportTimer);
     worker.postMessage({ t: 'stop' });
     await new Promise((r) => setTimeout(r, 300));
     try { await worker.terminate(); } catch { /* already gone */ }

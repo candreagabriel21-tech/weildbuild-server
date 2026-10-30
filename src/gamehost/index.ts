@@ -520,18 +520,18 @@ io.on("connection", (socket) => {
   });
 
   // ── game:pstate { instanceId, x, y, z, yaw, walking, jumping, sprint } ──
-  // v6.2.6: THE player channel of the Roblox-style model. Each client
-  // simulates its OWN character locally (the full singleplayer feel) and
-  // reports its state every 0.25 s; the worker applies light checks
-  // (PLAYER_LIGHT_CHECK_STUDS), keeps the last accepted report as that
-  // player's position, and relays it to everyone else in the snapshots.
+  // v6.2.6 LEGACY / v6.4 NO-OP. The old client-owned-position channel is
+  // no longer used (the server-authoritative simulation drives the player's
+  // body from `game:input` messages now). Still accepted so older clients
+  // do not error - their characters simply do not move on the authority
+  // (they should update to the new client that sends inputs).
   socket.on("game:pstate", (payload: unknown) => {
     const p = asRecord(payload);
     const instance = resolvePlayerInstance(socket.id, p.instanceId);
     if (!instance) return;
     if (!instance.players.has(socket.id)) return;
     socket.data.lastSeen = Date.now(); // duplicate guard liveness
-    worldSims.pstate(instance.id, socket.id, p);
+    // v6.4: silently dropped. worldSims.pstate() would no-op too.
   });
 
   // ── game:syncWorld ──
@@ -575,12 +575,16 @@ io.on("connection", (socket) => {
     );
   });
 
-  // ── game:input { instanceId, x, z, jump, sprint, yaw } ──
-  // v6.2.6 LEGACY: the old authority-side movement channel. The server no
-  // longer simulates characters (each client owns its own body now and
-  // reports via game:pstate), so these are accepted and silently ignored -
-  // old clients keep working, their characters simply run client-side
-  // like everyone's.
+  // ── game:input { instanceId, x, z, jump, sprint, yaw, seq } ──
+  // v6.4 CSP: THE player channel. The owning client sends its current
+  // input state with a monotonically increasing seq. The worker runs the
+  // SAME movement math the client prediction runs (character-constants.ts)
+  // and acks the latest seq in the next snapshot for that player. The
+  // client uses ackSeq to reconcile its prediction history. A jump press
+  // fires the instant the message arrives at the worker (not the next
+  // tick), so the only input latency is the network one-way trip (~RTT/2
+  // before the server even sees it) - the client prediction makes the
+  // VISIBLE latency 0 ms (the local body moves the frame the key is pressed).
   socket.on("game:input", (payload: unknown) => {
     const p = asRecord(payload);
     const instance = resolvePlayerInstance(socket.id, p.instanceId);

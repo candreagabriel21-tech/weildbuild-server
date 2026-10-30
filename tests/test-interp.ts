@@ -1,9 +1,9 @@
 // ═══════════════════════════════════════════════════════════════════
-// WeildBuild — v6.2.6 entity interpolation + report throttle test
+// WeildBuild — v6.2.6 entity interpolation + v6.4 input throttle test
 // ═══════════════════════════════════════════════════════════════════
 // Regression test for the client-side interpolation core that remote
 // character rendering runs on (sampleInterp in netcode-bridge) plus the
-// 0.25 s state-report throttle (reportPlayerState):
+// input throttle (reportPlayerInput - v6.4 CSP):
 //
 //   • Positions interpolate LINEARLY between two timestamped samples
 //     (never a chase, never a sawtooth).
@@ -13,8 +13,7 @@
 //   • A teleport-class distance holds the old position and snaps exactly
 //     when the render clock reaches the new sample - never streaks.
 //   • Yaw interpolates through the SHORTEST ARC.
-//   • reportPlayerState rides the PLAYER_REPORT_HZ (4 Hz) throttle - the
-//     0.25 s cadence of the Roblox-style model.
+//   • reportPlayerInput rides the PLAYER_REPORT_HZ (20 Hz) throttle.
 //
 // Usage: npx tsx tests/test-interp.ts
 // (imports the synced engine copy - run `npm run build` first)
@@ -23,7 +22,7 @@ import assert from "node:assert";
 import {
   sampleInterp,
   resetNetcodeBridge,
-  reportPlayerState,
+  reportPlayerInput,
   setStateSender,
   REMOTE_INTERP_DELAY_MS,
   INTERP_GAP_CAP_MS,
@@ -103,27 +102,27 @@ function main(): void {
       `yaw halfway between 3.0 and -3.0 must be near +/-PI (shortest arc), got ${mid.yaw}`);
   }
 
-  // ── 6. reportPlayerState rides the 4 Hz throttle ──
+  // ── 6. reportPlayerInput rides the PLAYER_REPORT_HZ (20 Hz) throttle ──
   void (async () => {
     resetNetcodeBridge();
-    const sent: Array<{ x: number; jumping: boolean }> = [];
-    setStateSender((r) => sent.push({ x: r.x, jumping: !!r.jumping }));
-    const PERIOD = 1000 / PLAYER_REPORT_HZ; // 250 ms
-    reportPlayerState({ x: 1, y: 0, z: 0, yaw: 0, walking: true, jumping: false, sprint: false });
-    reportPlayerState({ x: 2, y: 0, z: 0, yaw: 0, walking: true, jumping: false, sprint: false });
+    const sent: Array<{ x: number; jump: boolean }> = [];
+    setStateSender((r) => sent.push({ x: r.x, jump: !!r.jump }));
+    const PERIOD = 1000 / PLAYER_REPORT_HZ; // 50 ms at 20 Hz
+    reportPlayerInput({ x: 1, z: 0, jump: false, sprint: false, yaw: 0 });
+    reportPlayerInput({ x: 2, z: 0, jump: false, sprint: false, yaw: 0 });
     assert.strictEqual(sent.length, 1,
-      `a second report inside the ${PERIOD.toFixed(0)}ms window must be throttled (got ${sent.length})`);
-    await sleep(PERIOD + 40);
-    reportPlayerState({ x: 3, y: 0, z: 0, yaw: 0, walking: false, jumping: true, sprint: false });
-    assert.strictEqual(sent.length, 2, "after the period elapses the next report goes out");
-    assert.strictEqual(sent[1].jumping, true, "the anim flags ride the report verbatim");
+      `a second input inside the ${PERIOD.toFixed(0)}ms window must be throttled (got ${sent.length})`);
+    await sleep(PERIOD + 20);
+    reportPlayerInput({ x: 3, z: 0, jump: true, sprint: false, yaw: 0 });
+    assert.strictEqual(sent.length, 2, "after the period elapses the next input goes out");
+    assert.strictEqual(sent[1].jump, true, "the jump flag rides the input verbatim");
     setStateSender(null);
-    reportPlayerState({ x: 4, y: 0, z: 0, yaw: 0, walking: false, jumping: false, sprint: false });
+    reportPlayerInput({ x: 4, z: 0, jump: false, sprint: false, yaw: 0 });
     assert.strictEqual(sent.length, 2, "no sender installed = nothing is sent");
     resetNetcodeBridge();
 
-    console.log('✓ entity interpolation + report throttle: ALL PASS');
-    console.log(`  (remote delay ${REMOTE_INTERP_DELAY_MS}ms, gap cap ${INTERP_GAP_CAP_MS}ms, teleport ${INTERP_TELEPORT_STUDS} studs, report ${PLAYER_REPORT_HZ} Hz)`);
+    console.log('✓ entity interpolation + input throttle: ALL PASS');
+    console.log(`  (remote delay ${REMOTE_INTERP_DELAY_MS}ms, gap cap ${INTERP_GAP_CAP_MS}ms, teleport ${INTERP_TELEPORT_STUDS} studs, input ${PLAYER_REPORT_HZ} Hz)`);
   })().catch((e) => {
     console.error('✗ interp test FAILED:', e?.message || e);
     process.exit(1);

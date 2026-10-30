@@ -1,15 +1,13 @@
 // Smoke test: boot the world-runtime worker with a tiny world, join two
-// players, exchange 0.25 s state reports (the Roblox-style player channel),
-// and verify snapshots relay them with the light checks enforced.
+// players, exchange input messages (the v6.4 CSP player channel), and
+// verify snapshots relay the AUTHORITATIVE positions + ackSeq.
 // Usage: npx tsx tests/test-world-runtime.ts
 //
-// v6.2.6: the server no longer simulates characters (each client owns its
-// own body and reports at 4 Hz). This test drives the NEW protocol:
-//   • pstate reports are relayed in the next snapshot (positions + anim)
-//   • the spawn ring assigns distinct slots and flags them tp
-//   • light checks: a > 500-stud report jump is REJECTED (position kept)
-//   • void deaths from reported positions + respawn tp
-//   • getWorldState returns the live part transforms
+// v6.4: the server now SIMULATES characters itself (CSP). The player
+// channel is `input` (with seq) instead of `pstate` (positions). The
+// server runs the SAME movement math the client prediction runs; the
+// snapshot carries the authoritative position + the latest acked input
+// seq so the client can reconcile.
 
 import assert from "node:assert";
 import { Worker } from "node:worker_threads";
@@ -103,7 +101,7 @@ async function main() {
   console.log("✓ snapshot: Alice@", a1.position.map((v: number) => v.toFixed(2)), "Bob@", b1.position.map((v: number) => v.toFixed(2)), "(ring", slotDist.toFixed(2), "apart, tp-flagged)");
 
   // 4. the unanchored crate falls: its y must drop between snapshots
-  //    (parts are STILL simulated server-side - only characters are client-owned).
+  //    (parts are STILL simulated server-side).
   let crateFell = false;
   for (let i = 0; i < 40 && !crateFell; i++) {
     const snap: any = await waitMessage(worker, (m) => m.t === "snapshot");
@@ -113,82 +111,80 @@ async function main() {
   assert.ok(crateFell, "unanchored crate simulated gravity server-side");
   console.log("✓ physics: the unanchored crate fell (server-authoritative)");
 
-  // 5. Alice reports walking +X (the owning client's simulation) -> the
-  //    snapshots relay her reported position + anim flags.
+  // 5. Alice sends a +X walk input (the owning client's prediction). The
+  //    server simulates the body from inputs; snapshots must reflect the
+  //    authoritative position. Each input message has a seq; the snapshot
+  //    must ack the latest seq.
   const startX = a1.position[0];
-  let reportX = startX;
-  const walkReports = setInterval(() => {
-    reportX += 1.4; // a plausible 0.25 s of walking
-    worker.postMessage({ t: "pstate", socketId: "sockA", x: reportX, y: a1.position[1], z: a1.position[2], yaw: 0, walking: true, jumping: false, sprint: false });
-  }, 100);
+  let seq = 0;
+  const walkInputs = setInterval(() => {
+    seq++;
+    worker.postMessage({
+      t: "input", socketId: "sockA",
+      x: 1, z: 0, jump: false, sprint: false, yaw: 0, seq,
+    });
+  }, 50);
   const snapWalk: any = await waitMessage(
     worker,
-    (m) => m.t === "snapshot" && m.players?.some((p: any) => p.socketId === "sockA" && p.position[0] > startX + 3),
+    (m) => m.t === "snapshot" && m.players?.some((p: any) => p.socketId === "sockA" && p.position[0] > startX + 1),
     5000,
   );
-  clearInterval(walkReports);
+  clearInterval(walkInputs);
   const a2 = snapWalk.players.find((p: any) => p.socketId === "sockA");
-  assert.ok(a2.position[0] > startX + 3, `Alice's reports were relayed (${startX.toFixed(2)} -> ${a2.position[0].toFixed(2)})`);
-  assert.strictEqual(a2.anim.walking, true, "the reported anim.walking flag rides the relay");
-  console.log(`✓ reports relayed: Alice walked +X (${startX.toFixed(2)} -> ${a2.position[0].toFixed(2)}), anim.walking = true`);
+  assert.ok(a2.position[0] > startX + 1, `Alice's inputs drove the body (${startX.toFixed(2)} -> ${a2.position[0].toFixed(2)})`);
+  assert.ok(typeof a2.ackSeq === 'number' && a2.ackSeq > 0, `the snapshot acks the latest input seq (got ${a2.ackSeq})`);
+  assert.ok(a2.ackSeq <= seq, `ackSeq (${a2.ackSeq}) must not exceed the latest sent seq (${seq})`);
+  console.log(`✓ inputs drove Alice +X (${startX.toFixed(2)} -> ${a2.position[0].toFixed(2)}), ackSeq=${a2.ackSeq} (sent=${seq})`);
 
-  // 6. The jump latch flag round-trips verbatim.
-  worker.postMessage({ t: "pstate", socketId: "sockA", x: a2.position[0], y: a2.position[1], z: a2.position[2], yaw: 0, walking: false, jumping: true, sprint: false });
-  const snapJump: any = await waitMessage(worker, (m) => m.t === "snapshot" && m.players?.some((p: any) => p.socketId === "sockA" && p.anim?.jumping === true));
-  assert.ok(snapJump, "the reported jumping flag is relayed verbatim");
-  worker.postMessage({ t: "pstate", socketId: "sockA", x: a2.position[0], y: a2.position[1], z: a2.position[2], yaw: 0, walking: false, jumping: false, sprint: false });
-  console.log("✓ jump flag relay: one pstate with jumping=true -> snapshot carries it");
+  // 6. JUMP: a press of the space bar sends jump=true. The server fires
+  //    the impulse instantly (on message arrival), the latch sets, and
+  //    the snapshot carries anim.jumping=true (exactly one rising edge).
+  worker.postMessage({
+    t: "input", socketId: "sockA", x: 0, z: 0, jump: true, sprint: false, yaw: 0, seq: ++seq,
+  });
+  const snapJump: any = await waitMessage(worker, (m) => m.t === "snapshot" && m.players?.some((p: any) => p.socketId === "sockA" && p.anim?.jumping === true), 5000);
+  assert.ok(snapJump, "the jump latch fires (anim.jumping=true relayed exactly once)");
+  console.log("✓ jump: a press of jump=true fires the impulse instantly (anim.jumping=true in the next snapshot)");
 
-  // 7. LIGHT CHECK: Bob reports a position 600 studs away -> REJECTED, the
-  //    server keeps his last accepted position (the user's "500 studs in a
-  //    frame" example).
-  const bobLast: any = await waitMessage(worker, (m) => m.t === "snapshot" && m.players?.some((p: any) => p.socketId === "sockB"));
-  const bobX = bobLast.players.find((p: any) => p.socketId === "sockB").position[0];
-  worker.postMessage({ t: "pstate", socketId: "sockB", x: bobX + 600, y: 0, z: 0, yaw: 0, walking: false, jumping: false, sprint: false });
-  await new Promise((r) => setTimeout(r, 700));
-  // A keyframe re-broadcasts Bob (~every 2s): his position must still be near
-  // the pre-attack spot (the 600-stud report was dropped).
-  const bobAfter: any = await waitMessage(worker, (m) => m.t === "snapshot" && m.players?.some((p: any) => p.socketId === "sockB"), 8000);
-  const bobXAfter = bobAfter.players.find((p: any) => p.socketId === "sockB").position[0];
-  assert.ok(Math.abs(bobXAfter - bobX) < 5,
-    `the 600-stud report must be REJECTED (kept ${bobX.toFixed(2)}, saw ${bobXAfter.toFixed(2)})`);
-  console.log(`✓ light check: a 600-stud report jump was rejected (position kept at ${bobXAfter.toFixed(2)})`);
-
-  // 7b. A sub-threshold move IS accepted (a fast but sane report).
-  worker.postMessage({ t: "pstate", socketId: "sockB", x: bobXAfter + 5, y: 0, z: 0, yaw: 0, walking: false, jumping: false, sprint: false });
-  const bobMoved: any = await waitMessage(worker, (m) => m.t === "snapshot" && m.players?.some((p: any) => p.socketId === "sockB" && Math.abs(p.position[0] - (bobXAfter + 5)) < 0.2), 8000);
-  assert.ok(bobMoved, "a 5-stud report is accepted and relayed");
-  console.log("✓ light check: a sane 5-stud report is accepted");
-
-  // 8. VOID DEATH from a reported position: Alice reports herself below the
-  //    void line -> the authority kills her, plays the death cycle, and the
-  //    respawn tp returns her to the spawn point.
-  const voidY = -50; // Math.min(-50, lowest - 30) with the baseplate at -0.5
-  worker.postMessage({ t: "pstate", socketId: "sockA", x: 0, y: voidY - 10, z: 0, yaw: 0, walking: false, jumping: false, sprint: false });
-  const deathSnap: any = await waitMessage(worker, (m) => m.t === "snapshot" && m.players?.some((p: any) => p.socketId === "sockA" && p.dying === true), 8000);
-  assert.ok(deathSnap, "the authority flagged Alice dying after her void report");
+  // 7. VOID DEATH from the AUTHORITATIVE body: walk Alice off the
+  //    baseplate edge into the void. The authority's void check kills
+  //    her, plays the death cycle, and the respawn tp returns her to
+  //    the spawn point.
+  // Strategy: walk her -Z far enough to fall off the 100x100 baseplate.
+  // Send a sustained -Z input for ~3 seconds (server walk speed ~10.8/s;
+  // 3 seconds = ~32 studs; the baseplate edge is at z=-50 from spawn z=5,
+  // so we need to walk ~55 studs; 5 seconds should be plenty).
+  const walkOffInputs = setInterval(() => {
+    seq++;
+    worker.postMessage({
+      t: "input", socketId: "sockA",
+      x: 0, z: -1, jump: false, sprint: false, yaw: 0, seq,
+    });
+  }, 50);
+  const deathSnap: any = await waitMessage(worker, (m) => m.t === "snapshot" && m.players?.some((p: any) => p.socketId === "sockA" && p.dying === true), 15000);
+  clearInterval(walkOffInputs);
+  assert.ok(deathSnap, "the authority flagged Alice dying after she walked off the baseplate");
   const deadA = deathSnap.players.find((p: any) => p.socketId === "sockA");
   assert.equal(deadA.hp, 0, "void death zeroes hp");
+  console.log(`✓ void death: Alice walked off the baseplate, hp=${deadA.hp} dying=${deadA.dying}`);
+
   const respawnSnap: any = await waitMessage(worker, (m) => m.t === "snapshot" && m.players?.some((p: any) => p.socketId === "sockA" && p.dying === false && p.hp === 100), 10000);
   const respawned = respawnSnap.players.find((p: any) => p.socketId === "sockA");
   assert.ok(respawned.tp === 1, "the respawn broadcast is tp-flagged (the owner teleports, others snap)");
   const distToSpawn = Math.hypot(respawned.position[0] - 5, respawned.position[2] - 5);
   assert.ok(distToSpawn < 3, `respawn returned Alice to spawn (dist ${distToSpawn.toFixed(2)})`);
-  console.log(`✓ void death + respawn: reported y < voidY -> died -> respawn tp at spawn (dist ${distToSpawn.toFixed(2)})`);
+  console.log(`✓ respawn: Alice back at spawn (dist ${distToSpawn.toFixed(2)}), tp flagged`);
 
-  // 9. getWorldState: the live part transforms (the crate settled by now).
+  // 8. getWorldState: the live part transforms (the crate settled by now).
   worker.postMessage({ t: "getWorldState", reqId: 42 });
   const worldState: any = await waitMessage(worker, (m) => m.t === "worldState" && m.reqId === 42, 5000);
   const objects = worldState.objects as any[];
-  // v1.3 (CharacterRoot removed): baseplate + Spawn + crate = 3 parts
-  // (the old root part is gone; the Spawn part is a real, expected part).
   assert.ok(Array.isArray(objects) && objects.length === 3, "worldState carries the non-character parts");
   const crateRec = objects.find((o: any) => o.id === "crate");
   assert.ok(crateRec && crateRec.position.y < 5, `worldState carries the SETTLED crate position (y=${crateRec.position.y.toFixed(2)})`);
-  assert.ok(!objects.some((o: any) => o.id === "root"), "character parts are excluded");
   console.log(`✓ worldstate: ${objects.length} parts with live transforms (crate settled at y=${crateRec.position.y.toFixed(2)})`);
 
-  // 10. leave -> player disappears from snapshots
+  // 9. leave -> player disappears from snapshots
   worker.postMessage({ t: "playerLeave", socketId: "sockB" });
   let gone = false;
   for (let i = 0; i < 30 && !gone; i++) {
@@ -198,7 +194,7 @@ async function main() {
   assert.ok(gone, "Bob left the snapshot after playerLeave");
   console.log("✓ lifecycle: playerLeave removes the player");
 
-  // 11. clean shutdown
+  // 10. clean shutdown
   worker.postMessage({ t: "stop" });
   const stopped = await waitMessage(worker, (m) => m.t === "stopped", 5000).catch(() => null);
   await worker.terminate();
@@ -208,6 +204,6 @@ async function main() {
 }
 
 main().catch((e) => {
-  console.error("✗ world-runtime smoke test failed:", e);
+  console.error("\n✗ world-runtime smoke test failed:", e);
   process.exit(1);
 });
