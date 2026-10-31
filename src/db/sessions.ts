@@ -1,5 +1,5 @@
 // ═══════════════════════════════════════════════════════════
-// WeildBuild DB — sessions (JWT tickets + revocation rows)
+// WeildBuild DB, sessions (JWT tickets + revocation rows)
 // ═══════════════════════════════════════════════════════════
 import { prisma } from "./client";
 import { signSessionToken, verifyTicket } from "../shared/jwt";

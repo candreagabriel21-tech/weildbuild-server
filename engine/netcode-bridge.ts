@@ -1,5 +1,5 @@
 // ═══════════════════════════════════════════════════════════════════
-// WeildBuild — netcode bridge (v1.3, client side)
+// WeildBuild, netcode bridge (v1.3, client side)
 // ═══════════════════════════════════════════════════════════════════
 // The channel between the GamePlayer's Socket.IO connection and the
 // play viewport's frame loop, for ROBLOX-STYLE multiplayer (v6.2.6):

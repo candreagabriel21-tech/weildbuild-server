@@ -1,5 +1,5 @@
 // ═══════════════════════════════════════════════════════════
-// WeildBuild DB — server settings (admin-editable, single row)
+// WeildBuild DB, server settings (admin-editable, single row)
 // ═══════════════════════════════════════════════════════════
 // The WB Admin CTRL app edits these values at runtime so you can
 // change the client version gate + per-platform download links
@@ -23,7 +23,7 @@ export interface EffectiveSettings {
     android: string;
     web: string;
   };
-  /** Which source each field came from — "db" (admin override) or "env". */
+  /** Which source each field came from, "db" (admin override) or "env". */
   source: {
     latestVersion: "db" | "env";
     minVersion: "db" | "env";

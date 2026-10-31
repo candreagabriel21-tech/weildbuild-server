@@ -1,5 +1,5 @@
 // ═══════════════════════════════════════════════════════════
-// WeildBuild Shared — platform constants
+// WeildBuild Shared, platform constants
 // ═══════════════════════════════════════════════════════════
 
 /** Max devices logged into the same account at once (oldest evicted). */
@@ -11,7 +11,7 @@ export const SESSION_LIFETIME_SECONDS = 60 * 60 * 24 * 365 * 10;
 /** Rate limit presets, ported from the original security.ts.
  *  v1.3.1: register raised 5 -> 10 per hour. 5 was too tight while
  *  testing (EVERY register press counts, including attempts that
- *  fail validation, e.g. username already taken) — the developer
+ *  fail validation, e.g. username already taken), the developer
  *  got locked out during their own testing. 10/h is still plenty
  *  of anti-spam protection for account creation. */
 export const RATE_LIMITS: Record<string, { maxAttempts: number; windowMs: number }> = {

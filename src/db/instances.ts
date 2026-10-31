@@ -1,5 +1,5 @@
 // ═══════════════════════════════════════════════════════════
-// WeildBuild DB — game host registry + instance placement
+// WeildBuild DB, game host registry + instance placement
 // ═══════════════════════════════════════════════════════════
 // Classic-style orchestration:
 //   • Each game can have multiple running instances ("mini servers").
@@ -20,7 +20,7 @@ export interface HeartbeatInstance {
   gameId: string;
   players: number;
   status: string; // running | closed
-  playerNames?: string[]; // usernames currently in the room (v1.3 — for admin "who's playing")
+  playerNames?: string[]; // usernames currently in the room (v1.3, for admin "who's playing")
 }
 
 export async function registerHost(input: {
@@ -40,13 +40,13 @@ export async function hostHeartbeat(hostId: string, instances: HeartbeatInstance
 
   // v1.4.2 SELF-HEAL PROTOCOL: if the host row is gone (fresh database after
   // a main-server migration, manual cleanup, ...) the old update() threw
-  // "record not found" on EVERY heartbeat — forever, because registration
+  // "record not found" on EVERY heartbeat, forever, because registration
   // only ran once at boot. Instead of crashing, tell the caller: the response
   // carries reRegister=true and the gamehost re-runs its registration
   // immediately (it knows its own real url/label/priority).
   const existing = await prisma.serverHost.findUnique({ where: { id: hostId } });
   if (!existing) {
-    console.warn(`[db] hostHeartbeat: host "${hostId}" is not registered — asking it to re-register (self-heal)`);
+    console.warn(`[db] hostHeartbeat: host "${hostId}" is not registered, asking it to re-register (self-heal)`);
     return { instances: running.length, players: totalPlayers, reRegister: true };
   }
 
@@ -122,7 +122,7 @@ export interface PlacementResult {
 /**
  * Find or create an instance for a player joining a game.
  *  1. Prefer an EXISTING instance of this game with room left
- *     (fill the fullest first — Server 1's instances before Server 2's).
+ *     (fill the fullest first, Server 1's instances before Server 2's).
  *  2. Otherwise create a new instance on the best available host:
  *     alive, under its instance cap, lowest priority number first
  *     (Server 1 = 1, Server 2 = 2 → "Server 2 comes in clutch").
@@ -169,13 +169,13 @@ export async function findOrCreateInstance(
   // v1.4.1 "SERVER OFFLINE" FIX: Render free-tier game hosts SLEEP after ~15
   // minutes without traffic. While asleep they send no heartbeats, so by the
   // time someone clicks Join, sweepStale() has marked every host offline and
-  // the old code answered "No game servers are currently online" — even
+  // the old code answered "No game servers are currently online", even
   // though every service was perfectly healthy (it was just napping). The
   // client showed "server offline" on every join.
   //
   // New behavior: when no host is freshly alive, fall back to the LAST KNOWN
   // host registry (any status). The create-fetch itself WAKES the sleeping
-  // service (Render cold start ~30-60s — the route's timeout allows for it),
+  // service (Render cold start ~30-60s, the route's timeout allows for it),
   // and once booted the host re-registers and heartbeats again. We try hosts
   // in priority order until one answers.
   let candidates: { id: string; url: string; priority: number; currentInstances: number; maxInstances: number; alive: boolean }[];
@@ -190,7 +190,7 @@ export async function findOrCreateInstance(
       // v1.4.2: an EMPTY registry is a CONFIG problem, not a sleep problem.
       // The game hosts' MAIN_SERVER_URL almost certainly points somewhere
       // else (a dead/old deployment), so their registration never lands in
-      // THIS server's database. Name the fix right in the error — the client
+      // THIS server's database. Name the fix right in the error, the client
       // shows it verbatim in its toast.
       const thisMain =
         process.env.MAIN_PUBLIC_URL || process.env.RENDER_EXTERNAL_URL || "your-main-server-url";
@@ -205,17 +205,17 @@ export async function findOrCreateInstance(
       id: h.id, url: h.url, priority: h.priority,
       currentInstances: 0, maxInstances: h.maxInstances, alive: false,
     }));
-    console.log(`[instances] no alive hosts — waking ${allHosts.length} registered host(s) from sleep`);
+    console.log(`[instances] no alive hosts, waking ${allHosts.length} registered host(s) from sleep`);
   }
 
   // Sort: priority asc (Server 1 first), then currentInstances asc (least loaded).
-  // (Woken hosts report 0 instances — the heartbeat will correct the count.)
+  // (Woken hosts report 0 instances, the heartbeat will correct the count.)
   const sorted = [...candidates].sort(
     (a, b) => a.priority - b.priority || a.currentInstances - b.currentInstances
   );
 
   for (const host of sorted) {
-    if (host.alive && host.currentInstances >= host.maxInstances) continue; // full (awake only — woken hosts reset)
+    if (host.alive && host.currentInstances >= host.maxInstances) continue; // full (awake only, woken hosts reset)
     const instanceId = await createOnHost(host.url, gameId, maxPlayers);
     if (instanceId) {
       await prisma.gameInstance.create({
@@ -224,7 +224,7 @@ export async function findOrCreateInstance(
           status: "running", playerCount: 0, maxPlayers,
         },
       });
-      // If this was a sleeping host, mark it online again right away — it
+      // If this was a sleeping host, mark it online again right away, it
       // clearly answered, and the next joiner shouldn't re-run the wake path.
       if (!host.alive) {
         await prisma.serverHost.update({
@@ -261,7 +261,7 @@ export async function listInstances(gameId?: string) {
   }));
 }
 
-/** Detailed instance list for the admin overview — includes player NAMES. */
+/** Detailed instance list for the admin overview, includes player NAMES. */
 export async function listInstancesDetailed() {
   const hosts = await prisma.serverHost.findMany();
   const hostById = new Map(hosts.map((h) => [h.id, h]));

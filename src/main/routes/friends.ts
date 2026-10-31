@@ -1,5 +1,5 @@
 // ═══════════════════════════════════════════════════════════
-// WeildBuild Main — /friends routes (faithful port of the Next.js
+// WeildBuild Main, /friends routes (faithful port of the Next.js
 // friends API route). ALL friend actions REQUIRE authentication;
 // the server determines identity from the session, NEVER from the
 // request body alone.
@@ -44,7 +44,7 @@ function qp(req: Request, name: string): string | null {
   return typeof v === "string" && v.length > 0 ? v : null;
 }
 
-// GET /friends — read friend data. REQUIRES authentication for own data.
+// GET /friends, read friend data. REQUIRES authentication for own data.
 friendsRouter.get("/", safeHandler(async (req, res) => {
   const rl = await requireRateLimit("general_api", clientIp(req));
   if (rl) return res.status(429).json({ error: rl.error, retryAfter: rl.retryAfter });
@@ -55,7 +55,7 @@ friendsRouter.get("/", safeHandler(async (req, res) => {
   const user1 = qp(req, "user1");
   const user2 = qp(req, "user2");
 
-  // Get DM messages — REQUIRES authentication
+  // Get DM messages, REQUIRES authentication
   if (action === "get_messages" && user1 && user2) {
     const sessionUser = await requireAuth(req, res);
     if (!sessionUser) return;
@@ -69,13 +69,13 @@ friendsRouter.get("/", safeHandler(async (req, res) => {
     return res.json(messages);
   }
 
-  // Search users — public
+  // Search users, public
   if (searchQuery) {
     const results = await searchUsers(searchQuery);
     return res.json(results);
   }
 
-  // Get friend list — REQUIRES authentication
+  // Get friend list, REQUIRES authentication
   if (username) {
     const sessionUser = await requireAuth(req, res);
     if (!sessionUser) return;
@@ -101,12 +101,12 @@ friendsRouter.get("/", safeHandler(async (req, res) => {
   return res.status(400).json({ error: "Username or search required" });
 }));
 
-// POST /friends — ALL friend actions. REQUIRES authentication.
+// POST /friends, ALL friend actions. REQUIRES authentication.
 friendsRouter.post("/", safeHandler(async (req, res) => {
   // Validate origin
   if (!originOk(req, res)) return;
 
-  // REQUIRE authentication — NO SOFT CHECKS
+  // REQUIRE authentication, NO SOFT CHECKS
   const sessionUser = await requireAuth(req, res);
   if (!sessionUser) return;
 

@@ -1,5 +1,5 @@
 // ═══════════════════════════════════════════════════════════
-// WeildBuild — official item colors (single server-side copy)
+// WeildBuild, official item colors (single server-side copy)
 // ═══════════════════════════════════════════════════════════
 // Used by prisma/seed.ts (initial seed) AND src/db/ensure.ts
 // (boot-time official-item re-sync) so the DB color column is

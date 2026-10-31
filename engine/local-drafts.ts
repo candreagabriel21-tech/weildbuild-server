@@ -1,5 +1,5 @@
 // ═══════════════════════════════════════════════════════════════════
-// WeildBuild — on-device private drafts (v2.0, IndexedDB)
+// WeildBuild, on-device private drafts (v2.0, IndexedDB)
 // ═══════════════════════════════════════════════════════════════════
 // PRIVATE work-in-progress games live ONLY on the player's device.
 // Nothing here ever touches a WeildBuild server: no fetch, no socket,

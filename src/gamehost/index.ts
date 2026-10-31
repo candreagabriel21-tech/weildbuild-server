@@ -7,7 +7,7 @@
 //   2. Main points at an existing instance, or asks THIS host to
 //      create one via POST /internal/instances
 //   3. Client connects here over Socket.IO and joins the instance
-//      room (`instance:<id>`) — one game can have many parallel
+//      room (`instance:<id>`), one game can have many parallel
 //      instances with DIFFERENT state.
 // Instances with 0 players for emptyGraceMs are disposed.
 // Event payload shapes match the legacy socket-server/server.js
@@ -64,7 +64,7 @@ const INTERNAL_HEADERS = {
 };
 
 // v1.4.2: registration state, exposed in /health so a broken deployment is
-// visible with a single curl — no dashboard log diving required:
+// visible with a single curl, no dashboard log diving required:
 //   curl https://<gamehost>/health
 //   { ..., "registered": true/false, "mainUrl": "...", "lastRegisterError": "..." }
 let registered = false;
@@ -107,7 +107,7 @@ app.use(express.json({ limit: "1mb" }));
 
 // ── Health check (Render + monitoring) ──
 // v1.3: allow any origin so the WB Admin CTRL desktop app can poll
-// uptime too (plain GET, no credentials — safe for *).
+// uptime too (plain GET, no credentials, safe for *).
 app.use("/health", (_req: express.Request, res: express.Response, next: () => void) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
   next();
@@ -166,7 +166,7 @@ app.post("/internal/instances", (req, res) => {
 
   console.log(
     `[gamehost] instance ${instanceId} created for game ${gameId} ` +
-      `(max ${maxPlayers} players) — ${manager.getInstanceStats().totalInstances}/${config.host.maxInstances} slots used`
+      `(max ${maxPlayers} players), ${manager.getInstanceStats().totalInstances}/${config.host.maxInstances} slots used`
   );
   return res.status(201).json({ instanceId, gameId, maxPlayers });
 });
@@ -201,7 +201,7 @@ async function registerWithMain(): Promise<void> {
 /** Keep retrying registration until Main accepts us.
  *
  * Backoff: the first retry comes fast (500ms) because the overwhelmingly
- * common failure is benign boot ORDER — the gamehost came up before Main's
+ * common failure is benign boot ORDER, the gamehost came up before Main's
  * HTTP listener was ready (separate services, independent startup). Doubling
  * up to the 15s steady-state keeps a genuinely unreachable/broken Main from
  * being hammered. Sequence: 0.5s, 1s, 2s, 4s, 8s, then 15s forever. */
@@ -218,7 +218,7 @@ async function registerLoop(): Promise<void> {
       registered = false;
       lastRegisterError = e instanceof Error ? e.message : String(e);
       console.warn(
-        `[gamehost] registration with ${MAIN} failed: ${lastRegisterError} — retrying in ${Math.round(retryMs / 100) / 10}s. ` +
+        `[gamehost] registration with ${MAIN} failed: ${lastRegisterError}, retrying in ${Math.round(retryMs / 100) / 10}s. ` +
           `Check MAIN_SERVER_URL (must be the URL of your REAL Main Server) and INTERNAL_TOKEN (must match Main's).`
       );
       await new Promise((resolve) => setTimeout(resolve, retryMs));
@@ -229,7 +229,7 @@ async function registerLoop(): Promise<void> {
 
 /** v1.4.2: re-register periodically (default every 5 min) even after the
  * initial success. If Main's database was ever reset/wiped, the host row is
- * gone — heartbeats alone used to fail forever. Re-registration heals it. */
+ * gone, heartbeats alone used to fail forever. Re-registration heals it. */
 function startReRegistrationLoop(): void {
   const intervalMs = parseInt(process.env.REREGISTER_INTERVAL_MS || "300000", 10);
   setInterval(() => {
@@ -267,12 +267,12 @@ function startHeartbeat(): void {
           return;
         }
         // v1.4.2 self-heal: Main answers { reRegister: true } when our host
-        // row is missing from its database (fresh DB / wiped registry) —
+        // row is missing from its database (fresh DB / wiped registry).
         // re-register immediately instead of failing forever.
         try {
           const data = (await res.json()) as { reRegister?: boolean };
           if (data && data.reRegister) {
-            console.warn("[gamehost] Main says we are not registered — re-registering now (self-heal)");
+            console.warn("[gamehost] Main says we are not registered, re-registering now (self-heal)");
             registerWithMain()
               .then(() => { registered = true; lastRegisterError = ""; })
               .catch((e: unknown) => {
@@ -290,7 +290,7 @@ function startHeartbeat(): void {
 
 /**
  * Fetch the game row from Main and cache extra_data.max_players on the
- * instance. Non-blocking and failure-tolerant — the passed-in maxPlayers
+ * instance. Non-blocking and failure-tolerant, the passed-in maxPlayers
  * is already the working fallback.
  */
 async function cacheGameMaxPlayers(instanceId: string, gameId: string, fallback: number): Promise<void> {
@@ -760,7 +760,7 @@ httpServer.listen(port, () => {
   console.log(`║  Max instances: ${String(config.host.maxInstances).slice(0, 30).padEnd(31)}║`);
   console.log(`║  Main: ${config.host.mainServerUrl.slice(0, 43).padEnd(44)}║`);
   console.log("╚══════════════════════════════════════════════════════╝");
-  // v1.4.2: catch the most common deployment mistake right at boot — a
+  // v1.4.2: catch the most common deployment mistake right at boot, a
   // MAIN_SERVER_URL that was never set (or still points at localhost). On
   // Render (RENDER_EXTERNAL_URL present) that's ALWAYS wrong and gets the
   // loud warning; on a local dev machine localhost is perfectly normal and
@@ -775,7 +775,7 @@ httpServer.listen(port, () => {
     console.warn("  clients use), e.g. https://weildbuild-server.onrender.com");
     console.warn("");
   } else if (!process.env.MAIN_SERVER_URL) {
-    console.log("[gamehost] note: MAIN_SERVER_URL not set — using local default " + config.host.mainServerUrl + " (fine for local dev)");
+    console.log("[gamehost] note: MAIN_SERVER_URL not set, using local default " + config.host.mainServerUrl + " (fine for local dev)");
   }
   // Register with Main (retry every 15s until success), then start heartbeats
   // + the periodic re-registration safety net.
@@ -789,7 +789,7 @@ let shuttingDown = false;
 function shutdown(signal: string): void {
   if (shuttingDown) return;
   shuttingDown = true;
-  console.log(`\n[gamehost] ${signal} received — shutting down...`);
+  console.log(`\n[gamehost] ${signal} received, shutting down...`);
   worldSims.stopAll();
   manager.stop();
   io.close(() => {

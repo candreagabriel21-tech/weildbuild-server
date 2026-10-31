@@ -1,5 +1,5 @@
 // ═══════════════════════════════════════════════════════════════════
-// WeildBuild GAME HOST — world simulation manager (v1.1)
+// WeildBuild GAME HOST, world simulation manager (v1.1)
 // ═══════════════════════════════════════════════════════════════════
 // Owns one server-authoritative world worker PER INSTANCE:
 //
@@ -211,7 +211,7 @@ export class WorldSimManager {
     if (!studioState || !Array.isArray(studioState.objects)) {
       // Nothing to simulate (ancient/empty game): the socket layer keeps
       // the legacy relay behavior for this instance.
-      console.log(`[world-sims] game ${instance.gameId} has no loadable world — instance ${instance.id} runs relay-only`);
+      console.log(`[world-sims] game ${instance.gameId} has no loadable world, instance ${instance.id} runs relay-only`);
       return;
     }
 
@@ -299,7 +299,7 @@ export class WorldSimManager {
     try {
       await sim.readyPromise;
       console.log(
-        `[world-sims] instance ${instance.id} (game ${instance.gameId}) — authoritative simulation READY`
+        `[world-sims] instance ${instance.id} (game ${instance.gameId}), authoritative simulation READY`
       );
       // The instance may have filled up while the world was loading -
       // register everyone already in the room.

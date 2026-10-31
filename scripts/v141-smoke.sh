@@ -1,6 +1,6 @@
 #!/bin/bash
 # ═══════════════════════════════════════════════════════════
-# WeildBuild v1.4.1 smoke test — single invocation
+# WeildBuild v1.4.1 smoke test, single invocation
 # (sandbox kills background processes between calls, so pg +
 #  all three services + every curl check run in THIS one call)
 # Covers: health, admin moderation (warn/ban/unban + rails),
@@ -18,10 +18,10 @@ export MAIN_SERVER_URL="http://localhost:8000"
 PASS=0; FAIL=0
 check() { # name, expected_substr, actual
   if echo "$3" | grep -q "$2"; then PASS=$((PASS+1)); echo "  OK  $1";
-  else FAIL=$((FAIL+1)); echo "  XX  $1 — wanted [$2] got: $(echo "$3" | head -c 220)"; fi
+  else FAIL=$((FAIL+1)); echo "  XX  $1, wanted [$2] got: $(echo "$3" | head -c 220)"; fi
 }
 checknot() { # name, forbidden_substr, actual
-  if echo "$3" | grep -q "$2"; then FAIL=$((FAIL+1)); echo "  XX  $1 — must NOT contain [$2] got: $(echo "$3" | head -c 220)";
+  if echo "$3" | grep -q "$2"; then FAIL=$((FAIL+1)); echo "  XX  $1, must NOT contain [$2] got: $(echo "$3" | head -c 220)";
   else PASS=$((PASS+1)); echo "  OK  $1"; fi
 }
 
@@ -46,7 +46,7 @@ GH_PID=$!
 for i in $(seq 1 30); do curl -s -o /dev/null http://localhost:8000/health && break; sleep 1; done
 curl -s -o /dev/null http://localhost:8000/health || { echo "main never came up"; tail -10 /tmp/main.log; exit 1; }
 
-# Wait for the gamehost to register with Main (it retries every 15s — the
+# Wait for the gamehost to register with Main (it retries every 15s, the
 # first attempt can race main's boot, exactly like on a Render cold start)
 for i in $(seq 1 45); do grep -q "registered with Main Server" /tmp/gh.log 2>/dev/null && break; sleep 1; done
 grep -q "registered with Main Server" /tmp/gh.log && echo "  OK  gamehost registered" || { echo "  XX  gamehost never registered"; tail -5 /tmp/gh.log; exit 1; }
@@ -148,7 +148,7 @@ check "stale copy purged from extras" 'STALE_NAME_IN_EXTRAS=false' "$CLEAN"
 
 echo "── 12. SLEEPING-HOST WAKE FIX (the server-offline bug) ──"
 # Register + heartbeat happened at boot. Simulate the host going to sleep:
-# heartbeat older than HOST_STALE_MS (60s) + status offline — exactly what
+# heartbeat older than HOST_STALE_MS (60s) + status offline, exactly what
 # sweepStale leaves behind after 15 idle minutes on Render free tier.
 npx tsx -e "
 import { prisma } from './src/db/client';

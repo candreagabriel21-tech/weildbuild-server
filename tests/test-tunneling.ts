@@ -1,5 +1,5 @@
 // ═══════════════════════════════════════════════════════════════════
-// WeildBuild — v6.2.4 anti-tunneling test (adaptive substepping)
+// WeildBuild, v6.2.4 anti-tunneling test (adaptive substepping)
 // ═══════════════════════════════════════════════════════════════════
 // Regression test for "characters sometimes pass through unanchored
 // parts":

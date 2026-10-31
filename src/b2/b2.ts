@@ -1,11 +1,11 @@
 // ═══════════════════════════════════════════════════════════
-// WeildBuild B2 — Backblaze B2 storage (S3-compatible)
+// WeildBuild B2, Backblaze B2 storage (S3-compatible)
 // ═══════════════════════════════════════════════════════════
 // Four buckets, one account (see DEPLOY.md):
-//   weildbuild            — assets (faces, shirts, pants, future images/sounds)
-//   weildbuild-gamefiles  — published builds, project exports
-//   weildbuild-reports    — bug reports, moderation reports, attachments
-//   weildbuild-backups    — database exports and recovery snapshots
+//   weildbuild           , assets (faces, shirts, pants, future images/sounds)
+//   weildbuild-gamefiles , published builds, project exports
+//   weildbuild-reports   , bug reports, moderation reports, attachments
+//   weildbuild-backups   , database exports and recovery snapshots
 
 import { S3Client, GetObjectCommand, PutObjectCommand } from "@aws-sdk/client-s3";
 import { config } from "../shared/config";

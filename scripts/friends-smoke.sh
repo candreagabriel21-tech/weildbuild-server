@@ -1,6 +1,6 @@
 #!/bin/bash
 # ═══════════════════════════════════════════════════════════
-# Friend lifecycle smoke test — reproduce "can't add, block or
+# Friend lifecycle smoke test, reproduce "can't add, block or
 # unfriend anyone" bug. Boots pg + main server in ONE call.
 # ═══════════════════════════════════════════════════════════
 set -u
@@ -15,11 +15,11 @@ export MAIN_SERVER_URL="http://localhost:8000"
 PASS=0; FAIL=0
 check() {
   if echo "$3" | grep -q "$2"; then PASS=$((PASS+1)); echo "  OK  $1";
-  else FAIL=$((FAIL+1)); echo "  XX  $1 — wanted [$2] got: $(echo "$3" | head -c 300)"; fi
+  else FAIL=$((FAIL+1)); echo "  XX  $1, wanted [$2] got: $(echo "$3" | head -c 300)"; fi
 }
 status_check() {
   if [ "$3" = "$2" ]; then PASS=$((PASS+1)); echo "  OK  $1";
-  else FAIL=$((FAIL+1)); echo "  XX  $1 — wanted HTTP $2 got $3"; fi
+  else FAIL=$((FAIL+1)); echo "  XX  $1, wanted HTTP $2 got $3"; fi
 }
 
 echo "── 0. Postgres ──"
@@ -90,7 +90,7 @@ status_check "admin blocks Bob returns 200" "200" "$(echo "$BLK" | tail -1)"
 check "admin blocks Bob success" '"success":true' "$(echo "$BLK" | head -1)"
 # v1.4.5 API shape: GET /api/friends returns friends/requests only; the
 # authoritative blocked_users comes back on the block/unblock action itself
-# (stripSensitiveFields(user)) — that's also what the client store keeps.
+# (stripSensitiveFields(user)), that's also what the client store keeps.
 check "admin blocked_users has Bob" '"blocked_users":\["Bob"\]' "$(echo "$BLK" | head -1)"
 
 echo "── 9. ADMIN unblocks Bob ──"

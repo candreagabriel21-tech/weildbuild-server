@@ -1,5 +1,5 @@
 // Boots embedded-postgres on :5433 for local smoke tests.
-// Runs FOREVER (the smoke script kills it at the end) — the sandbox
+// Runs FOREVER (the smoke script kills it at the end), the sandbox
 // kills background processes between bash calls, so the whole smoke
 // run (pg + services + curl checks) happens in ONE invocation.
 import EmbeddedPostgres from "embedded-postgres";

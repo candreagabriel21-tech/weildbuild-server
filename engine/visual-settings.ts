@@ -1,8 +1,8 @@
 // ═══════════════════════════════════════════════════════════
-// WeildBuild — local (device) visual settings (v13.3)
+// WeildBuild, local (device) visual settings (v13.3)
 // ═══════════════════════════════════════════════════════════
 // Visual settings (dark mode, animations, reduce motion, sidebar
-// position, UI scale, volume) are DEVICE preferences — your PC
+// position, UI scale, volume) are DEVICE preferences, your PC
 // being in dark mode shouldn't force your phone into dark mode.
 // Until v13.3 every toggle of these also fired a server call
 // (PUT /users), which was pure waste. They are now stored in
@@ -111,7 +111,7 @@ export function saveVisualSettings(settings: Partial<VisualSettings>): VisualSet
   try {
     localStorage.setItem(KEY, JSON.stringify(next));
   } catch {
-    /* storage full/blocked — settings still apply for this session */
+    /* storage full/blocked, settings still apply for this session */
   }
   window.dispatchEvent(new CustomEvent(VISUAL_SETTINGS_CHANGED, { detail: next }));
   return next;

@@ -1,5 +1,5 @@
 // ═══════════════════════════════════════════════════════════════════
-// WeildBuild — ROBLOX-STYLE MULTIPLAYER E2E (v6.2.6)
+// WeildBuild, ROBLOX-STYLE MULTIPLAYER E2E (v6.2.6)
 // ═══════════════════════════════════════════════════════════════════
 // Full-stack netcode test against the REAL gamehost process:
 //

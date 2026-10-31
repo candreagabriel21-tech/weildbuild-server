@@ -1,6 +1,6 @@
 #!/bin/bash
 # ═══════════════════════════════════════════════════════════
-# WeildBuild server — full end-to-end test (local)
+# WeildBuild server, full end-to-end test (local)
 # ═══════════════════════════════════════════════════════════
 # Requires embedded-postgres running on :5433 (see test-e2e.sh).
 # Boots main (:8000), realtime (:3003), gamehost (:3004) and
@@ -19,7 +19,7 @@ export MAIN_SERVER_URL="http://localhost:8000"
 PASS=0; FAIL=0
 check() { # name, expected_substr, actual
   if echo "$3" | grep -q "$2"; then PASS=$((PASS+1)); echo "✓ $1";
-  else FAIL=$((FAIL+1)); echo "✗ $1 — expected [$2] got: $(echo "$3" | head -c 200)"; fi
+  else FAIL=$((FAIL+1)); echo "✗ $1, expected [$2] got: $(echo "$3" | head -c 200)"; fi
 }
 
 echo "── 1. Migrate + seed ──"
@@ -117,7 +117,7 @@ BADTOKEN=$(curl -s -o /dev/null -w "%{http_code}" -X POST http://localhost:3004/
 check "internal API rejects bad token" '401' "$BADTOKEN"
 
 echo "── 13. v1.3: Admin settings + overview (WB Admin CTRL API) ──"
-# /version before any override — env defaults + downloads object
+# /version before any override, env defaults + downloads object
 check "version gate has downloads object" '"downloads"' "$(curl -s http://localhost:8000/version)"
 check "downloads.windows default derived" '/download/windows' "$(curl -s http://localhost:8000/version)"
 
@@ -155,7 +155,7 @@ sleep 1
 HB=$(curl -s -X POST http://localhost:8000/internal/hosts/heartbeat -H "Content-Type: application/json" -H "x-internal-token: $INTERNAL_TOKEN" -d "{\"hostId\":\"server-1\",\"uptimeSeconds\":1234,\"instances\":[{\"id\":\"$INSTANCE_ID\",\"gameId\":\"$GAME_ID\",\"players\":1,\"status\":\"running\",\"playerNames\":[\"TestPlayer1\"]}]}" )
 check "heartbeat with playerNames accepted" '"success":true' "$HB"
 
-# Overview — the one-click dashboard payload
+# Overview, the one-click dashboard payload
 OV=$(curl -s http://localhost:8000/api/admin/overview -H "X-Session-Token: $ADMIN_TOKEN")
 check "overview has counts" '"counts"' "$OV"
 check "overview counts 2 users" '"users":2' "$OV"

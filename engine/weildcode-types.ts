@@ -122,6 +122,25 @@ export const TRIGGER_DEFINITIONS: TriggerDefinition[] = [
           { label: 'Parts only', value: 'parts' },
         ],
       },
+      // v7.1: optional player-name filter (comma-separated, case-insensitive).
+      // Empty = any player. Only meaningful when filter is 'any' or 'player'.
+      // Example: "Alice, Bob" fires the rule only when Alice or Bob touches.
+      {
+        key: 'playerNames',
+        label: 'Only these players (comma-separated, blank = any)',
+        type: 'string',
+        default: '',
+      },
+      // v7.1: optional part-name filter (comma-separated, case-insensitive).
+      // Empty = any part. Only meaningful when filter is 'any' or 'parts'.
+      // Example: "Bullet, Door" fires the rule only when a part named
+      // Bullet or Door touches this object.
+      {
+        key: 'partNames',
+        label: 'Only these part names (comma-separated, blank = any)',
+        type: 'string',
+        default: '',
+      },
     ],
   },
   {
@@ -205,13 +224,13 @@ export const TRIGGER_DEFINITIONS: TriggerDefinition[] = [
         type: 'select',
         default: 'noon',
         options: [
-          { label: 'Dawn (5:00–7:00)', value: 'dawn' },
-          { label: 'Morning (7:00–11:00)', value: 'morning' },
-          { label: 'Noon (11:00–13:00)', value: 'noon' },
-          { label: 'Afternoon (13:00–17:00)', value: 'afternoon' },
-          { label: 'Dusk (17:00–19:00)', value: 'dusk' },
-          { label: 'Evening (19:00–22:00)', value: 'evening' },
-          { label: 'Midnight (22:00–5:00)', value: 'midnight' },
+          { label: 'Dawn (5:00-7:00)', value: 'dawn' },
+          { label: 'Morning (7:00-11:00)', value: 'morning' },
+          { label: 'Noon (11:00-13:00)', value: 'noon' },
+          { label: 'Afternoon (13:00-17:00)', value: 'afternoon' },
+          { label: 'Dusk (17:00-19:00)', value: 'dusk' },
+          { label: 'Evening (19:00-22:00)', value: 'evening' },
+          { label: 'Midnight (22:00-5:00)', value: 'midnight' },
         ],
       },
     ],

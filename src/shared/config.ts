@@ -1,5 +1,5 @@
 // ═══════════════════════════════════════════════════════════
-// WeildBuild Shared — environment config
+// WeildBuild Shared, environment config
 // ═══════════════════════════════════════════════════════════
 import dotenv from "dotenv";
 
@@ -70,7 +70,7 @@ export const config = {
   },
 
   // ── Realtime (v1.4.7: Main pushes moderation events to Realtime so a
-  //    warn/ban reaches the player's open socket INSTANTLY — the client
+  //    warn/ban reaches the player's open socket INSTANTLY, the client
   //    shows the pop-up the moment it happens, no polling delay) ──
   realtimeUrl: (process.env.REALTIME_SERVER_URL || "http://localhost:3003").replace(/\/$/, ""),
 };
@@ -82,7 +82,7 @@ export function assertSecrets(serviceName: string): void {
     console.error(`\n[${serviceName}] ✗ Missing required environment variables:`);
     for (const p of problems) console.error(`    - ${p}`);
     console.error(`  See .env.example for the full list.\n`);
-    // Don't crash realtime/gamehost if they can still run — but main MUST have it.
+    // Don't crash realtime/gamehost if they can still run, but main MUST have it.
     if (serviceName === "main") process.exit(1);
   }
 }

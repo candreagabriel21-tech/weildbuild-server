@@ -537,6 +537,33 @@ class WeildCodeEngine {
         const filter = params.filter || 'any';
         if (filter === 'player' && eventData?.touchType !== 'player') return false;
         if (filter === 'parts' && eventData?.touchType !== 'parts') return false;
+        // v7.1: optional player-name filter (only meaningful when something
+        // player-shaped is touching - 'any' or 'player'). Empty = any player.
+        const playerNamesRaw = String(params.playerNames ?? '').trim();
+        if (playerNamesRaw) {
+          const allowed = playerNamesRaw
+            .split(',')
+            .map((s) => s.trim().toLowerCase())
+            .filter(Boolean);
+          const actor = String(eventData?.actor ?? '').toLowerCase();
+          // If there is no actor (e.g. a 'parts' touch with no player
+          // involved), the player filter cannot match - skip.
+          if (!actor || !allowed.includes(actor)) return false;
+        }
+        // v7.1: optional part-name filter (only meaningful when something
+        // part-shaped is touching - 'any' or 'parts'). Empty = any part.
+        const partNamesRaw = String(params.partNames ?? '').trim();
+        if (partNamesRaw) {
+          const allowed = partNamesRaw
+            .split(',')
+            .map((s) => s.trim().toLowerCase())
+            .filter(Boolean);
+          const actorName = String(eventData?.actorName ?? '').toLowerCase();
+          // If there is no actorName (e.g. a 'player' touch, or a 'parts'
+          // touch where the touching part's name is unknown), the part
+          // filter cannot match - skip.
+          if (!actorName || !allowed.includes(actorName)) return false;
+        }
         return true;
       }
       case 'on_timer': {
@@ -2804,8 +2831,10 @@ class WeildCodeEngine {
   }
 
   /** v6.2.1: `actor` is the player whose character touched the part (same
-   * multiplayer semantics as handleClick). */
-  handleTouch(partId: string, touchType: 'player' | 'parts' | 'any' = 'any', actor?: string) {
+   * multiplayer semantics as handleClick).
+   *  v7.1: `actorName` is the name of the touching PART (for 'parts' touch
+   *  events), so the new partNames filter can match against it. */
+  handleTouch(partId: string, touchType: 'player' | 'parts' | 'any' = 'any', actor?: string, actorName?: string) {
     // v1.7 PERF: standing on a part fires the physics contact EVERY frame
     // (~60 Hz). A 100 ms debounce per part + touch type keeps touch rules
     // responsive (10 fires/sec max) while killing the rule storm.
@@ -2813,12 +2842,15 @@ class WeildCodeEngine {
     // part-only key, one player's touch ate the NEXT player's touch event
     // within the 100 ms window (two players hitting the same lava brick =
     // only the first one died until they stepped off and back on).
-    const key = `${partId}::${touchType}::${actor ?? ''}`;
+    // v7.1: the key also includes actorName so two DIFFERENT named parts
+    // touching the same brick both fire (otherwise the second one would be
+    // debounced away by the first).
+    const key = `${partId}::${touchType}::${actor ?? ''}::${actorName ?? ''}`;
     const now = performance.now();
     const last = this.touchFiredAt.get(key) ?? -Infinity;
     if (now - last < WeildCodeEngine.TOUCH_DEBOUNCE_MS) return;
     this.touchFiredAt.set(key, now);
-    this.withActor(actor, () => this.fireTrigger(partId, 'when_touched', { touchType }));
+    this.withActor(actor, () => this.fireTrigger(partId, 'when_touched', { touchType, actor, actorName }));
   }
 
   // v13.4: re-entrancy guard - a when_destroyed rule that deletes parts

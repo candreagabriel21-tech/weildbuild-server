@@ -1,5 +1,5 @@
 // ═══════════════════════════════════════════════════════════
-// WeildBuild Main — /auth routes (faithful port of the Next.js
+// WeildBuild Main, /auth routes (faithful port of the Next.js
 // auth API route; now returns JWT tickets as the session token)
 // ═══════════════════════════════════════════════════════════
 import { Router } from "express";
@@ -48,7 +48,7 @@ const logoutSchema = z.object({ action: z.literal("logout") });
 const guestSchema = z.object({ action: z.literal("guest") });
 const authActionSchema = z.discriminatedUnion("action", [registerSchema, loginSchema, changePasswordSchema, logoutSchema, guestSchema]);
 
-// POST /auth — register | login | changePassword | logout
+// POST /auth, register | login | changePassword | logout
 authRouter.post("/", safeHandler(async (req, res) => {
   if (!originOk(req, res)) return;
 
@@ -100,7 +100,7 @@ authRouter.post("/", safeHandler(async (req, res) => {
       // v1.4.2 BAN VISIBILITY FIX: banned logins return 403 (Forbidden), not
       // 401 (Unauthorized). The client's apiFetch treats ANY 401 on a write
       // as "stale session" and swaps the real message for "Session expired.
-      // Please log in again." — so banned players never saw WHY. With 403 the
+      // Please log in again.", so banned players never saw WHY. With 403 the
       // client surfaces this error verbatim: "Account is banned: <reason>".
       // (verifyLogin's message starts with "Account is banned" when banned.)
       const banned = result.error.startsWith("Account is banned");
@@ -196,7 +196,7 @@ authRouter.post("/", safeHandler(async (req, res) => {
   return res.status(400).json({ error: "Unknown action" });
 }));
 
-// GET /auth — session verification
+// GET /auth, session verification
 authRouter.get("/", safeHandler(async (req, res) => {
   const token = extractToken(req);
   if (!token) return res.json({ authenticated: false });

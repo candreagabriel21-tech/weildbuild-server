@@ -1,5 +1,5 @@
 // ═══════════════════════════════════════════════════════════
-// WeildBuild Main — /reports routes (bug + moderation reports)
+// WeildBuild Main, /reports routes (bug + moderation reports)
 // ═══════════════════════════════════════════════════════════
 // Metadata lives in Postgres (Report table); attachments go to
 // the B2 "reports" bucket. Foundation for the future in-app
@@ -26,7 +26,7 @@ const reportSchema = z.object({
   attachmentName: z.string().max(100).optional(),
 });
 
-// POST /reports — submit a report (logged-in users only)
+// POST /reports, submit a report (logged-in users only)
 reportsRouter.post("/", safeHandler(async (req, res) => {
   if (!originOk(req, res)) return;
   const username = await requireAuth(req, res);
@@ -65,7 +65,7 @@ reportsRouter.post("/", safeHandler(async (req, res) => {
   return res.status(201).json({ success: true, reportId: id });
 }));
 
-// GET /reports — admin only: list recent reports
+// GET /reports, admin only: list recent reports
 reportsRouter.get("/", safeHandler(async (req, res) => {
   const username = await requireAuth(req, res);
   if (!username) return;

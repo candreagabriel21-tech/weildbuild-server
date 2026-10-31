@@ -1,5 +1,5 @@
 // ═══════════════════════════════════════════════════════════
-// WeildBuild Main — /notifications routes (faithful port of the
+// WeildBuild Main, /notifications routes (faithful port of the
 // Next.js notifications API route). ALL notification actions
 // REQUIRE authentication; users can only read/manage their own
 // notifications (admins may create for anyone).
@@ -34,7 +34,7 @@ function qp(req: Request, name: string): string | null {
   return typeof v === "string" && v.length > 0 ? v : null;
 }
 
-// GET /notifications — Read notifications. REQUIRES authentication.
+// GET /notifications, Read notifications. REQUIRES authentication.
 notificationsRouter.get("/", safeHandler(async (req, res) => {
   const rl = await requireRateLimit("general_api", clientIp(req));
   if (rl) return res.status(429).json({ error: rl.error, retryAfter: rl.retryAfter });
@@ -42,7 +42,7 @@ notificationsRouter.get("/", safeHandler(async (req, res) => {
   const username = qp(req, "username");
   if (!username) return res.status(400).json({ error: "Username required" });
 
-  // REQUIRE authentication — users can only read their own notifications
+  // REQUIRE authentication, users can only read their own notifications
   const sessionUser = await requireAuth(req, res);
   if (!sessionUser) return;
 
@@ -54,7 +54,7 @@ notificationsRouter.get("/", safeHandler(async (req, res) => {
   return res.json(notifications);
 }));
 
-// POST /notifications — Notification actions. REQUIRES authentication.
+// POST /notifications, Notification actions. REQUIRES authentication.
 notificationsRouter.post("/", safeHandler(async (req, res) => {
   // Validate origin
   if (!originOk(req, res)) return;

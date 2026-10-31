@@ -1,5 +1,5 @@
 // ═══════════════════════════════════════════════════════════
-// WeildBuild DB — items, games, notifications, DMs, transactions
+// WeildBuild DB, items, games, notifications, DMs, transactions
 // ═══════════════════════════════════════════════════════════
 import { randomBytes } from "crypto";
 import { Prisma } from "@prisma/client";
@@ -51,7 +51,7 @@ export async function getItem(itemId: string) {
 }
 
 /**
- * Buy an item — SERVER-AUTHORITATIVE and race-condition safe.
+ * Buy an item, SERVER-AUTHORITATIVE and race-condition safe.
  * The balance deduction and ownership append happen in ONE atomic
  * conditional UPDATE: it only succeeds if the user can afford the
  * item AND doesn't already own it. Two simultaneous buys can never
@@ -180,8 +180,8 @@ const STUDIO_STATE_MAX_BYTES = 8_000_000;
 /**
  * v2.0: normalize an incoming world into a PLAIN studioState object.
  * Accepts either:
- *   • studioState — plain JSON (what current clients send)
- *   • world_b64 — legacy clients still send the encrypted export blob;
+ *   • studioState, plain JSON (what current clients send)
+ *   • world_b64, legacy clients still send the encrypted export blob;
  *     it is decrypted here and stored plain
  * Returns { studioState, worldMeta } where worldMeta carries the light
  * metadata that should live in extra_data (max_players, multiplayer,

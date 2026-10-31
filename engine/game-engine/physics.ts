@@ -887,7 +887,7 @@ export class PhysicsWorld {
     // sphere kept moving while the box caught the corner and, both belonging
     // to one fixed-rotation body, the whole character "caught up" and got
     // pinned (jump animation stuck, could slide but not jump). The fix: ONE
-    // continuous PILL (capsule) — the feet sphere extended upward at the
+    // continuous PILL (capsule), the feet sphere extended upward at the
     // SAME radius all the way to the head, exactly like the visible body.
     //
     // cannon-es has no capsule shape, and a CANNON.Cylinder for the middle
@@ -1323,6 +1323,72 @@ export class PhysicsWorld {
       cannonBody.mass = effectiveMass(mass);
       cannonBody.updateMassProperties();
       cannonBody.wakeUp();
+    }
+  }
+
+  /**
+   * v7.1 FIX: a part's canCollide flag flipped during play (WeildCode
+   * modify_property rule, the properties panel, a server sync). The
+   * PhysicsBody MIRROR was already flipped by the caller (syncFromPart);
+   * this pushes the change into the CANNON body itself (collision filters
+   * + body creation/removal).
+   *
+   * Before this fix the cannon body kept its boot-time collision filters
+   * forever: a part made non-collidable mid-game kept colliding, and a
+   * part made collidable mid-game that STARTED non-collidable had no
+   * cannon body to collide with (addBody skips cannon body creation for
+   * non-collidable parts). Both directions of the rule were broken.
+   *
+   * Strategy:
+   *   - false -> true:  if there is no cannon body yet, remove and re-add
+   *                      the body so addBody creates the cannon body for
+   *                      the now-collidable part. If a cannon body already
+   *                      exists (rare, only happens for parts that were
+   *                      collidable before), flip its filters back on.
+   *                      Joint constraints are dropped by removeBody but
+   *                      re-realized on the next step by
+   *                      syncJointConstraints (the joints array is
+   *                      unchanged), so no joints are lost.
+   *   - true -> false:  set the cannon body's filters to the non-collidable
+   *                      group/mask so it stops interacting with anything.
+   *                      Cheaper than removing the body, and reversible if
+   *                      canCollide flips back.
+   */
+  refreshBodyCanCollide(part: StudioPart): void {
+    const body = this.bodies.get(part.id);
+    if (!body) return;
+    const wasCollidable = body.canCollide;
+    const nowCollidable = !!part.canCollide;
+    if (wasCollidable === nowCollidable) return;
+
+    // Update the JS mirror flag immediately so the next syncFromPart
+    // (which would otherwise flip it back to the stale value) is a no-op.
+    body.canCollide = nowCollidable;
+
+    const cannonBody = this.cannonBodies.get(part.id);
+
+    if (nowCollidable) {
+      if (!cannonBody) {
+        // Part started non-collidable (no cannon body) and is now collidable.
+        // Remove the JS body entry and re-add the part entirely so addBody
+        // runs the cannon body creation path. Constraints referencing this
+        // body are dropped by removeBody and re-created on the next step.
+        this.bodies.delete(part.id);
+        this.addBody(part);
+        return;
+      }
+      // Existing cannon body: flip the filters back to collidable.
+      cannonBody.collisionFilterGroup = GROUP_COLLIDABLE;
+      cannonBody.collisionFilterMask = MASK_COLLIDABLE;
+      cannonBody.wakeUp();
+    } else {
+      // Now non-collidable: neuter the cannon body's filters so it stops
+      // interacting with anything. We keep the body itself (cheaper than
+      // remove+re-add if canCollide flips back).
+      if (cannonBody) {
+        cannonBody.collisionFilterGroup = GROUP_NON_COLLIDABLE;
+        cannonBody.collisionFilterMask = MASK_NON_COLLIDABLE;
+      }
     }
   }
 

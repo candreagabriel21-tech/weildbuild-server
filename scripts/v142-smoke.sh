@@ -1,6 +1,6 @@
 #!/bin/bash
 # ═══════════════════════════════════════════════════════════
-# WeildBuild v1.4.2 smoke test — single invocation
+# WeildBuild v1.4.2 smoke test, single invocation
 # (sandbox kills background processes between calls, so pg +
 #  all services + every curl check run in THIS one call)
 # Covers:
@@ -26,15 +26,15 @@ export REREGISTER_INTERVAL_MS="5000" # fast loop so the self-heal test is quick
 PASS=0; FAIL=0
 check() { # name, expected_substr, actual
   if echo "$3" | grep -q "$2"; then PASS=$((PASS+1)); echo "  OK  $1";
-  else FAIL=$((FAIL+1)); echo "  XX  $1 — wanted [$2] got: $(echo "$3" | head -c 220)"; fi
+  else FAIL=$((FAIL+1)); echo "  XX  $1, wanted [$2] got: $(echo "$3" | head -c 220)"; fi
 }
 checknot() { # name, forbidden_substr, actual
-  if echo "$3" | grep -q "$2"; then FAIL=$((FAIL+1)); echo "  XX  $1 — must NOT contain [$2] got: $(echo "$3" | head -c 220)";
+  if echo "$3" | grep -q "$2"; then FAIL=$((FAIL+1)); echo "  XX  $1, must NOT contain [$2] got: $(echo "$3" | head -c 220)";
   else PASS=$((PASS+1)); echo "  OK  $1"; fi
 }
 status_check() { # name, expected_code, actual_code
   if [ "$3" = "$2" ]; then PASS=$((PASS+1)); echo "  OK  $1";
-  else FAIL=$((FAIL+1)); echo "  XX  $1 — wanted HTTP $2 got $3"; fi
+  else FAIL=$((FAIL+1)); echo "  XX  $1, wanted HTTP $2 got $3"; fi
 }
 
 echo "── 0. Postgres ──"
@@ -48,7 +48,7 @@ echo "── 1. Migrate + seed ──"
 npx prisma db push --skip-generate --force-reset > /tmp/mig.log 2>&1 && echo "  OK  schema pushed" || { echo "  XX  migrate failed"; tail -5 /tmp/mig.log; exit 1; }
 npx tsx prisma/seed.ts > /tmp/seed.log 2>&1 && echo "  OK  seeded (top_admin)" || { echo "  XX  seed failed"; tail -5 /tmp/seed.log; exit 1; }
 
-echo "── 2. Boot MAIN ONLY (no gamehost yet — empty registry) ──"
+echo "── 2. Boot MAIN ONLY (no gamehost yet, empty registry) ──"
 node dist/main/index.js > /tmp/main.log 2>&1 &
 MAIN_PID=$!
 for i in $(seq 1 30); do curl -s -o /dev/null http://localhost:8000/health && break; sleep 1; done
@@ -78,7 +78,7 @@ echo "── 5. v1.4.2 BUG2: banned login -> 403 + reason ──"
 BAN=$(curl -s -X POST http://localhost:8000/api/admin/moderate -H "Content-Type: application/json" -H "X-Session-Token: $ADMIN_TOKEN" -d '{"action":"ban","username":"Victim1","reason":"Testing bans"}')
 check "ban ok" '"is_banned":true' "$BAN"
 BANNED_CODE=$(curl -s -o /tmp/bl.json -w "%{http_code}" -X POST http://localhost:8000/api/auth -H "Content-Type: application/json" -d '{"action":"login","username":"Victim1","password":"testpass123"}')
-status_check "banned login returns 403 (was 401 — the bug!)" "403" "$BANNED_CODE"
+status_check "banned login returns 403 (was 401, the bug!)" "403" "$BANNED_CODE"
 check "banned login body has reason" 'Account is banned: Testing bans' "$(cat /tmp/bl.json)"
 check "banned login body flagged banned:true" '"banned":true' "$(cat /tmp/bl.json)"
 check "old session instantly dead" '"authenticated":false' "$(curl -s http://localhost:8000/api/auth -H "X-Session-Token: $V_TOKEN")"
@@ -132,14 +132,14 @@ async function main() {
 main();
 " | grep -q ROW-DELETED && echo "  OK  host row deleted (simulating wiped registry)" || echo "  XX  delete failed"
 # The gamehost's next heartbeat gets reRegister:true (or the 5s re-register
-# loop fires) — the row must come back on its own within ~10s.
+# loop fires), the row must come back on its own within ~10s.
 HEALED=""
 for i in $(seq 1 20); do
   R=$(curl -s http://localhost:8000/health | grep -o '"registered":[0-9]*' || true)
   if echo "$R" | grep -q '"registered":1'; then HEALED="yes"; break; fi
   sleep 1
 done
-[ "$HEALED" = "yes" ] && echo "  OK  host re-registered automatically (self-heal works)" || echo "  XX  host never came back — self-heal broken"
+[ "$HEALED" = "yes" ] && echo "  OK  host re-registered automatically (self-heal works)" || echo "  XX  host never came back, self-heal broken"
 check "gamehost health still registered:true" '"registered":true' "$(curl -s http://localhost:3004/health)"
 
 echo "── 12. v1.4.1 regression: SLEEPING-HOST WAKE FIX ──"

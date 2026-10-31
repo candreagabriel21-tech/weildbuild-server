@@ -1,5 +1,5 @@
 // ═══════════════════════════════════════════════════════════
-// WeildBuild DB — rate limiting (ported from security.ts)
+// WeildBuild DB, rate limiting (ported from security.ts)
 // ═══════════════════════════════════════════════════════════
 import { prisma } from "./client";
 import { RATE_LIMITS } from "../shared/constants";
@@ -34,7 +34,7 @@ export async function checkRateLimit(
     await prisma.rateLimit.create({ data: { identifier, attempts: 1, windowStart: now } });
     return { allowed: true, remainingAttempts: maxAttempts - 1 };
   } catch {
-    // Fail closed (safer) — matches original behavior
+    // Fail closed (safer), matches original behavior
     return { allowed: false, remainingAttempts: 0 };
   }
 }

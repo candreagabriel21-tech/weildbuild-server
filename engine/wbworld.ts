@@ -237,7 +237,7 @@ export function wbworldSizeInfo(payloadBytes: Uint8Array, payload: object) {
 }
 
 // ═══════════════════════════════════════════════════════════════════
-// v2.0 — GAME STORAGE is PLAIN JSON (user decision)
+// v2.0, GAME STORAGE is PLAIN JSON (user decision)
 // ═══════════════════════════════════════════════════════════════════
 // Encryption now happens ONLY when a player exports/downloads a game
 // file in the create tab (.wbworld, identical bytes as before). The

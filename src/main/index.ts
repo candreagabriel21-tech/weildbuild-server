@@ -34,7 +34,7 @@ const app = express();
 // ── Middleware ──
 app.set("trust proxy", 1); // Render sits in front (x-forwarded-for)
 app.use(cors({ origin: corsOrigin, credentials: true }));
-// v1.1: 8mb — game publishes now carry the world as an encrypted
+// v1.1: 8mb, game publishes now carry the world as an encrypted
 // .wbworld blob (base64). Compressed worlds are tiny (a 1 MB JSON world
 // lands ~20-50 KB), but the cap leaves headroom for chunky thumbnails
 // on top; anything beyond 4 MB of decoded world bytes is rejected in
@@ -46,7 +46,7 @@ const startedAt = Date.now();
 app.get("/", healthHandler);
 app.get("/health", healthHandler);
 function healthHandler(_req: express.Request, res: express.Response) {
-  // v1.4.2: include the host registry census — "hosts: { registered: 0 }"
+  // v1.4.2: include the host registry census, "hosts: { registered: 0 }"
   // instantly explains "No game hosts are registered" join failures without
   // opening a database console.
   prisma.serverHost
@@ -78,8 +78,8 @@ function healthHandler(_req: express.Request, res: express.Response) {
     });
 }
 
-// ── Version gate (roadmap 2.5 — client checks on boot) ──
-// v1.3: admin-editable — DB settings (set via WB Admin CTRL) override
+// ── Version gate (roadmap 2.5, client checks on boot) ──
+// v1.3: admin-editable, DB settings (set via WB Admin CTRL) override
 // the env vars. Response shape stays compatible with client v13.1:
 // `latest` / `minimum` / `downloadUrl` unchanged, `downloads` is new.
 app.get("/version", async (_req, res) => {
@@ -106,7 +106,7 @@ app.get("/version", async (_req, res) => {
   }
 });
 
-// ── Routers (mounted under /api/* — the exact same paths the
+// ── Routers (mounted under /api/*, the exact same paths the
 //    old Next.js app used, so the client only changes its base
 //    URL, nothing else) ──
 app.use("/api/auth", authRouter);
@@ -139,7 +139,7 @@ app.listen(port, () => {
   // paid feature, so this replaces the old "run npm run migrate
   // in the Shell" step. Runs AFTER the port is bound so health
   // checks pass instantly; every step fails soft (see ensure.ts).
-  // Only the main server does this — never realtime/gamehost.
+  // Only the main server does this, never realtime/gamehost.
   ensureDatabase().catch((e) =>
     console.error("[db-setup] unexpected error (non-fatal):", e)
   );

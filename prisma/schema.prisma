@@ -1,5 +1,5 @@
 // ═══════════════════════════════════════════════════════════
-// WeildBuild — Database schema (Neon Postgres via Prisma)
+// WeildBuild, Database schema (Neon Postgres via Prisma)
 // ═══════════════════════════════════════════════════════════
 // Ported from scripts/supabase-schema.sql. Column names are kept
 // identical so existing data could be migrated later if ever needed.
@@ -7,9 +7,9 @@
 // this is a fresh database.
 //
 // NEW tables for the game-instance orchestration (Roblox-style):
-//   ServerHost    — registry of game host services (Server 1, Server 2)
-//   GameInstance  — a running "mini server" of one game
-//   Report        — bug reports / moderation reports metadata
+//   ServerHost   , registry of game host services (Server 1, Server 2)
+//   GameInstance , a running "mini server" of one game
+//   Report       , bug reports / moderation reports metadata
 
 generator client {
   provider = "prisma-client-js"
@@ -107,7 +107,7 @@ model Item {
 
 // ─────────────────────────── GAMES ───────────────────────────
 // "Game files": all studio state lives in extra_data JSONB.
-// Game hosts READ this to run instances — never modify at root.
+// Game hosts READ this to run instances, never modify at root.
 model Game {
   id          String   @id
   name        String   @default("")
@@ -124,7 +124,7 @@ model Game {
 }
 
 // ─────────────────────────────────────────────────────────────
-// v1.1: GAME WORLDS — every game's full studio state is stored as an
+// v1.1: GAME WORLDS, every game's full studio state is stored as an
 // encrypted .wbworld blob (the exact format File > Export writes:
 // WBWD1 header + deflate-9 + AES-256-GCM). Kept in a 1:1 side table
 // so game LIST queries never drag the (much larger) blob along, and
@@ -257,7 +257,7 @@ model ServerHost {
 
 // ─────────────── GAME INSTANCES (NEW) ────────────────────────
 // A "mini server": one running room of one game. Same game can
-// have many instances — different players, different state.
+// have many instances, different players, different state.
 // Created via Main's placement API, deleted when 0 players.
 model GameInstance {
   id            String    @id

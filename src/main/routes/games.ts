@@ -1,5 +1,5 @@
 // ═══════════════════════════════════════════════════════════
-// WeildBuild Main — /games routes (faithful port of the Next.js
+// WeildBuild Main, /games routes (faithful port of the Next.js
 // games API route). Creating/updating games REQUIRES auth; the
 // creator is ALWAYS determined from the session, never from the
 // request body.
@@ -105,7 +105,7 @@ function qp(req: Request, name: string): string | null {
   return typeof v === "string" && v.length > 0 ? v : null;
 }
 
-// GET /games — public endpoint (game browsing)
+// GET /games, public endpoint (game browsing)
 gamesRouter.get("/", safeHandler(async (req, res) => {
   const rl = await requireRateLimit("general_api", clientIp(req));
   if (rl) return res.status(429).json({ error: rl.error, retryAfter: rl.retryAfter });
@@ -120,7 +120,7 @@ gamesRouter.get("/", safeHandler(async (req, res) => {
   return res.json(games);
 }));
 
-// POST /games — Create game. REQUIRES authentication.
+// POST /games, Create game. REQUIRES authentication.
 gamesRouter.post("/", safeHandler(async (req, res) => {
   // Validate origin
   if (!originOk(req, res)) return;
@@ -166,7 +166,7 @@ gamesRouter.post("/", safeHandler(async (req, res) => {
   return res.status(201).json(game);
 }));
 
-// PUT /games — Update game. REQUIRES authentication + ownership or admin.
+// PUT /games, Update game. REQUIRES authentication + ownership or admin.
 gamesRouter.put("/", safeHandler(async (req, res) => {
   // Validate origin
   if (!originOk(req, res)) return;
@@ -226,7 +226,7 @@ gamesRouter.put("/", safeHandler(async (req, res) => {
   return res.json(game);
 }));
 
-// DELETE /games?id= — v1.4: creator or admin only (same permission model
+// DELETE /games?id=, v1.4: creator or admin only (same permission model
 // as PUT above). Removes the game row and any running instance rows.
 gamesRouter.delete("/", safeHandler(async (req, res) => {
   if (!originOk(req, res)) return;

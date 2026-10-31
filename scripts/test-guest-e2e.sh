@@ -1,6 +1,6 @@
 #!/bin/bash
 # ═══════════════════════════════════════════════════════════
-# WeildBuild server — GUEST MODE end-to-end test (v1.9.2)
+# WeildBuild server, GUEST MODE end-to-end test (v1.9.2)
 # ═══════════════════════════════════════════════════════════
 # Boots embedded-postgres + the Main server in ONE invocation
 # (the sandbox kills background processes between calls), then
@@ -17,7 +17,7 @@ export INTERNAL_TOKEN="e2e-internal-token"
 PASS=0; FAIL=0
 check() { # name, expected_substr, actual
   if echo "$3" | grep -q "$2"; then PASS=$((PASS+1)); echo "✓ $1";
-  else FAIL=$((FAIL+1)); echo "✗ $1 — expected [$2] got: $(echo "$3" | head -c 220)"; fi
+  else FAIL=$((FAIL+1)); echo "✗ $1, expected [$2] got: $(echo "$3" | head -c 220)"; fi
 }
 jsonval() { node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{try{const o=JSON.parse(d);const p='$2'.split('.');let v=o;for(const k of p)v=v?.[k];console.log(v??'')}catch{console.log('')}})"; }
 

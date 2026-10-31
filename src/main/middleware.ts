@@ -1,5 +1,5 @@
 // ═══════════════════════════════════════════════════════════
-// WeildBuild Main — auth middleware (Express port of security.ts)
+// WeildBuild Main, auth middleware (Express port of security.ts)
 // ═══════════════════════════════════════════════════════════
 import { Request, Response, NextFunction, RequestHandler } from "express";
 import { verifySession } from "../db/sessions";
@@ -64,7 +64,7 @@ export async function requireSelfOrAdmin(req: Request, res: Response, targetUser
   return null;
 }
 
-/** CSRF origin check for mutating routes — returns false (and responds) if blocked. */
+/** CSRF origin check for mutating routes, returns false (and responds) if blocked. */
 export function originOk(req: Request, res: Response): boolean {
   return validateOrigin(req, res);
 }
@@ -76,7 +76,7 @@ export function setSessionCookie(res: Response, token: string) {
     httpOnly: true,
     secure: isSecure,
     sameSite: "lax",
-    maxAge: 60 * 60 * 24 * 365 * 10, // 10 years — sessions never expire
+    maxAge: 60 * 60 * 24 * 365 * 10, // 10 years, sessions never expire
     path: "/",
   });
 }

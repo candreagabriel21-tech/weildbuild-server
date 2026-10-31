@@ -1,5 +1,5 @@
 // ═══════════════════════════════════════════════════════════
-// WeildBuild Shared — HTTP helpers (Express)
+// WeildBuild Shared, HTTP helpers (Express)
 // ═══════════════════════════════════════════════════════════
 import { Request, Response, NextFunction } from "express";
 import { ZodError, ZodType } from "zod";
@@ -55,18 +55,18 @@ export function corsOrigin(origin: string | undefined, callback: (err: Error | n
  * ALWAYS allowed, no matter what ALLOWED_ORIGINS says:
  *   • http(s)://localhost:<any port> and http(s)://127.0.0.1:<any port>
  *     (the web client on :3000, WB Admin CTRL in browser mode on :5173,
- *      any future local tool on any port — no more "add my port to the
+ *      any future local tool on any port, no more "add my port to the
  *      env var" dance)
  *   • tauri://localhost + http://tauri.localhost (desktop apps)
  * Localhost is the machine itself, so this is safe to allow broadly.
  * Production origins still come from ALLOWED_ORIGINS.
  *
  * v1.8.0 (renumbered from the staged v1.4.8): any https://*.vercel.app
- * (and *.vercel.dev) origin is allowed — the official web app runs on
+ * (and *.vercel.dev) origin is allowed, the official web app runs on
  * Vercel (plus its deploy previews). This is
  * the same trust level as localhost above: the session cookie is
  * SameSite=Lax (never sent cross-site by browsers), so a page on another
- * origin cannot authenticate as anyone — cross-origin clients log in and
+ * origin cannot authenticate as anyone, cross-origin clients log in and
  * authenticate with the X-Session-Token header, which only our own client
  * ever holds. Custom domains still go through ALLOWED_ORIGINS.
  */
@@ -80,7 +80,7 @@ export function isAllowedOrigin(origin: string): boolean {
   // v1.8.0: the Vercel-hosted web app + its deploy previews
   if (/^https:\/\/[a-z0-9-]+\.vercel\.(app|dev)$/i.test(clean)) return true;
   // Sandbox web previews (space-z.ai): same trust model as the Vercel rule
-  // above — the session cookie is SameSite=Lax (never sent cross-site) and
+  // above, the session cookie is SameSite=Lax (never sent cross-site) and
   // all auth flows through the X-Session-Token header, which only our own
   // client ever holds, so a page on such an origin cannot act as anyone.
   if (/^https:\/\/[a-z0-9-]+\.space-z\.ai$/i.test(clean)) return true;

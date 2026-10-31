@@ -1,5 +1,5 @@
 // ═══════════════════════════════════════════════════════════════════
-// WeildBuild — v6.2.2 delta snapshots + idle pause test
+// WeildBuild, v6.2.2 delta snapshots + idle pause test
 // ═══════════════════════════════════════════════════════════════════
 // Verifies the server-efficiency work directly against the worker:
 //

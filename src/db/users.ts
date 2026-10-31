@@ -1,5 +1,5 @@
 // ═══════════════════════════════════════════════════════════
-// WeildBuild DB — users + passwords (ported 1:1 from file-db.ts)
+// WeildBuild DB, users + passwords (ported 1:1 from file-db.ts)
 // ═══════════════════════════════════════════════════════════
 // The password algorithm is IDENTICAL to the original app, so
 // existing accounts (including the seeded WeildBuild admin) keep
@@ -245,7 +245,7 @@ export async function getAllUsers() {
 
 export async function searchUsers(query: string) {
   try {
-    // Ported from Supabase .ilike — case-insensitive substring match
+    // Ported from Supabase .ilike, case-insensitive substring match
     const rows = await prisma.user.findMany({
       where: { username: { contains: query, mode: "insensitive" } },
       take: 20,
@@ -257,7 +257,7 @@ export async function searchUsers(query: string) {
 }
 
 // ─────────────────── FREE STARTER WARDROBE (simplification) ───────────────────
-// Every NEW account now starts owning the entire basic wardrobe — every
+// Every NEW account now starts owning the entire basic wardrobe, every
 // shirt, every pair of pants, and the friendly face set (all free faces
 // plus the classics: Smile, Surprised Guy, Looking Up, Happy, Fury, Smug
 // and Calm). verifyLogin() also BACKFILLS this set onto existing accounts,
@@ -351,7 +351,7 @@ export async function verifyLogin(username: string, password: string) {
   }
 
   // SIMPLIFICATION (free starter wardrobe): make sure long-lived
-  // accounts ALSO own the free basics — the shop UI is hidden now, so
+  // accounts ALSO own the free basics, the shop UI is hidden now, so
   // there is no way to buy them anymore. Idempotent: only writes when
   // something is actually missing (which after the first login is never).
   if (!Array.isArray(user.items_owned)) user.items_owned = [];

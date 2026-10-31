@@ -1,5 +1,5 @@
 // ═══════════════════════════════════════════════════════════════════
-// WeildBuild — world-runtime bundler (v1.2)
+// WeildBuild, world-runtime bundler (v1.2)
 // ═══════════════════════════════════════════════════════════════════
 // Bundles the server-authoritative game runtime into ONE self-contained
 // Node file: dist/gamehost/world-runtime.bundle.js.

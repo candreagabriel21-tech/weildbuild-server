@@ -1,10 +1,10 @@
 // ═══════════════════════════════════════════════════════════
-// WeildBuild Main — /instances routes (game placement + hosts)
+// WeildBuild Main, /instances routes (game placement + hosts)
 // ═══════════════════════════════════════════════════════════
 // The classic orchestration conductor:
 //   • Client: POST /instances/join {gameId} → {instanceId, socketUrl}
 //     (fill an existing instance with room left, else create one
-//     on the best host — Server 1 first, Server 2 as overflow)
+//     on the best host, Server 1 first, Server 2 as overflow)
 //   • Game hosts: POST /internal/hosts/register + /heartbeat
 //   • Public: GET /instances?gameId= (live server browser data)
 
@@ -19,11 +19,11 @@ import {
 } from "../../db/instances";
 import { incrementGamePlays } from "../../db/data";
 
-// Client-facing router — mounted at /instances
+// Client-facing router, mounted at /instances
 export const instancesRouter = Router();
 instancesRouter.use(attachUser);
 
-// Server-to-server router — mounted at /internal (game hosts call these)
+// Server-to-server router, mounted at /internal (game hosts call these)
 export const internalRouter = Router();
 
 // ─────────────── Client-facing: join a game ───────────────
@@ -52,7 +52,7 @@ instancesRouter.post("/join", safeHandler(async (req, res) => {
           "x-internal-token": config.internalToken,
         },
         body: JSON.stringify({ gameId: gid, maxPlayers }),
-        signal: AbortSignal.timeout(75000), // v1.4.1: Render free-tier cold start can take 30-60s — 20s gave up mid-wake
+        signal: AbortSignal.timeout(75000), // v1.4.1: Render free-tier cold start can take 30-60s, 20s gave up mid-wake
       });
       if (!response.ok) {
         console.error(`[instances] host ${hostUrl} create failed: ${response.status}`);
@@ -84,7 +84,7 @@ instancesRouter.post("/join", safeHandler(async (req, res) => {
   });
 }));
 
-// GET /instances?gameId= — live instances (server browser data)
+// GET /instances?gameId=, live instances (server browser data)
 instancesRouter.get("/", safeHandler(async (_req, res) => {
   const instances = await listInstances();
   return res.json({ instances });

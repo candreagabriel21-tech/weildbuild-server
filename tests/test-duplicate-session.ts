@@ -1,5 +1,5 @@
 // ═══════════════════════════════════════════════════════════════════
-// WeildBuild — v6.2.2 duplicate session guard test
+// WeildBuild, v6.2.2 duplicate session guard test
 // ═══════════════════════════════════════════════════════════════════
 // The reported bug: joining the same game twice with the same account
 // produced TWO bodies in the room (the second one often with a default
@@ -185,7 +185,7 @@ async function main() {
       'the duplicate warning carries a readable message',
     );
     // No hyphens or em dashes in any UI-facing message (user requirement).
-    assert.ok(!/[-—–]/.test(dupErr.message), `warning must not contain dashes (got "${dupErr.message}")`);
+    assert.ok(!/[---]/.test(dupErr.message), `warning must not contain dashes (got "${dupErr.message}")`);
     await withTimeout(alice2Gone, 8000, 'disconnect');
     console.log(`✓ duplicate join REJECTED + kicked: "${dupErr.message}"`);
 
@@ -221,7 +221,7 @@ async function main() {
       typeof takeoverErr.message === 'string' && takeoverErr.message.length > 0,
       'the takeover warning carries a readable message',
     );
-    assert.ok(!/[-—–]/.test(takeoverErr.message), `takeover warning must not contain dashes (got "${takeoverErr.message}")`);
+    assert.ok(!/[---]/.test(takeoverErr.message), `takeover warning must not contain dashes (got "${takeoverErr.message}")`);
     await withTimeout(alice1Gone, 8000, 'disconnect');
     console.log(`✓ parked session taken over + warned: "${takeoverErr.message}"`);
 

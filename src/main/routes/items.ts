@@ -1,5 +1,5 @@
 // ═══════════════════════════════════════════════════════════
-// WeildBuild Main — /items routes (faithful port of the Next.js
+// WeildBuild Main, /items routes (faithful port of the Next.js
 // items API route). Buying items REQUIRES authentication; the
 // server is the SOLE AUTHORITY on WeBuy balances (atomic purchase,
 // transaction logging).
@@ -28,7 +28,7 @@ function qp(req: Request, name: string): string | null {
   return typeof v === "string" && v.length > 0 ? v : null;
 }
 
-// GET /items — public endpoint (catalog browsing)
+// GET /items, public endpoint (catalog browsing)
 itemsRouter.get("/", safeHandler(async (req, res) => {
   const rl = await requireRateLimit("general_api", clientIp(req));
   if (rl) return res.status(429).json({ error: rl.error, retryAfter: rl.retryAfter });
@@ -46,7 +46,7 @@ itemsRouter.get("/", safeHandler(async (req, res) => {
   return res.json(items);
 }));
 
-// POST /items — Buy item. REQUIRES authentication.
+// POST /items, Buy item. REQUIRES authentication.
 // The server is the SOLE AUTHORITY on WeBuy balances.
 itemsRouter.post("/", safeHandler(async (req, res) => {
   // Validate origin
@@ -88,7 +88,7 @@ itemsRouter.post("/", safeHandler(async (req, res) => {
     return res.status(400).json({ error: "Not enough WeBuy" });
   }
 
-  // Server-authoritative balance deduction — one atomic conditional
+  // Server-authoritative balance deduction, one atomic conditional
   // UPDATE, race-condition safe (no double-spend / double-append).
   const result = await buyItemAtomic(username, itemId);
   if ("error" in result) {

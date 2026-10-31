@@ -1,5 +1,5 @@
 // ═══════════════════════════════════════════════════════════
-// WeildBuild Main — /storage routes (B2 asset proxy)
+// WeildBuild Main, /storage routes (B2 asset proxy)
 // ═══════════════════════════════════════════════════════════
 // Ported from /api/storage/download. Streams private-bucket
 // assets (avatar faces etc.) without exposing signed URLs.

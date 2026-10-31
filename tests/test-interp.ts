@@ -1,5 +1,5 @@
 // ═══════════════════════════════════════════════════════════════════
-// WeildBuild — v6.2.6 entity interpolation + report throttle test
+// WeildBuild, v6.2.6 entity interpolation + report throttle test
 // ═══════════════════════════════════════════════════════════════════
 // Regression test for the client-side interpolation core that remote
 // character rendering runs on (sampleInterp in netcode-bridge) plus the

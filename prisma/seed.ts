@@ -1,18 +1,18 @@
 // ═══════════════════════════════════════════════════════════
-// WeildBuild — database seed
+// WeildBuild, database seed
 // ═══════════════════════════════════════════════════════════
 // Run with:  npm run seed
 // Seeds the 35 official shop items from data/items/*.json.
 //
 // v2.1 SECURITY: the default admin account (WeildBuild / a
-// hardcoded password) is NO LONGER seeded here — a password baked
+// hardcoded password) is NO LONGER seeded here, a password baked
 // into the repo is a leaked password. The first admin is created
 // from ENVIRONMENT VARIABLES instead (see src/db/ensure.ts):
 //
 //   ADMIN_USERNAME + ADMIN_PASSWORD
 //
 // Set them once on your hosting dashboard (Render > Environment)
-// and restart — the account is created only if the username does
+// and restart, the account is created only if the username does
 // not exist yet, and its password is NEVER overwritten afterwards,
 // so you can change it freely from in-app Settings.
 //
@@ -28,7 +28,7 @@ const prisma = new PrismaClient();
 async function seedItems() {
   const itemsDir = join(__dirname, "..", "data", "items");
   if (!existsSync(itemsDir)) {
-    console.warn("! No data/items directory found — skipping items");
+    console.warn("! No data/items directory found, skipping items");
     return;
   }
   const files = readdirSync(itemsDir).filter((f) => f.endsWith(".json"));
@@ -60,7 +60,7 @@ async function seedItems() {
 async function main() {
   console.log("Seeding WeildBuild database...");
   await seedItems();
-  console.log("Done. (Admin accounts come from ADMIN_USERNAME/ADMIN_PASSWORD env vars — see src/db/ensure.ts)");
+  console.log("Done. (Admin accounts come from ADMIN_USERNAME/ADMIN_PASSWORD env vars, see src/db/ensure.ts)");
 }
 
 main()

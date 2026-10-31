@@ -1,5 +1,5 @@
 // ═══════════════════════════════════════════════════════════════════
-// WeildBuild — Block editor catalog (v7, our own editor - no Blockly)
+// WeildBuild, Block editor catalog (v7, our own editor - no Blockly)
 // ═══════════════════════════════════════════════════════════════════
 // The new Code editor is built in-house: a React block palette + stack
 // that edits WeildCodeRule JSON DIRECTLY (the same model the engine runs

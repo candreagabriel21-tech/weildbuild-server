@@ -365,15 +365,15 @@ export interface WorldSettings {
   cloudsEnabled: boolean;
   cloudColor: string;
   cloudDensity: number;
-  cloudSpeed: number;        // 0–10 (multiplier)
-  windDirection: number;     // 0–360 (degrees, 0=North, 90=East, 180=South, 270=West)
+  cloudSpeed: number;        // 0-10 (multiplier)
+  windDirection: number;     // 0-360 (degrees, 0=North, 90=East, 180=South, 270=West)
   starsEnabled: boolean;
-  starCount: number;         // 0–5000
+  starCount: number;         // 0-5000
   dayNightEnabled: boolean;
-  timeOfDay: number;        // 0–24 (hours), e.g. 12 = noon, 0 = midnight
+  timeOfDay: number;        // 0-24 (hours), e.g. 12 = noon, 0 = midnight
   dayLength: number;         // real-time seconds for a full day/night cycle
   weatherType: 'clear' | 'cloudy' | 'rain' | 'snow';
-  weatherIntensity: number;  // 0–1
+  weatherIntensity: number;  // 0-1
 }
 
 // ─── Universes (multiple scenes within a project) ───

@@ -1,5 +1,5 @@
 // ═══════════════════════════════════════════════════════════
-// WeildBuild DB — Prisma client singleton
+// WeildBuild DB, Prisma client singleton
 // ═══════════════════════════════════════════════════════════
 import { PrismaClient } from "@prisma/client";
 

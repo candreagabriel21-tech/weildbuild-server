@@ -1,6 +1,6 @@
 // ─── FPS status tiers (studio performance HUD) ───
-// The studio's live FPS counter reads "(fps) FPS - (status)" — e.g.
-// "72 FPS - Perfect" — and its hover tooltip is just the status word.
+// The studio's live FPS counter reads "(fps) FPS - (status)", e.g.
+// "72 FPS - Perfect", and its hover tooltip is just the status word.
 // The scale (user-specified in Round 10):
 //   70+      Perfect
 //   60-69    Awesome
@@ -22,7 +22,7 @@ export interface FpsTier {
   dot: string;
 }
 
-// Highest first — fpsTier() picks the first tier whose min fits.
+// Highest first, fpsTier() picks the first tier whose min fits.
 export const FPS_TIERS: readonly FpsTier[] = [
   { min: 70, label: 'Perfect', color: 'text-emerald-400', dot: 'bg-emerald-400' },
   { min: 60, label: 'Awesome', color: 'text-emerald-400', dot: 'bg-emerald-400' },

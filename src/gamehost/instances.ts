@@ -1,5 +1,5 @@
 // ═══════════════════════════════════════════════════════════
-// WeildBuild GAME HOST — instance manager
+// WeildBuild GAME HOST, instance manager
 // ═══════════════════════════════════════════════════════════
 // One game-host process runs MANY game instances ("mini servers").
 // Each instance = one room of one game, capped at maxPlayers
@@ -146,7 +146,7 @@ export class GameInstanceManager {
 
   /**
    * Remove a socket from an instance. If instanceId is given, only that
-   * instance is considered (no-op if the socket isn't in it — matches the
+   * instance is considered (no-op if the socket isn't in it, matches the
    * old server's behaviour); otherwise the socket is removed from wherever
    * it is playing. Sets emptySince when the instance becomes empty.
    */
@@ -224,7 +224,7 @@ export class GameInstanceManager {
       ) {
         console.log(
           `[gamehost] instance ${instance.id} (game ${instance.gameId}) empty for ` +
-            `${Math.round((now - instance.emptySince) / 1000)}s — disposing`
+            `${Math.round((now - instance.emptySince) / 1000)}s, disposing`
         );
         this.disposeInstance(instance.id);
       }

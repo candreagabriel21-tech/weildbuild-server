@@ -1,15 +1,15 @@
 # ═══════════════════════════════════════════════════════════════════
-# WeildBuild — Render Blueprint
+# WeildBuild, Render Blueprint
 # ═══════════════════════════════════════════════════════════════════
 # Push this repo to GitHub, then: https://dashboard.render.com/blueprints
 #
-# ⚠️ READ THIS FIRST — THE FREE-TIER MATH ⚠️
+# ⚠️ READ THIS FIRST, THE FREE-TIER MATH ⚠️
 # Render free accounts get 750 instance-hours/month. A service kept
 # awake 24/7 burns ~730 h/month. So ONE always-awake service per
-# account fits — but this blueprint's four services together would
+# account fits, but this blueprint's four services together would
 # burn ~2,920 h/month and get suspended around day 8.
 #
-# ▶ RECOMMENDED (the 4-account plan — see DEPLOY.md for the
+# ▶ RECOMMENDED (the 4-account plan, see DEPLOY.md for the
 #   click-by-click guide):
 #     Account 1 (you)          → weildbuild-main
 #     Account 2 (friend)       → weildbuild-realtime
@@ -23,7 +23,7 @@
 #   tier. Delete the services you don't want on this account before
 #   applying (or comment them out below).
 #
-# ▶ KEEP-AWAKE: no extra service and no 5th account needed — set up
+# ▶ KEEP-AWAKE: no extra service and no 5th account needed, set up
 #   a free UptimeRobot (or cron-job.org) monitor per service, each
 #   pinging /health every 5 minutes. See DEPLOY.md section 6.
 # ═══════════════════════════════════════════════════════════════════
@@ -43,7 +43,7 @@ services:
     envVars:
       - key: NODE_ENV
         value: production
-      # ── Secrets (fill in during blueprint setup — Render asks you) ──
+      # ── Secrets (fill in during blueprint setup, Render asks you) ──
       - key: DATABASE_URL          # Neon connection string
         sync: false
       - key: AUTH_SECRET           # same 96-hex-char value on EVERY service
@@ -56,7 +56,7 @@ services:
         sync: false
       # ── v1.4.7: where Main pushes instant warn/ban events ──
       # Set this to your REALTIME service's public URL (e.g. https://weildbuild-realtime.onrender.com).
-      # Without it, moderation still works — players just see the pop-up on
+      # Without it, moderation still works, players just see the pop-up on
       # their next login instead of the instant push.
       - key: REALTIME_SERVER_URL
         sync: false
@@ -143,7 +143,7 @@ services:
       - key: HEARTBEAT_INTERVAL_MS
         value: "15000"
 
-  # ─────────────── 4. GAME HOST 2 ("Server 2" — the overflow) ───────────────
+  # ─────────────── 4. GAME HOST 2 ("Server 2", the overflow) ───────────────
   # Same code, different identity. Server 2 only gets instances once
   # Server 1 is full (priority ordering in the Main Server).
   - type: web

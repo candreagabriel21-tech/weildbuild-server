@@ -1,7 +1,7 @@
 // ═══════════════════════════════════════════════════════════
-// WeildBuild — SIMPLE MODE (the declutter switch)
+// WeildBuild, SIMPLE MODE (the declutter switch)
 // ═══════════════════════════════════════════════════════════
-// "this game is a little too complicated" — one switch that HIDES
+// "this game is a little too complicated", one switch that HIDES
 // the features we're shelving for now. Nothing is deleted from the
 // codebase: every hidden surface still exists, so flipping this
 // back to false brings everything back exactly as it was.

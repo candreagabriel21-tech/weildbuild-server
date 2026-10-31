@@ -1,5 +1,5 @@
 // ═══════════════════════════════════════════════════════════
-// WeildBuild — .wbworld format, SERVER side (v1.1)
+// WeildBuild, .wbworld format, SERVER side (v1.1)
 // ═══════════════════════════════════════════════════════════
 // Node implementation of the exact same encrypted world format the
 // studio uses for File > Export / Import (see platform/src/lib/

@@ -1,13 +1,13 @@
 // ═══════════════════════════════════════════════════════════
-// Password compatibility test — MUST pass before deployment
+// Password compatibility test, MUST pass before deployment
 // ═══════════════════════════════════════════════════════════
 // Verifies the ported scrypt algorithm produces/verifies the
 // same hashes as the original app. The ADMIN_* constants below
 // are HISTORICAL TEST VECTORS from the original supabase
-// schema.sql (pure crypto fixtures for algorithm compatibility —
+// schema.sql (pure crypto fixtures for algorithm compatibility.
 // they are NOT live credentials; no account is seeded with them
 // anywhere, see prisma/seed.ts).
-// No database needed — pure crypto check.
+// No database needed, pure crypto check.
 
 import { scryptSync, timingSafeEqual, createHash, randomBytes } from "crypto";
 
@@ -67,8 +67,8 @@ check("scrypt hash is 128-char hex", /^[a-f0-9]{128}$/.test(newHash));
 
 console.log("");
 if (failures > 0) {
-  console.error(`✗ ${failures} test(s) FAILED — do not deploy!`);
+  console.error(`✗ ${failures} test(s) FAILED, do not deploy!`);
   process.exit(1);
 } else {
-  console.log("✓ All password compatibility tests passed — existing accounts will keep working.");
+  console.log("✓ All password compatibility tests passed, existing accounts will keep working.");
 }

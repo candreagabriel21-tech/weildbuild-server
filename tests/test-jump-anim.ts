@@ -1,11 +1,11 @@
 // ═══════════════════════════════════════════════════════════════════
-// WeildBuild — v6.2.6 jump animation latch test (client-owned)
+// WeildBuild, v6.2.6 jump animation latch test (client-owned)
 // ═══════════════════════════════════════════════════════════════════
 // Regression test for "when you jump, the animation and sound plays once
 // when you jump and once when you hit the ground":
 //
 //   The naive `!grounded && vy > 0` flag flips FALSE at the apex (landing
-//   cues fired mid-air) and — much worse — flips TRUE again for a tick
+//   cues fired mid-air) and, much worse, flips TRUE again for a tick
 //   when the landing impact resolves with a small upward velocity spike,
 //   so every remote viewer rendered the jump animation (and played the
 //   jump sound) TWICE: once at the jump and once at the landing.

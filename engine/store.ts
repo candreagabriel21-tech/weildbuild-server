@@ -220,12 +220,12 @@ export async function apiFetch(path: string, options?: RequestInit) {
   if (res.status === 401) {
     // v13.11: /auth POST failures must surface the SERVER's own error.
     // Session recovery makes no sense when the client is ESTABLISHING a
-    // session (login/register/changePassword) — and the generic fallback
+    // session (login/register/changePassword), and the generic fallback
     // below ("Session expired. Please log in again.") was hiding the real
     // reason: banned players saw "Session expired" instead of "Account is
     // banned: <reason>", and even wrong passwords showed the same confusing
     // message. (Banned logins now also come back as 403 from server v1.4.2,
-    // which older clients already display correctly — this covers the rest.)
+    // which older clients already display correctly, this covers the rest.)
     if (path === "/auth" && !isGet) {
       const body = await res.json().catch(() => ({}));
       throw new Error(body.error || "Login failed");

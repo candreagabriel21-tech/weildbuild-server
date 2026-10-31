@@ -10,7 +10,7 @@
 //   NEXT_PUBLIC_API_URL=http://localhost:8000
 //   NEXT_PUBLIC_REALTIME_URL=http://localhost:3003
 //
-// v13.3: the version now lives in ONE place — package.json
+// v13.3: the version now lives in ONE place, package.json
 // "version". APP_VERSION below reads it directly, and
 // scripts/sync-version.mjs stamps the same number into the
 // splash screen, tauri.conf.json and Cargo.toml automatically
@@ -22,7 +22,7 @@ import pkg from "../../package.json";
 /** The Main Server - accounts, games, items, friends, everything.
  *  v6.2s: if NEXT_PUBLIC_API_URL is SET but empty (""), that means
  *  "same origin" (sandbox web preview proxies the API through Next.js
- *  rewrites) — an UNSET var still falls back to the official server. */
+ *  rewrites), an UNSET var still falls back to the official server. */
 export const API_URL = (
   process.env.NEXT_PUBLIC_API_URL !== undefined
     ? process.env.NEXT_PUBLIC_API_URL
@@ -61,7 +61,7 @@ export function assetUrl(b2Key: string): string {
 
 /**
  * WB preview helper (sandbox web preview): the preview gateway exposes
- * ONE external origin — extra local services are addressed with the
+ * ONE external origin, extra local services are addressed with the
  * ?XTransformPort=<port> query. The server side still stores absolute
  * localhost URLs (e.g. a game host's socketUrl), so the browser needs
  * them translated to same-origin gateway paths before io() connects.
@@ -73,7 +73,7 @@ export function assetUrl(b2Key: string): string {
 const socketUrlMap: readonly [string, string][] = (process.env.NEXT_PUBLIC_SOCKET_URL_MAP || "")
   .split(";")
   .map((pair) => {
-    const eq = pair.indexOf("="); // first "=" only — values contain "=" themselves
+    const eq = pair.indexOf("="); // first "=" only, values contain "=" themselves
     return eq > 0 ? [pair.slice(0, eq).trim(), pair.slice(eq + 1).trim()] : null;
   })
   .filter((pair): pair is [string, string] => !!pair && pair[0].length > 0 && pair[1].length > 0);

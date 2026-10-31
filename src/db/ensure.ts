@@ -1,39 +1,39 @@
 // ═══════════════════════════════════════════════════════════
-// WeildBuild DB — automatic setup on boot (v1.3.1)
+// WeildBuild DB, automatic setup on boot (v1.3.1)
 // ═══════════════════════════════════════════════════════════
 // WHY THIS EXISTS: Render made the Shell tab a paid feature, so
 // "deploy then run npm run migrate in the Shell" no longer works
 // on the free plan. From v1.3.1 the Main Server sets up the
 // database BY ITSELF, in the background, a few seconds after it
 // starts:
-//   1. `prisma db push`  — syncs the schema (safe to re-run: it
+//   1. `prisma db push` , syncs the schema (safe to re-run: it
 //      does nothing when the database is already up to date)
 //   2. If the database is COMPLETELY empty (zero user accounts,
 //      i.e. a brand-new Neon project) it also runs the seed
 //      (the official shop items; admin accounts come from
-//      ADMIN_USERNAME/ADMIN_PASSWORD env vars — see bootstrapAdmin)
+//      ADMIN_USERNAME/ADMIN_PASSWORD env vars, see bootstrapAdmin)
 //
 // NOTES
-//   • Only the MAIN SERVER calls this — never add it to realtime
+//   • Only the MAIN SERVER calls this, never add it to realtime
 //     or gamehost, or three services would race each other.
 //   • It runs in the background AFTER the port is bound, so the
 //     Render health check passes instantly even on a cold Neon
 //     database. Every step is wrapped in try/catch: a database
-//     hiccup can never take the server down — it just retries on
+//     hiccup can never take the server down, it just retries on
 //     the next boot.
 //   • v2.1 SECURITY: the seed no longer creates a default admin
 //     account (no hardcoded passwords in the repo, ever). The
 //     first admin is bootstrapped from ENVIRONMENT VARIABLES:
 //     ADMIN_USERNAME + ADMIN_PASSWORD. It is created only when the
-//     account does not exist yet — an existing account's password
+//     account does not exist yet, an existing account's password
 //     is NEVER overwritten, so a password changed in-app stays
 //     changed across redeploys and restarts.
-//   • NEW in v1.8.1 — OFFICIAL ITEM RE-SYNC on every boot: the
+//   • NEW in v1.8.1, OFFICIAL ITEM RE-SYNC on every boot: the
 //     34 official catalog items from data/items/*.json are
 //     upserted on EVERY start (not just empty databases), so a
 //     redeploy is all it takes to push catalog edits (names,
 //     descriptions, prices, colors) to the live database. It
-//     only touches items whose IDs exist in data/items — any
+//     only touches items whose IDs exist in data/items, any
 //     user-created/community items are left alone.
 
 import { exec } from "child_process";
@@ -79,7 +79,7 @@ async function runWithRetries(
       return true;
     } catch (err: any) {
       const msg = String(err?.message ?? err).split("\n")[0];
-      console.warn(`[db-setup] ${label}: attempt ${i}/${attempts} failed — ${msg}`);
+      console.warn(`[db-setup] ${label}: attempt ${i}/${attempts} failed, ${msg}`);
       if (err?.stdout) logTail(err.stdout, 2);
       if (err?.stderr) logTail(err.stderr, 2);
       if (i < attempts) {
@@ -92,7 +92,7 @@ async function runWithRetries(
 }
 
 /**
- * Official item re-sync (v1.8.1) — upserts every item from
+ * Official item re-sync (v1.8.1), upserts every item from
  * data/items/*.json. Runs on EVERY boot, so catalog edits deploy
  * with a plain redeploy. Only items whose IDs are listed in
  * data/items are touched; user-created items are never modified.
@@ -100,7 +100,7 @@ async function runWithRetries(
 async function syncOfficialItems(): Promise<void> {
   const itemsDir = join(repoRoot, "data", "items");
   if (!existsSync(itemsDir)) {
-    console.warn("! [db-setup] data/items not found — official item re-sync skipped");
+    console.warn("! [db-setup] data/items not found, official item re-sync skipped");
     return;
   }
   const files = readdirSync(itemsDir).filter((f) => f.endsWith(".json")).sort();
@@ -197,7 +197,7 @@ async function migrateGamesToPlain(): Promise<void> {
 // v2.1 ADMIN BOOTSTRAP (from environment variables)
 // ─────────────────────────────────────────────────────────────
 // The old seed baked a default admin (WeildBuild / a fixed
-// password) into the repository — anyone reading the code could
+// password) into the repository, anyone reading the code could
 // log into every deployment that forgot to change it. The admin
 // now comes exclusively from env vars:
 //
@@ -219,7 +219,7 @@ function bootstrapAdminFromEnv(): void {
 
   if (!adminUsername || !adminPassword) {
     console.log(
-      "[db-setup] No ADMIN_USERNAME/ADMIN_PASSWORD set — no admin bootstrapped.\n" +
+      "[db-setup] No ADMIN_USERNAME/ADMIN_PASSWORD set, no admin bootstrapped.\n" +
         "    To create the first admin: set both env variables on your host\n" +
         "    (Render → Environment) and restart the server. The account is only\n" +
         "    created if it doesn't exist yet; its password is never overwritten."
@@ -231,20 +231,20 @@ function bootstrapAdminFromEnv(): void {
     .findUnique({ where: { username: adminUsername }, select: { username: true } })
     .then(async (existing) => {
       if (existing) {
-        // Re-assert the ROLE only — never the password (Settings must win).
+        // Re-assert the ROLE only, never the password (Settings must win).
         await prisma.user.update({
           where: { username: adminUsername },
           data: { adminRole: "top_admin" },
         });
         console.log(
-          `[db-setup] Admin account "${adminUsername}" already exists — top_admin role re-asserted (password untouched).`
+          `[db-setup] Admin account "${adminUsername}" already exists, top_admin role re-asserted (password untouched).`
         );
         return;
       }
 
       if (adminPassword.length < 6) {
         console.warn(
-          "[db-setup] ADMIN_PASSWORD is shorter than 6 characters — admin account NOT created. Set a stronger one and restart."
+          "[db-setup] ADMIN_PASSWORD is shorter than 6 characters, admin account NOT created. Set a stronger one and restart."
         );
         return;
       }
@@ -281,7 +281,7 @@ function bootstrapAdminFromEnv(): void {
 export async function ensureDatabase(): Promise<void> {
   console.log("─".repeat(58));
   console.log("[db-setup] Automatic database setup started (v1.3.1)");
-  console.log("[db-setup] Step 1/4 — syncing database schema…");
+  console.log("[db-setup] Step 1/4, syncing database schema…");
 
   const pushed = await runWithRetries(
     "npx prisma db push --skip-generate",
@@ -299,12 +299,12 @@ export async function ensureDatabase(): Promise<void> {
     return;
   }
 
-  console.log("[db-setup] Step 2/4 — checking whether seeding is needed…");
+  console.log("[db-setup] Step 2/4, checking whether seeding is needed…");
   try {
     const users = await prisma.user.count();
     if (users === 0) {
       console.log(
-        "[db-setup] Empty database detected — seeding the official shop items…"
+        "[db-setup] Empty database detected, seeding the official shop items…"
       );
       const seeded = await runWithRetries("npx tsx prisma/seed.ts", "seed");
       if (seeded) {
@@ -312,7 +312,7 @@ export async function ensureDatabase(): Promise<void> {
       }
     } else {
       console.log(
-        `[db-setup] Database ready — ${users} user account(s) found, seed skipped.`
+        `[db-setup] Database ready, ${users} user account(s) found, seed skipped.`
       );
     }
   } catch (err: any) {
@@ -326,8 +326,8 @@ export async function ensureDatabase(): Promise<void> {
 
   // v1.8.1: ALWAYS re-sync the official catalog (idempotent upserts).
   // This is what pushes catalog edits (names/descriptions/prices/colors)
-  // to an EXISTING database — a redeploy is all it takes.
-  console.log("[db-setup] Step 3/4 — re-syncing the official shop items…");
+  // to an EXISTING database, a redeploy is all it takes.
+  console.log("[db-setup] Step 3/4, re-syncing the official shop items…");
   try {
     await syncOfficialItems();
   } catch (err: any) {
@@ -337,7 +337,7 @@ export async function ensureDatabase(): Promise<void> {
 
   // v2.0: decrypt any v1.x encrypted world rows back into plain JSON
   // storage (idempotent; nothing to do once every row is plain).
-  console.log("[db-setup] Step 4/4 — migrating encrypted worlds to plain storage…");
+  console.log("[db-setup] Step 4/4, migrating encrypted worlds to plain storage…");
   try {
     await migrateGamesToPlain();
   } catch (err: any) {

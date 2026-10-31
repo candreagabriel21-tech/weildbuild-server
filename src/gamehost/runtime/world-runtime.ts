@@ -1,5 +1,5 @@
 // ═══════════════════════════════════════════════════════════════════
-// WeildBuild — world runtime (v1.3 — ROBLOX-STYLE PLAYERS)
+// WeildBuild, world runtime (v1.3, ROBLOX-STYLE PLAYERS)
 // ═══════════════════════════════════════════════════════════════════
 // Runs INSIDE A WORKER THREAD, one per game instance, on the gamehost.
 //
@@ -437,7 +437,7 @@ async function main(): Promise<void> {
     p.pendingTp = { ...target }; // the owner teleports; others snap
     // v6.2.8 DOUBLE-DEATH FIX: move the SERVER's record of the player to
     // the spawn point too (pendingTp alone only fixes the BROADCAST). The
-    // old code left p.x/p.y/p.z at the death spot — for a VOID death that
+    // old code left p.x/p.y/p.z at the death spot, for a VOID death that
     // is still below voidY, so the void check in the very same stepSim
     // frame re-killed the just-respawned player: they exploded a SECOND
     // time at the spawn point and waited through another full death
@@ -816,7 +816,7 @@ async function main(): Promise<void> {
         if (p.dyingTimer <= 0) respawn(p);
       }
       // Void death: the authority still owns "fell off the world".
-      // v6.2.8: only for LIVING players (hp > 0) — a just-respawned
+      // v6.2.8: only for LIVING players (hp > 0), a just-respawned
       // player (dyingTimer just hit 0, hp restored) must never be
       // re-killed by a stale below-voidY record.
       // v6.4: the respawn grace window covers this check too (a stale
@@ -915,11 +915,54 @@ async function main(): Promise<void> {
         pb.anchored = obj.anchored;
         if (!obj.anchored) pb.isAwake = true;
       }
+      // v7.1 FIX: canCollide flipped by a rule (modify_property). Push the
+      // change into the CANNON body (filters + body creation/removal) so
+      // the part actually starts/stops colliding. Without this, a part
+      // made non-collidable mid-game kept colliding, and a part made
+      // collidable mid-game (that started non-collidable) had no cannon
+      // body to collide with.
+      if (pb.canCollide !== obj.canCollide) {
+        try { world.refreshBodyCanCollide(obj); } catch { /* never kill the sim */ }
+        // refreshBodyCanCollide may have re-created the body entry.
+        const refreshed = world.bodies.get(id);
+        if (!refreshed) { activeIds.delete(id); continue; }
+        // Continue using the refreshed body for the rest of this iteration.
+        // (We can't reassign pb in a for-of, but the only field read below
+        //  is pb.isGrounded which is updated by world.step on the next tick.)
+      }
 
       // when_touched('parts') - landing frame only.
       const wasGrounded = (pb as any)._wasGrounded;
       if (pb.isGrounded && !wasGrounded) {
+        // v7.1: pass the touching part's name so the new partNames filter
+        // works. The rule on `id` (the moving part) fires with no
+        // actorName, since the thing it landed on is unknown (could be
+        // terrain, the baseplate, or another part). Rules with a
+        // partNames filter won't match this call.
         try { weildCodeEngine.handleTouch(id, 'parts'); } catch { /* never kill the sim */ }
+
+        // v7.1 NEW: also fire when_touched on the part `id` landed on (if
+        // it's another part). This is the correct "something touched me"
+        // semantics per the rule description. The touching part's name is
+        // passed as actorName so the partNames filter works.
+        const idHalfH = pb.size.y / 2;
+        const idBottom = pb.position.y - idHalfH;
+        const idObj = objects.get(id);
+        const touchingName = idObj && isPart(idObj) ? idObj.name : undefined;
+        world.bodies.forEach((other) => {
+          if (other.id === id) return;
+          if (!other.canCollide) return;
+          // XZ overlap check
+          const dx = Math.abs(other.position.x - pb.position.x);
+          const dz = Math.abs(other.position.z - pb.position.z);
+          if (dx > (other.size.x + pb.size.x) / 2 + 0.05) return;
+          if (dz > (other.size.z + pb.size.z) / 2 + 0.05) return;
+          // `other` is directly below `id` (its top is at id's bottom)
+          const otherTop = other.position.y + other.size.y / 2;
+          if (Math.abs(otherTop - idBottom) > 0.25) return;
+          // Found the part `id` landed on. Fire the rule on it.
+          try { weildCodeEngine.handleTouch(other.id, 'parts', undefined, touchingName); } catch { /* never kill the sim */ }
+        });
       }
       (pb as any)._wasGrounded = pb.isGrounded;
     }

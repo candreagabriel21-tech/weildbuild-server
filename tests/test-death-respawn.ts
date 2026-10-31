@@ -1,14 +1,14 @@
 // ═══════════════════════════════════════════════════════════════════
-// WeildBuild — v6.2.1 death/respawn + per-player rule effects test
+// WeildBuild, v6.2.1 death/respawn + per-player rule effects test
 // ═══════════════════════════════════════════════════════════════════
 // Regression test for the two reported game-breaking bugs:
 //
-//   1. "When a player dies, everyone dies" — kill_player used to write
+//   1. "When a player dies, everyone dies", kill_player used to write
 //      the single shared playState.characterHealth, which the worker
 //      mirrored onto EVERY player. Now the engine queues a per-player
 //      effect naming the TOUCHING player, and only that player dies.
 //
-//   2. "They never respawn properly" — rule-driven deaths never set the
+//   2. "They never respawn properly", rule-driven deaths never set the
 //      server's dyingTimer, so respawn() never ran (hp stayed 0 forever,
 //      other players never even saw the death). Now killPlayer() starts
 //      the death cycle and the authority respawns the player at spawn

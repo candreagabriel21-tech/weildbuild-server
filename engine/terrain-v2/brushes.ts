@@ -10,7 +10,7 @@ export interface BrushSettings {
   type: BrushType;
   /** Brush radius in world units */
   size: number;
-  /** Brush strength 0–1 (controls how much each stroke changes the terrain) */
+  /** Brush strength 0-1 (controls how much each stroke changes the terrain) */
   strength: number;
   /** Target height for 'flatten' brush */
   targetHeight?: number;

@@ -1,5 +1,5 @@
 // ═══════════════════════════════════════════════════════════
-// WeildBuild Main — /admin routes (faithful port of the Next.js
+// WeildBuild Main, /admin routes (faithful port of the Next.js
 // admin backup + admin cleanup API routes). Backups now dump the
 // full Prisma database and upload to Backblaze B2 (was Dropbox).
 // ═══════════════════════════════════════════════════════════
@@ -22,7 +22,7 @@ export const adminRouter = Router();
 // After a warn/ban lands in the database, tell the Realtime server so the
 // player's OPEN app gets the pop-up immediately (no polling delay). Fire
 // and forget: a Realtime hiccup must never fail the moderation action
-// itself — the notification inbox + session kick still happened.
+// itself, the notification inbox + session kick still happened.
 function pushModerationToRealtime(payload: {
   action: "warn" | "ban" | "unban";
   username: string;
@@ -30,7 +30,7 @@ function pushModerationToRealtime(payload: {
   reason?: string;
   from?: string;
 }): void {
-  if (!config.internalToken) return; // push disabled — client falls back to login-time detection
+  if (!config.internalToken) return; // push disabled, client falls back to login-time detection
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 4000);
   fetch(`${config.realtimeUrl}/internal/moderation`, {
@@ -42,7 +42,7 @@ function pushModerationToRealtime(payload: {
     .then(async (res) => {
       if (!res.ok) console.warn(`[moderate] realtime push rejected (HTTP ${res.status})`);
     })
-    .catch(() => { /* realtime asleep/unreachable — non-fatal by design */ })
+    .catch(() => { /* realtime asleep/unreachable, non-fatal by design */ })
     .finally(() => clearTimeout(timer));
 }
 
@@ -58,7 +58,7 @@ function pushAnnouncementToRealtime(payload: {
   from: string;
   category?: string;
 }): void {
-  if (!config.internalToken) return; // push disabled — the heartbeat delivers within 20s
+  if (!config.internalToken) return; // push disabled, the heartbeat delivers within 20s
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 4000);
   fetch(`${config.realtimeUrl}/internal/announcement`, {
@@ -70,7 +70,7 @@ function pushAnnouncementToRealtime(payload: {
     .then(async (res) => {
       if (!res.ok) console.warn(`[announce] realtime push rejected (HTTP ${res.status})`);
     })
-    .catch(() => { /* realtime asleep/unreachable — non-fatal by design */ })
+    .catch(() => { /* realtime asleep/unreachable, non-fatal by design */ })
     .finally(() => clearTimeout(timer));
 }
 
@@ -94,7 +94,7 @@ const BACKUP_DUMPERS: Record<string, () => Promise<any[]>> = {
   reports: () => prisma.report.findMany(),
 };
 
-// GET /admin/backup — returns backup status/info (no side effects)
+// GET /admin/backup, returns backup status/info (no side effects)
 adminRouter.get("/backup", safeHandler(async (req, res) => {
   // Verify admin
   const admin = await requireAdmin(req, res);
@@ -104,11 +104,11 @@ adminRouter.get("/backup", safeHandler(async (req, res) => {
     message: "Use POST to trigger a backup. Backups are uploaded to Backblaze B2.",
     b2Configured: !!(config.b2.keyId && config.b2.applicationKey),
     tablesBackedUp: Object.keys(BACKUP_DUMPERS),
-    note: "Backups include password hashes — keep your B2 keys secret!",
+    note: "Backups include password hashes, keep your B2 keys secret!",
   });
 }));
 
-// POST /admin/backup — dump ALL tables and upload the JSON to B2
+// POST /admin/backup, dump ALL tables and upload the JSON to B2
 adminRouter.post("/backup", safeHandler(async (req, res) => {
   // Verify admin
   const admin = await requireAdmin(req, res);
@@ -122,7 +122,7 @@ adminRouter.post("/backup", safeHandler(async (req, res) => {
 
     console.log(`[backup] Starting backup at ${timestamp}`);
 
-    // Step 1: Dump all tables (a failed table becomes an empty list —
+    // Step 1: Dump all tables (a failed table becomes an empty list.
     // the backup still continues, exactly like the original)
     const tables: Record<string, { rowCount: number; bytes: number }> = {};
     const data: Record<string, any[]> = {};
@@ -185,13 +185,13 @@ adminRouter.post("/backup", safeHandler(async (req, res) => {
   }
 }));
 
-// GET /admin/cleanup — returns a preview of the retention policy (dry run)
+// GET /admin/cleanup, returns a preview of the retention policy (dry run)
 adminRouter.get("/cleanup", safeHandler(async (req, res) => {
   // Verify admin
   const admin = await requireAdmin(req, res);
   if (!admin) return;
 
-  // Dry run — just return the current cleanup status
+  // Dry run, just return the current cleanup status
   return res.json({
     message: "Use POST to run cleanup. This endpoint deletes old data from the database.",
     retentionPolicy: {
@@ -207,7 +207,7 @@ adminRouter.get("/cleanup", safeHandler(async (req, res) => {
   });
 }));
 
-// POST /admin/cleanup — actually runs the cleanup
+// POST /admin/cleanup, actually runs the cleanup
 adminRouter.post("/cleanup", safeHandler(async (req, res) => {
   // Verify admin
   const admin = await requireAdmin(req, res);
@@ -231,11 +231,11 @@ adminRouter.post("/cleanup", safeHandler(async (req, res) => {
 }));
 
 // ═══════════════════════════════════════════════════════════
-// v1.3 — WB Admin CTRL support: settings + one-click overview
+// v1.3, WB Admin CTRL support: settings + one-click overview
 // ═══════════════════════════════════════════════════════════
 
 
-// GET /admin/settings — the effective version gate + download links
+// GET /admin/settings, the effective version gate + download links
 // (DB overrides merged over env defaults, with a per-field source map)
 adminRouter.get("/settings", safeHandler(async (req, res) => {
   const admin = await requireAdmin(req, res);
@@ -256,7 +256,7 @@ const settingsUpdateSchema = z.object({
   maintenanceMode: z.boolean().optional(),
 });
 
-// PUT /admin/settings — update the version gate / download links.
+// PUT /admin/settings, update the version gate / download links.
 // Empty string on a field = "clear the override" (falls back to env).
 adminRouter.put("/settings", safeHandler(async (req, res) => {
   if (!originOk(req, res)) return;
@@ -290,7 +290,7 @@ adminRouter.put("/settings", safeHandler(async (req, res) => {
   }
 }));
 
-// GET /admin/overview — ONE call with everything WB Admin CTRL shows:
+// GET /admin/overview, ONE call with everything WB Admin CTRL shows:
 // counts, version gate, game hosts, live instances + player names,
 // recent DMs and open reports.
 adminRouter.get("/overview", safeHandler(async (req, res) => {
@@ -353,7 +353,7 @@ adminRouter.get("/overview", safeHandler(async (req, res) => {
 }));
 
 // ─────────────── v1.4: Player moderation ───────────────
-// GET /admin/users?search= — player list for the Admin tab (v13.9 client).
+// GET /admin/users?search=, player list for the Admin tab (v13.9 client).
 // Returns the exact AdminUserRow shape the client renders: username,
 // admin_role, banned, warnings, created, last_login. 50 most recent by
 // default; case-insensitive substring search when ?search= is given.
@@ -391,7 +391,7 @@ const moderateSchema = z.object({
   reason: z.string().max(200).optional(),  // ban: required reason
 });
 
-// POST /admin/moderate — warn / ban / unban / DELETE a player (v13.9 client Admin tab).
+// POST /admin/moderate, warn / ban / unban / DELETE a player (v13.9 client Admin tab).
 //   warn:   warnings counter +1 and a "warning" notification lands in the
 //           player's inbox (custom message or a default).
 //   ban:    sets banned {is_banned, reason}, notifies, and deletes ALL the
@@ -453,7 +453,7 @@ adminRouter.post("/moderate", safeHandler(async (req, res) => {
       `Your account has been banned by ${admin}. Reason: ${reason.trim()}`,
       admin,
     );
-    // Kick every active session — a banned player is logged out mid-game.
+    // Kick every active session, a banned player is logged out mid-game.
     await deleteUserSessions(username);
     // v1.4.7: deliver the ban pop-up to any OPEN app instantly, then the
     // Realtime server force-disconnects their sockets.
@@ -597,7 +597,7 @@ adminRouter.post("/delete-user", safeHandler(async (req, res) => {
 }));
 
 // ═══════════════════════════════════════════════════════════
-// v1.9.0 — Announcements ("WeildBuild Updates")
+// v1.9.0, Announcements ("WeildBuild Updates")
 // ═══════════════════════════════════════════════════════════
 // TOP ADMIN ONLY. Writes a "letter" to one, several or ALL players:
 //   • every recipient gets an "announcement" notification in their inbox
@@ -605,7 +605,7 @@ adminRouter.post("/delete-user", safeHandler(async (req, res) => {
 //   • online players ALSO get the small toast + letter instantly via the
 //     Realtime push (offline players simply find the letter in the inbox)
 //   • recipients may turn the pop-up off per-category in Settings
-//     (WeildBuild Updates toggle) — the inbox copy always lands
+//     (WeildBuild Updates toggle), the inbox copy always lands
 const announceSchema = z.object({
   title: z.string().max(100).optional(),
   message: z.string().min(1).max(2000),

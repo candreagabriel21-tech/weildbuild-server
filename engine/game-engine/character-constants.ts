@@ -1,5 +1,5 @@
 // ═══════════════════════════════════════════════════════════════════
-// WeildBuild — character movement constants (v1.1, SHARED)
+// WeildBuild, character movement constants (v1.1, SHARED)
 // ═══════════════════════════════════════════════════════════════════
 // Single source of truth for the character FEEL. Imported by BOTH:
 //   • the client play viewport (local prediction - singleplayer AND the

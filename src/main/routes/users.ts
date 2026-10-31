@@ -1,5 +1,5 @@
 // ═══════════════════════════════════════════════════════════
-// WeildBuild Main — /users routes (faithful port of the Next.js
+// WeildBuild Main, /users routes (faithful port of the Next.js
 // users API route: public search / Object-Key lookup / public
 // profiles, plus an authenticated paginated user listing)
 // ═══════════════════════════════════════════════════════════
@@ -28,13 +28,13 @@ function qp(req: Request, name: string): string | null {
   return typeof v === "string" && v.length > 0 ? v : null;
 }
 
-// GET /users — ?search= | ?key=USER-XXXX | ?username= | paginated listing (auth)
+// GET /users, ?search= | ?key=USER-XXXX | ?username= | paginated listing (auth)
 usersRouter.get("/", safeHandler(async (req, res) => {
   const username = qp(req, "username");
   const userKey = qp(req, "key");
   const searchQuery = qp(req, "search");
 
-  // Search users — public endpoint, rate limited
+  // Search users, public endpoint, rate limited
   if (searchQuery) {
     const rl = await requireRateLimit("general_api", clientIp(req));
     if (rl) return res.status(429).json({ error: rl.error, retryAfter: rl.retryAfter });
@@ -53,7 +53,7 @@ usersRouter.get("/", safeHandler(async (req, res) => {
     return res.json(stripSensitiveFields(user));
   }
 
-  // Get specific user — public profile, rate limited
+  // Get specific user, public profile, rate limited
   if (username) {
     const rl = await requireRateLimit("general_api", clientIp(req));
     if (rl) return res.status(429).json({ error: rl.error, retryAfter: rl.retryAfter });
@@ -63,7 +63,7 @@ usersRouter.get("/", safeHandler(async (req, res) => {
     return res.json(stripSensitiveFields(user));
   }
 
-  // List all users — REQUIRE authentication + pagination
+  // List all users, REQUIRE authentication + pagination
   // No more dumping the entire user database to anyone who asks
   const authResult = await requireAuth(req, res);
   if (!authResult) return;
@@ -84,7 +84,7 @@ usersRouter.get("/", safeHandler(async (req, res) => {
   });
 }));
 
-// PUT /users — update own profile (or admin). Identity via session.
+// PUT /users, update own profile (or admin). Identity via session.
 usersRouter.put("/", safeHandler(async (req, res) => {
   // Validate origin
   if (!originOk(req, res)) return;
@@ -120,7 +120,7 @@ usersRouter.put("/", safeHandler(async (req, res) => {
   const requester = await getUser(authResult);
   const isAdmin = requester?.admin_role === "admin" || requester?.admin_role === "top_admin";
 
-  // Filter updates — only allow specific fields
+  // Filter updates, only allow specific fields
   const filteredUpdates = filterUserUpdates(body, isAdmin);
 
   const updated = { ...user, ...filteredUpdates };

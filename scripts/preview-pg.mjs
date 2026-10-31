@@ -1,9 +1,9 @@
 // ═══════════════════════════════════════════════════════════
-// WeildBuild — sandbox web-preview Postgres (persistent)
+// WeildBuild, sandbox web-preview Postgres (persistent)
 // ═══════════════════════════════════════════════════════════
 // Boots embedded-postgres on :5433 with a PERSISTENT data dir, so
 // accounts/games created in the web preview survive restarts.
-// (scripts/start-pg.mjs — the smoke-test twin — wipes its dir on
+// (scripts/start-pg.mjs, the smoke-test twin, wipes its dir on
 // every boot; this one is the opposite of that.)
 //
 // Must live inside server/ so `import "embedded-postgres"` resolves
@@ -28,7 +28,7 @@ if (!existsSync(join(DB_DIR, "PG_VERSION"))) {
   console.log(`[preview-pg] initialising new cluster at ${DB_DIR}…`);
   await pg.initialise();
 } else {
-  console.log(`[preview-pg] existing cluster found at ${DB_DIR} — skipping init`);
+  console.log(`[preview-pg] existing cluster found at ${DB_DIR}, skipping init`);
 }
 
 await pg.start();
