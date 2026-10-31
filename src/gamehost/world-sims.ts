@@ -137,6 +137,10 @@ export class WorldSimManager {
   private sims = new Map<string, SimEntry>();
   private sweeper: NodeJS.Timeout;
   private snapshotListeners: Array<(instanceId: string, snap: WorldSnapshot) => void> = [];
+  // v7: targeted screen messages (print_message with a target selector) -
+  // the worker names the recipients by USERNAME; the socket layer maps
+  // them to sockets and emits game:message to those ONLY.
+  private playerMessageListeners: Array<(instanceId: string, messages: Array<{ message: any; username: string }>) => void> = [];
   // v6.2.7: pending getWorldState replies (reqId -> { instance, resolver }).
   private worldStateWaiters = new Map<number, { instanceId: string; resolve: (state: any) => void }>();
   private worldStateReqCounter = 0;
@@ -154,6 +158,11 @@ export class WorldSimManager {
 
   onSnapshot(cb: (instanceId: string, snap: WorldSnapshot) => void): void {
     this.snapshotListeners.push(cb);
+  }
+
+  /** v7: subscribe to targeted player messages from the sim workers. */
+  onPlayerMessage(cb: (instanceId: string, messages: Array<{ message: any; username: string }>) => void): void {
+    this.playerMessageListeners.push(cb);
   }
 
   /** True when the instance has a live (or booting) simulation. */
@@ -257,6 +266,13 @@ export class WorldSimManager {
       if (!m || typeof m !== "object") return;
       if (m.t === "snapshot") {
         for (const cb of this.snapshotListeners) cb(instance.id, m as WorldSnapshot);
+      } else if (m.t === "pmsg") {
+        // v7: targeted screen messages - hand them to the socket layer,
+        // which emits game:message to the named players' sockets only.
+        const messages = Array.isArray(m.messages) ? m.messages : [];
+        if (messages.length > 0) {
+          for (const cb of this.playerMessageListeners) cb(instance.id, messages);
+        }
       } else if (m.t === "worldState") {
         // v6.2.7: a getWorldState reply - hand it to the waiting joiner.
         const waiter = this.worldStateWaiters.get(m.reqId);

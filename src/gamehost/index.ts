@@ -38,6 +38,24 @@ worldSims.onSnapshot((instanceId, snap) => {
   // messages). Clients reconcile their local prediction against this.
   io.to(`instance:${instanceId}`).emit("game:state", snap);
 });
+// v7: TARGETED screen messages (print_message with a target selector).
+// The worker names recipients by username; map them to the live sockets in
+// that instance and emit game:message to those players ONLY - "if a player
+// says the magic word, only they get the hint".
+worldSims.onPlayerMessage((instanceId, messages) => {
+  const instance = manager.getInstance(instanceId);
+  if (!instance) return;
+  for (const entry of messages) {
+    const payload = entry && entry.message;
+    const username = String(entry?.username || "").toLowerCase();
+    if (!payload || !username) continue;
+    for (const [socketId, player] of instance.players) {
+      if (String(player.username || "").toLowerCase() === username) {
+        io.to(socketId).emit("game:message", payload);
+      }
+    }
+  }
+});
 const startedAt = Date.now();
 const MAIN = config.host.mainServerUrl;
 const INTERNAL_HEADERS = {

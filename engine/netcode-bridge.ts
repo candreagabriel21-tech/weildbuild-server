@@ -62,6 +62,9 @@ export interface SelfCorrection {
   z: number;
   /** Authoritative health (server-owned in multiplayer). */
   hp: number;
+  /** v7: the rule-set walk speed (studs/s). The owner applies it to its
+   * local sim as a PARAMETER (never a position correction). */
+  spd?: number;
   /** True during the server-side death animation. */
   dying: boolean;
   /** A forced position (spawn slot / respawn / teleport rule): teleport
@@ -272,7 +275,7 @@ export function drainFx(): Array<{ name: string; volume: number }> {
 
 /** Called by GamePlayer on every server snapshot. */
 export function pushSnapshot(data: {
-  self?: { socketId: string; x?: number; y?: number; z?: number; yaw: number; hp: number; dying: boolean; seq: number; tp?: number[] | { x: number; y: number; z: number } };
+  self?: { socketId: string; x?: number; y?: number; z?: number; yaw: number; hp: number; dying: boolean; seq: number; tp?: number[] | { x: number; y: number; z: number }; spd?: number };
   parts?: PartCorrection[];
   fx?: Array<{ name: string; volume: number }>;
 }): void {
@@ -294,6 +297,7 @@ export function pushSnapshot(data: {
       y: typeof s.y === 'number' ? s.y : 0,
       z: typeof s.z === 'number' ? s.z : 0,
       hp: s.hp,
+      spd: typeof s.spd === 'number' ? s.spd : undefined,
       dying: s.dying,
       tp,
       receivedAt: lastSnapshotAt,

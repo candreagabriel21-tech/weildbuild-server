@@ -46,7 +46,7 @@ export const SERVER_SNAPSHOT_HZ = 30;
  * client simulates its own character (full singleplayer feel) and the
  * server relays the reports to everyone else, who interpolate between
  * them - the denser stream makes remote players look smoother too. */
-export const PLAYER_REPORT_HZ = 20;
+export const PLAYER_REPORT_HZ = 40;
 /** Idle keepalive (Hz): while the player has NOT moved, a report is
  * still sent at this rate so the server keeps seeing a live client
  * (presence, light checks, interpolation gap timeouts). */

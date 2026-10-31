@@ -309,6 +309,13 @@ export interface PlayState {
   // can't touch the controller directly (it lives inside PlayCharacter), so
   // they write to this field and PlayCharacter picks it up.
   teleportPosition: Vector3 | null;
+  // ─── v7: rule-driven player state ───
+  /** Walk speed in studs/second. 0 = the default CHAR_WALK_SPEED. */
+  characterSpeed: number;
+  /** A custom respawn position set by set_spawn_point rules (null = world spawn). */
+  spawnPointOverride: Vector3 | null;
+  /** Bumped by respawn_player rules; the play viewports teleport + heal when it changes. */
+  pendingRespawn: number;
 }
 
 // ─── Simulation State (inline physics, no character) ───
@@ -930,6 +937,9 @@ export const useStudioStore = create<StudioStore>((set, get) => ({
     characterHealth: 100,
     characterMaxHealth: 100,
     teleportPosition: null,
+    characterSpeed: 0,
+    spawnPointOverride: null,
+    pendingRespawn: 0,
   },
   simulationState: {
     isSimulating: false,
@@ -2709,6 +2719,9 @@ export const useStudioStore = create<StudioStore>((set, get) => ({
         characterHealth: 100,
         characterMaxHealth: 100,
         teleportPosition: null,
+        characterSpeed: 0,
+        spawnPointOverride: null,
+        pendingRespawn: 0,
       },
       simulationState: {
         isSimulating: false,
@@ -2898,6 +2911,9 @@ export const useStudioStore = create<StudioStore>((set, get) => ({
         characterHealth: 100,
         characterMaxHealth: 100,
         teleportPosition: null,
+        characterSpeed: 0,
+        spawnPointOverride: null,
+        pendingRespawn: 0,
       },
     });
   },
@@ -2922,6 +2938,9 @@ export const useStudioStore = create<StudioStore>((set, get) => ({
         characterHealth: 100,
         characterMaxHealth: 100,
         teleportPosition: null,
+        characterSpeed: 0,
+        spawnPointOverride: null,
+        pendingRespawn: 0,
       },
     });
 
@@ -2954,6 +2973,9 @@ export const useStudioStore = create<StudioStore>((set, get) => ({
         characterHealth: 100,
         characterMaxHealth: 100,
         teleportPosition: null,
+        characterSpeed: 0,
+        spawnPointOverride: null,
+        pendingRespawn: 0,
       },
     });
   },

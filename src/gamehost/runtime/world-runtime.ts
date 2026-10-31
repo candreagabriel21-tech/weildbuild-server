@@ -113,6 +113,15 @@ interface RuntimePlayer {
   strikes: number;
   /** Part ids currently touched (when_touched re-arm). */
   touched: Set<string>;
+  // ─── v7: rule-driven per-player state ───
+  /** Walk speed set by set_player_speed rules (studs/s; CHAR_WALK_SPEED
+   * until a rule changes it). Relayed to the owner via the snapshot's
+   * `spd` field - the owner's local sim is the authority for movement,
+   * so IT has to know the new speed. */
+  speed: number;
+  /** Custom respawn position from set_spawn_point rules (undefined = the
+   * world spawn). Used by respawn() and the respawn_player effect. */
+  spawn?: { x: number; y: number; z: number };
 }
 
 const SIM_HZ = 30;
@@ -129,10 +138,11 @@ const SNAPSHOT_HZ = 30;
 // instead of 0.45s of dead air.
 const DEATH_ANIMATION_SECONDS = 1.35;
 // ─── v6.2.6: Roblox-style report cadence + light checks ───
-/** v1.3: the client's report rate (documentation only - the server applies
- * reports as they arrive). Clients now report on movement (capped at
- * 20 Hz = one per 0.05 s) with a 2 Hz keepalive while idle. */
-const PLAYER_REPORT_HZ = 20;
+/** v7 (user request: "the client sends its data every 0.025 seconds"): the
+ * client's report rate (documentation only - the server applies reports
+ * as they arrive). Clients now report on movement (capped at 40 Hz = one
+ * per 0.025 s) with a 2 Hz keepalive while idle. */
+const PLAYER_REPORT_HZ = 40;
 /** Light check: one report may not move the player more than this many
  * studs from the last accepted position (user: "moving 500 studs in a
  * frame"). Generous by design - it catches blatant teleports, nothing
@@ -332,7 +342,9 @@ async function main(): Promise<void> {
       respawnGraceUntil: 0,
       strikes: 0,
       touched: new Set(),
+      speed: 0, // 0 = the client default (CHAR_WALK_SPEED)
     });
+    pushStats(players.get(socketId)!);
     // v6.3.0 PLAYER COLLISIONS: a kinematic cannon Body per player. The
     // owning client still drives its character's transform (the 0.25 s
     // report sets p.x/y/z); we mirror that into a kinematic body so the
@@ -418,9 +430,11 @@ async function main(): Promise<void> {
   }
 
   function respawn(p: RuntimePlayer): void {
+    // v7: a set_spawn_point rule may have moved THIS player's spawn.
+    const target = p.spawn ?? spawnFeet;
     p.hp = useStudioStore.getState().playState.characterMaxHealth || 100;
     p.dyingTimer = 0;
-    p.pendingTp = { ...spawnFeet }; // the owner teleports; others snap
+    p.pendingTp = { ...target }; // the owner teleports; others snap
     // v6.2.8 DOUBLE-DEATH FIX: move the SERVER's record of the player to
     // the spawn point too (pendingTp alone only fixes the BROADCAST). The
     // old code left p.x/p.y/p.z at the death spot — for a VOID death that
@@ -428,9 +442,9 @@ async function main(): Promise<void> {
     // frame re-killed the just-respawned player: they exploded a SECOND
     // time at the spawn point and waited through another full death
     // animation ("you die again when you respawn" + the delayed respawn).
-    p.x = spawnFeet.x;
-    p.y = spawnFeet.y;
-    p.z = spawnFeet.z;
+    p.x = target.x;
+    p.y = target.y;
+    p.z = target.z;
     p.walking = false;
     p.jumping = false;
     p.sprint = false;
@@ -442,7 +456,8 @@ async function main(): Promise<void> {
     // point with zeroed velocity. A respawn is a teleport - we don't
     // want the body-sync pass to read (deathSpot -> spawn) as a huge
     // velocity and slingshot every part around the spawn across the map.
-    try { world.teleportNamedCharacterBody(p.socketId, spawnFeet); } catch { /* body gone */ }
+    try { world.teleportNamedCharacterBody(p.socketId, target); } catch { /* body gone */ }
+    pushStats(p);
   }
 
   // ─── v6.2.1: per-player rule effects ───
@@ -451,6 +466,19 @@ async function main(): Promise<void> {
   // shared playState (which used to make "one player steps on lava" kill
   // EVERYONE). Effects without an actor (timer/global rules) keep the
   // classic applies-to-everyone semantics.
+  // ─── v7: per-player stats for the rules engine ───
+  // IF conditions ("player health < 30") and $(health)/$(speed) text read
+  // PER-PLAYER numbers; the authority keeps them fresh here.
+  function pushStats(p: RuntimePlayer): void {
+    try {
+      weildCodeEngine.setPlayerStats(p.username, {
+        health: p.hp,
+        maxHealth: useStudioStore.getState().playState.characterMaxHealth || 100,
+        speed: p.speed || 10.8,
+      });
+    } catch { /* never kill the sim */ }
+  }
+
   function killPlayer(p: RuntimePlayer): void {
     if (p.dyingTimer <= 0 && p.hp > 0) {
       p.hp = 0;
@@ -458,6 +486,9 @@ async function main(): Promise<void> {
       // The dead touch nothing: clearing the set re-arms when_touched for
       // the respawned body (standing on the same lava kills you AGAIN).
       p.touched.clear();
+      // v7: fire the on_player_died game rules (once per death).
+      pushStats(p);
+      try { weildCodeEngine.handlePlayerDied(p.username); } catch { /* never kill the sim */ }
     }
   }
 
@@ -466,20 +497,33 @@ async function main(): Promise<void> {
     p.dyingTimer = 0; // a heal cancels an in-progress death
   }
 
+  // ─── v7: TARGETED screen messages (print_message with a target) ───
+  // Drained as { t: 'pmsg' } to the host, which emits game:message to the
+  // named players' sockets ONLY (broadcast messages ride the snapshot).
+  const targetedMessages: Array<{ message: any; username: string }> = [];
+
   function applyPlayerEffects(): void {
     const effects = weildCodeEngine.drainPlayerEffects();
     for (const e of effects) {
-      const targets = e.username ? players : null;
-      if (targets) {
-        // Named actor: only that player.
-        for (const p of targets.values()) {
-          if (p.username !== e.username) continue;
-          applyEffectToPlayer(p, e);
+      // v7: target selectors. 'this' (or a legacy actor username) = that
+      // player, 'all' = everyone, 'username' = the named player.
+      const targets: RuntimePlayer[] = [];
+      if (e.target === 'all') {
+        targets.push(...players.values());
+      } else if (e.target === 'username' && e.targetName) {
+        const wanted = e.targetName.toLowerCase();
+        for (const p of players.values()) {
+          if (p.username.toLowerCase() === wanted) targets.push(p);
+        }
+      } else if (e.username) {
+        for (const p of players.values()) {
+          if (p.username === e.username) targets.push(p);
         }
       } else {
         // Global rule (timer etc.): everyone - the classic semantics.
-        for (const p of players.values()) applyEffectToPlayer(p, e);
+        targets.push(...players.values());
       }
+      for (const p of targets) applyEffectToPlayer(p, e);
     }
   }
 
@@ -492,13 +536,51 @@ async function main(): Promise<void> {
       case 'heal':
         healPlayer(p);
         break;
-      case 'damage':
+      case 'damage': {
+        const before = p.hp;
         p.hp = Math.max(0, Math.min(maxHp, p.hp + (e.value ?? 0)));
+        // v7: the damage event fires on any real loss (rules can react:
+        // "when a player takes damage, ...").
+        if (p.hp < before) {
+          pushStats(p);
+          try { weildCodeEngine.handlePlayerDamaged(p.username, p.hp - before, p.hp); } catch { /* never kill the sim */ }
+        }
         if (p.hp <= 0) killPlayer(p);
         break;
-      case 'set_health':
+      }
+      case 'set_health': {
+        const before = p.hp;
         p.hp = Math.max(0, Math.min(maxHp, e.value ?? 0));
+        if (p.hp < before) {
+          pushStats(p);
+          try { weildCodeEngine.handlePlayerDamaged(p.username, p.hp - before, p.hp); } catch { /* never kill the sim */ }
+        }
         if (p.hp <= 0) killPlayer(p);
+        break;
+      }
+      // ─── v7: new rule-driven effects ───
+      case 'set_speed': {
+        // The OWNER simulates movement, so the new speed is relayed via
+        // the snapshot's spd field (the client applies it to its local
+        // sim - never a correction, just a new parameter).
+        const base = p.speed || 10.8;
+        p.speed = Math.max(0, e.relative === true ? base + (e.value ?? 0) : (e.value ?? 10.8));
+        pushStats(p);
+        break;
+      }
+      case 'set_spawn':
+        if (e.spawn) p.spawn = e.spawn;
+        break;
+      case 'respawn':
+        // respawn() restores full health + teleports to (custom) spawn.
+        respawn(p);
+        break;
+      case 'message':
+        // Targeted screen message: delivered ONLY to the matching
+        // players' clients (game:message), never broadcast.
+        if (e.message) {
+          targetedMessages.push({ message: e.message, username: p.username });
+        }
         break;
       case 'teleport':
         if (e.position) {
@@ -571,7 +653,7 @@ async function main(): Promise<void> {
   // Players are only broadcast when they CHANGE (plus a periodic keyframe
   // of everyone). Parts only when they change AND are near a player.
   const lastPlayerBroadcast = new Map<string, {
-    x: number; y: number; z: number; yaw: number; hp: number;
+    x: number; y: number; z: number; yaw: number; hp: number; spd: number;
     walking: boolean; jumping: boolean; dying: boolean; sprint: boolean;
   }>();
   let simClock = 0;                 // simulated seconds (frozen while idle)
@@ -747,6 +829,10 @@ async function main(): Promise<void> {
         && p.y + playerHeight / 2 < world.voidY) {
         p.hp = 0;
         p.dyingTimer = DEATH_ANIMATION_SECONDS;
+        // v7: void deaths fire on_player_died too (rules can react to
+        // "a player fell off the world" the same as any other death).
+        pushStats(p);
+        try { weildCodeEngine.handlePlayerDied(p.username); } catch { /* never kill the sim */ }
       }
     }
 
@@ -1013,6 +1099,10 @@ async function main(): Promise<void> {
         sprint: p.sprint && p.dyingTimer <= 0,
       };
       const hp = Math.round(p.hp);
+      // v7: the rule-set walk speed (rounded to 0.1) rides every player
+      // entry - the OWNER applies it to its local sim (a parameter, never
+      // a correction); everyone else can ignore it.
+      const spd = Math.round((p.speed || 10.8) * 10) / 10;
       const prev = lastPlayerBroadcast.get(p.socketId);
       const changed = !prev || tp ||
         Math.abs(prev.x - x) > 0.01 ||
@@ -1020,13 +1110,14 @@ async function main(): Promise<void> {
         Math.abs(prev.z - z) > 0.01 ||
         Math.abs(prev.yaw - p.yaw) > 0.02 ||
         prev.hp !== hp ||
+        prev.spd !== spd ||
         prev.walking !== anim.walking ||
         prev.jumping !== anim.jumping ||
         prev.dying !== anim.dying ||
         prev.sprint !== anim.sprint;
       if (!keyframe && !changed) continue; // nothing new to say about them
       lastPlayerBroadcast.set(p.socketId, {
-        x, y, z, yaw: p.yaw, hp,
+        x, y, z, yaw: p.yaw, hp, spd,
         walking: anim.walking, jumping: anim.jumping, dying: anim.dying, sprint: anim.sprint,
       });
       playersOut.push({
@@ -1036,6 +1127,7 @@ async function main(): Promise<void> {
         rotation: [0, p.yaw, 0],
         anim,
         hp,
+        spd,
         dying: p.dyingTimer > 0,
         ...(tp ? { tp: 1 } : {}),
       });
@@ -1215,6 +1307,11 @@ async function main(): Promise<void> {
       stepSim(SIM_DT);
       simAccum -= SIM_DT;
       stepped = true;
+    }
+    // v7: flush targeted messages right after the sim pass that produced
+    // them (they are latency-sensitive chat-like text, not world state).
+    if (targetedMessages.length > 0) {
+      post({ t: 'pmsg', messages: targetedMessages.splice(0, targetedMessages.length) });
     }
     if (stepped && snapAccum >= 1 / SNAPSHOT_HZ) {
       snapAccum = 0;

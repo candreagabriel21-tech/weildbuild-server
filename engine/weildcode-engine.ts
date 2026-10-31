@@ -10,6 +10,7 @@ import {
   WeildCodeAction,
   TriggerType,
   ActionType,
+  OperandSpec,
   TRIGGER_DEFINITIONS,
   ACTION_DEFINITIONS,
   createBlankRule,
@@ -29,6 +30,9 @@ interface TimerState {
   fired: boolean; // for 'once' mode
   maxRepeats: number; // for repeat_every (0 = infinity)
   fireCount: number;
+  /** v7 FIX: repeat_every timers re-run THESE actions (the block's
+   * children), not the whole rule again. */
+  actions?: WeildCodeAction[];
   /** v6.2.1: the player whose event scheduled this timer (kills/heals
    * scheduled by a touch keep targeting the toucher). */
   actor?: string;
@@ -43,6 +47,12 @@ interface PendingWait {
   gameRule?: boolean;
   /** v6.2.1: the player whose event started this wait. */
   actor?: string;
+  /** v7 FIX: the EXACT action array the wait sits in. The old code resumed
+   * with `rule.actions.slice(index + 1)` - correct at the top level, but a
+   * wait nested inside repeat / tell_object / if children resumed at that
+   * index in the TOP-LEVEL actions instead, so whole chunks of a rule
+   * silently "skipped" after the wait. */
+  actions: WeildCodeAction[];
 }
 
 // ─── v6.2.1: per-player rule effects (multiplayer) ───
@@ -56,14 +66,34 @@ interface PendingWait {
 // (or to everyone when the rule had no player context, e.g. timers).
 // Singleplayer / Test Play keeps the old store-writing behavior exactly.
 export interface PlayerEffect {
-  kind: 'kill' | 'heal' | 'set_health' | 'damage' | 'teleport';
+  kind: 'kill' | 'heal' | 'set_health' | 'damage' | 'teleport' | 'set_speed' | 'set_spawn' | 'respawn' | 'message';
   /** The acting player (trigger source). Undefined = apply to ALL players
    * (timer/global rules - the classic shared semantics). */
   username?: string;
+  /** v7: who the effect applies to. 'this' (default) = the acting player,
+   * 'all' = everyone, 'username' = the player named in targetName. */
+  target?: 'this' | 'all' | 'username';
+  /** v7: the username when target === 'username'. */
+  targetName?: string;
   /** For set_health / damage: the hp value or delta. */
   value?: number;
+  /** For set_speed: add to the current speed instead of replacing it. */
+  relative?: boolean;
   /** For teleport: the target feet position. */
   position?: { x: number; y: number; z: number };
+  /** For set_spawn: the resolved spawn position. */
+  spawn?: { x: number; y: number; z: number };
+  /** For message: the screen message payload (delivered to the target
+   * players ONLY - it never rides the broadcast snapshot). */
+  message?: {
+    message: string;
+    position: 'top' | 'bottom';
+    textColor: string;
+    fontStyle: 'normal' | 'bold' | 'italic' | 'bold-italic';
+    fontSize: number;
+    backgroundColor: string;
+    duration: number;
+  };
 }
 
 class WeildCodeEngine {
@@ -79,6 +109,20 @@ class WeildCodeEngine {
   private static MAX_PLAYER_EFFECTS = 256; // bound rule storms
   /** The player whose trigger is currently executing (undefined = global). */
   private currentActor: string | undefined = undefined;
+
+  // ─── v7: acting-player context for interpolation + conditions ───
+  /** The local player's name (solo mode has no roster; the play viewports
+   * set this when play starts). */
+  private localUsername = 'Player';
+  /** Per-player stats pushed by the gamehost authority (hp/speed) so IF
+   * conditions and $(health)-style text can read ANY player's numbers. */
+  private playerStats = new Map<string, { health: number; maxHealth: number; speed: number }>();
+  /** Monotonic counter for unique wait keys (two waits at the same index
+   * in different child arrays used to overwrite each other). */
+  private waitSeq = 0;
+  /** Re-entrancy guard for the damage/died events (a damage rule that
+   * damages again must not loop forever). */
+  private eventDepth = 0;
 
   // ─── v1.7: performance guards (no lag machines) ───
   /** Actions executed during the current frame; reset in update(). */
@@ -148,7 +192,20 @@ class WeildCodeEngine {
   /** v6.2.1: queue a per-player effect (server mode). No-op in singleplayer. */
   private pushPlayerEffect(effect: PlayerEffect): void {
     if (this.playerEffects.length >= WeildCodeEngine.MAX_PLAYER_EFFECTS) return; // drop the storm, keep the sim alive
-    this.playerEffects.push({ ...effect, username: this.currentActor || effect.username });
+    // v7: resolve the target selector at push time. 'this' keeps the
+    // classic acting-player routing; 'all' mirrors the old global
+    // semantics; 'username' names a specific player.
+    const target = effect.target ?? 'this';
+    const resolved: PlayerEffect = { ...effect, target };
+    if (target === 'this') {
+      resolved.username = this.currentActor || effect.username;
+    } else if (target === 'username') {
+      resolved.targetName = String(effect.targetName ?? '').trim();
+      resolved.username = undefined;
+    } else {
+      resolved.username = undefined; // everyone
+    }
+    this.playerEffects.push(resolved);
   }
 
   /** v6.2.1: hand the queued per-player effects to the authority. The
@@ -168,6 +225,85 @@ class WeildCodeEngine {
     } finally {
       this.currentActor = prev;
     }
+  }
+
+  // ─── v7: acting-player context, target selectors, $(var) text ───
+
+  /** The play viewports call this when play starts (solo + multiplayer).
+   * It powers $(username), IF conditions on player stats and the
+   * 'this player' target selector in solo mode. */
+  setLocalUsername(name: string | undefined): void {
+    if (name && name.trim()) this.localUsername = name.trim();
+  }
+
+  getLocalUsername(): string {
+    return this.localUsername;
+  }
+
+  /** The gamehost authority pushes each player's live stats so IF
+   * conditions + $(health)/$(speed) text read the right numbers per
+   * player (solo mode falls back to the shared playState). */
+  setPlayerStats(username: string, stats: { health: number; maxHealth: number; speed: number }): void {
+    if (!username) return;
+    this.playerStats.set(username, stats);
+  }
+
+  /** Which player's context is executing right now. */
+  private currentActorName(): string {
+    return this.currentActor || this.localUsername;
+  }
+
+  /** Live stats for a player (authority map first, playState fallback). */
+  private statsFor(username: string): { health: number; maxHealth: number; speed: number } {
+    const s = this.playerStats.get(username);
+    if (s) return s;
+    const p = useStudioStore.getState().playState;
+    return { health: p.characterHealth, maxHealth: p.characterMaxHealth, speed: p.characterSpeed || 0 };
+  }
+
+  /** v7: read a player action's target selector (old rules: 'this'). */
+  private playerTargetOf(action: WeildCodeAction): { target: 'this' | 'all' | 'username'; targetName: string } {
+    const t = action.params?.target;
+    const target: 'this' | 'all' | 'username' = t === 'all' || t === 'username' ? t : 'this';
+    return { target, targetName: String(action.params?.playerName ?? '').trim() };
+  }
+
+  /** v7: does the target selector include the LOCAL player? (solo mode has
+   * exactly one player - 'this' and 'all' both apply, 'username' must match.) */
+  private soloTargetMatches(action: WeildCodeAction): boolean {
+    const { target, targetName } = this.playerTargetOf(action);
+    if (target === 'username') return targetName.toLowerCase() === this.currentActorName().toLowerCase();
+    return true;
+  }
+
+  /** v7: $(name) interpolation for ANY text param. Resolves object
+   * variables, global variables and the built-ins $(username), $(health),
+   * $(maxHealth) and $(speed). Unknown names stay untouched so ordinary
+   * text containing "$(" is never corrupted. */
+  private interpolate(partId: string, s: string): string {
+    if (!s || s.indexOf('$(') === -1) return s;
+    return s.replace(/\$\(([^)\s]{1,64})\)/g, (_all, name: string) => {
+      switch (name) {
+        case 'username': return this.currentActorName();
+        case 'health': return String(Math.round(this.statsFor(this.currentActorName()).health));
+        case 'maxHealth': return String(Math.round(this.statsFor(this.currentActorName()).maxHealth));
+        case 'speed': {
+          const spd = this.statsFor(this.currentActorName()).speed;
+          return String(spd > 0 ? Math.round(spd * 10) / 10 : 10.8);
+        }
+        default: break;
+      }
+      if (partId) {
+        const part = useStudioStore.getState().objects.get(partId);
+        if (part && isPart(part)) {
+          const v = part.objectVariables?.[name];
+          if (v !== undefined) return String(v);
+        }
+      }
+      const g = useStudioStore.getState().globalVariables[name];
+      if (g !== undefined) return String(g);
+      return `$(${name})`; // unknown: keep the literal
+    });
   }
 
   start() {
@@ -215,6 +351,14 @@ class WeildCodeEngine {
         this.createdParts.add(obj.id);
       }
     });
+
+    // v7 FIX: game-level on_timer rules were never scheduled anywhere (only
+    // part rules were), so a timer attached to a GAME rule silently never
+    // fired. Schedule them here; updateTimers already knows the partId === ''
+    // game path.
+    for (const rule of state.gameRules || []) {
+      if (rule.enabled && rule.trigger.type === 'on_timer') this.setupTimer(rule, '');
+    }
 
     // Start the update loop
     this.update();
@@ -492,7 +636,12 @@ class WeildCodeEngine {
           if (timer.repeat === 'once' && timer.fired) continue;
           const gameRule = (state.gameRules || []).find((r) => r.id === timer.ruleId);
           if (gameRule && gameRule.enabled) {
-            this.withActor(timer.actor, () => this.executeGameActions(gameRule.actions, gameRule.id));
+            this.withActor(timer.actor, () => {
+              // v7 FIX: a repeat_every timer re-runs its CHILDREN only; an
+              // on_timer trigger runs the whole rule (the old code re-ran
+              // EVERY action in the rule on every interval).
+              this.executeGameActions(timer.actions ?? gameRule.actions, gameRule.id, timer.actions ? 1 : 0);
+            });
           }
           timer.fired = true;
           timer.fireCount++;
@@ -520,7 +669,16 @@ class WeildCodeEngine {
         if (obj && isPart(obj)) {
           const rule = (obj.rules || []).find((r) => r.id === timer.ruleId);
           if (rule && rule.enabled) {
-            this.withActor(timer.actor, () => this.executeActions(timer.partId, rule.actions, rule.id));
+            this.withActor(timer.actor, () => {
+              // v7 FIX: repeat_every re-runs ITS CHILDREN, not the whole rule
+              // (the old behavior re-executed every action in the rule each
+              // interval - extra prints, extra kills, double teleports).
+              if (timer.actions) {
+                this.executeActions(timer.partId, timer.actions, rule.id, 1);
+              } else {
+                this.executeActions(timer.partId, rule.actions, rule.id);
+              }
+            });
           }
         }
 
@@ -531,7 +689,11 @@ class WeildCodeEngine {
           this.timers.delete(key);
         }
 
-        // Check maxRepeats for repeat_every actions (handled at action level, not trigger level)
+        // v7 FIX: maxRepeats was only enforced on the game path - a part
+        // rule's repeat_every with a max ran forever.
+        if (timer.maxRepeats > 0 && timer.fireCount >= timer.maxRepeats) {
+          this.timers.delete(key);
+        }
       }
     }
   }
@@ -543,14 +705,16 @@ class WeildCodeEngine {
       wait.remainingSeconds -= dt;
       if (wait.remainingSeconds <= 0) {
         this.pendingWaits.delete(key);
-        // Continue executing from the next action after the wait
+        // Continue executing from the next action after the wait - in the
+        // EXACT action array the wait was scheduled from (v7 fix: nested
+        // waits used to resume at the wrong level and skip actions).
         const state = useStudioStore.getState();
+        const remainingActions = wait.actions.slice(wait.actionIndex + 1);
         // v1.5: game-rule waits resume on the game action path.
         if (wait.gameRule) {
           const rule = (state.gameRules || []).find((r) => r.id === wait.ruleId);
           if (rule && rule.enabled) {
-            const remainingActions = rule.actions.slice(wait.actionIndex + 1);
-            this.withActor(wait.actor, () => this.executeGameActions(remainingActions, rule.id));
+            this.withActor(wait.actor, () => this.executeGameActions(remainingActions, wait.ruleId));
           }
           continue;
         }
@@ -558,9 +722,7 @@ class WeildCodeEngine {
         if (obj && isPart(obj)) {
           const rule = (obj.rules || []).find((r) => r.id === wait.ruleId);
           if (rule && rule.enabled) {
-            // Execute remaining actions after the wait
-            const remainingActions = rule.actions.slice(wait.actionIndex + 1);
-            this.withActor(wait.actor, () => this.executeActions(wait.partId, remainingActions, rule.id));
+            this.withActor(wait.actor, () => this.executeActions(wait.partId, remainingActions, wait.ruleId));
           }
         }
       }
@@ -601,6 +763,29 @@ class WeildCodeEngine {
     this.fireGameTrigger('on_chat_message', { username, message });
   }
 
+  /** v7: a player lost health (solo path + the gamehost authority both
+   * call this). Fires the on_player_damaged game rules. */
+  handlePlayerDamaged(username: string, amount: number, healthAfter: number): void {
+    if (!this.isRunning || this.eventDepth > 4) return;
+    this.eventDepth++;
+    try {
+      this.fireGameTrigger('on_player_damaged', { username, amount, health: healthAfter });
+    } finally {
+      this.eventDepth--;
+    }
+  }
+
+  /** v7: a player died (health 0 or the void). Fires on_player_died. */
+  handlePlayerDied(username: string): void {
+    if (!this.isRunning || this.eventDepth > 4) return;
+    this.eventDepth++;
+    try {
+      this.fireGameTrigger('on_player_died', { username });
+    } finally {
+      this.eventDepth--;
+    }
+  }
+
   fireGameTrigger(triggerType: TriggerType, eventData?: Record<string, any>): void {
     if (!this.isRunning) return;
     const state = useStudioStore.getState();
@@ -627,6 +812,11 @@ class WeildCodeEngine {
       const filter = this.paramString('', params.username, '').trim().toLowerCase();
       if (filter && String(eventData?.username || '').toLowerCase() !== filter) return false;
     }
+    // v7: the life-state triggers take the same optional username filter.
+    if (triggerType === 'on_player_damaged' || triggerType === 'on_player_died') {
+      const filter = this.paramString('', params.username, '').trim().toLowerCase();
+      if (filter && String(eventData?.username || '').toLowerCase() !== filter) return false;
+    }
     if (triggerType === 'on_chat_message') {
       const user = this.paramString('', params.username, '').trim().toLowerCase();
       if (user && String(eventData?.username || '').toLowerCase() !== user) return false;
@@ -643,13 +833,14 @@ class WeildCodeEngine {
       const action = actions[i];
       if (!action.enabled) continue;
       if (action.type === 'wait') {
-        this.pendingWaits.set(`game_${ruleId}_${i}`, {
+        this.pendingWaits.set(`game_${ruleId}_${i}_${this.waitSeq++}`, {
           ruleId,
           partId: '',
           actionIndex: i,
           remainingSeconds: Math.max(WeildCodeEngine.MIN_INTERVAL, this.paramNumber('', action.params.seconds, 1)),
           gameRule: true,
           actor: this.currentActor, // v6.2.1: keep the triggering player
+          actions, // v7: resume THIS array (nested waits resumed wrongly before)
         });
         return; // resume after the wait
       }
@@ -664,9 +855,67 @@ class WeildCodeEngine {
     if (!this.spendActionBudget()) return;
 
     switch (action.type) {
+      case 'if_condition': {
+        // v7: the customizable IF - run the THEN children or the ELSE
+        // children based on the comparison. Works in game rules too (the
+        // part operand resolves named parts only).
+        const branch = this.evaluateIfCondition('', action) ? action.children : (action.elseChildren ?? []);
+        if (branch && branch.length > 0) this.executeGameActions(branch, ruleId, depth + 1);
+        break;
+      }
+      case 'modify_property': {
+        // v7: game rules have no "this part" - a NAMED target still works.
+        if (!this.executeModifyProperty('', action, true)) {
+          useStudioStore.getState().addConsoleMessage('warn', `[WeildCode] modify_property in a game rule needs a named object.`);
+        }
+        break;
+      }
+      case 'set_player_speed': {
+        const t = this.playerTargetOf(action);
+        const speed = Math.max(0, this.paramNumber('', action.params.speed, 10.8));
+        if (this.isServerAuthority()) {
+          this.pushPlayerEffect({ kind: 'set_speed', ...t, value: speed, relative: action.params.relative === true });
+          break;
+        }
+        if (!this.soloTargetMatches(action)) break;
+        const cur = useStudioStore.getState().playState.characterSpeed || 10.8;
+        const next = action.params.relative === true ? Math.max(0, cur + speed) : speed;
+        useStudioStore.getState().setPlayState({ characterSpeed: next });
+        useStudioStore.getState().addConsoleMessage('info', `[WeildCode] Player speed set to ${Math.round(next * 10) / 10}`);
+        break;
+      }
+      case 'set_spawn_point': {
+        const t = this.playerTargetOf(action);
+        const pos = this.resolveSpawnPosition('', action);
+        if (!pos) {
+          useStudioStore.getState().addConsoleMessage('warn', `[WeildCode] set_spawn_point: could not resolve the spawn position`);
+          break;
+        }
+        if (this.isServerAuthority()) {
+          this.pushPlayerEffect({ kind: 'set_spawn', ...t, spawn: pos });
+          break;
+        }
+        if (!this.soloTargetMatches(action)) break;
+        useStudioStore.getState().setPlayState({ spawnPointOverride: pos });
+        useStudioStore.getState().addConsoleMessage('info', `[WeildCode] Spawn point set to (${pos.x.toFixed(1)}, ${pos.y.toFixed(1)}, ${pos.z.toFixed(1)})`);
+        break;
+      }
+      case 'respawn_player': {
+        const t = this.playerTargetOf(action);
+        if (this.isServerAuthority()) {
+          this.pushPlayerEffect({ kind: 'respawn', ...t });
+          break;
+        }
+        if (!this.soloTargetMatches(action)) break;
+        // v7: bump the counter - the play viewport teleports the body to
+        // the spawn + restores full health on the next frame (no death).
+        const st = useStudioStore.getState();
+        st.setPlayState({ pendingRespawn: st.playState.pendingRespawn + 1 });
+        break;
+      }
       case 'print_message': {
         const message = this.paramString('', action.params.message, 'Hello, world!');
-        useStudioStore.getState().addScreenMessage({
+        const msgPayload = {
           message,
           position: (action.params.position || 'bottom') as 'top' | 'bottom',
           textColor: action.params.textColor || '#ffffff',
@@ -674,7 +923,16 @@ class WeildCodeEngine {
           fontSize: this.paramNumber('', action.params.fontSize, 24),
           backgroundColor: action.params.backgroundColor || '#000000',
           duration: this.paramNumber('', action.params.duration, 3),
-        });
+        };
+        // v7: "this player" / a named player get a TARGETED message (it is
+        // delivered to their client only, not broadcast); "all players"
+        // (and old rules with no selector) keep the classic broadcast.
+        const msgTarget = this.playerTargetOf(action);
+        if (this.isServerAuthority() && msgTarget.target !== 'all') {
+          this.pushPlayerEffect({ kind: 'message', ...msgTarget, message: msgPayload });
+          break;
+        }
+        useStudioStore.getState().addScreenMessage(msgPayload);
         useStudioStore.getState().addConsoleMessage('info', `[WeildCode] Print: "${message}" (game rule)`);
         break;
       }
@@ -703,59 +961,59 @@ class WeildCodeEngine {
         // v6.2.1: server mode queues a per-player teleport (the acting
         // player only); singleplayer keeps the shared-store behavior.
         if (this.isServerAuthority()) {
-          const pos = this.paramVec3('', action.params.position, { x: 0, y: 5, z: 0 });
-          const p = action.params.position || {};
-          const cur = useStudioStore.getState().playState.characterPosition;
-          this.pushPlayerEffect({
-            kind: 'teleport',
-            position: {
-              x: p.relativeX ? cur.x + (pos.x || 0) : (pos.x || 0),
-              y: p.relativeY ? cur.y + (pos.y || 0) : (pos.y || 0),
-              z: p.relativeZ ? cur.z + (pos.z || 0) : (pos.z || 0),
-            },
-          });
+          const t = this.playerTargetOf(action);
+          const pos = this.resolveTeleportPosition('', action);
+          if (pos) this.pushPlayerEffect({ kind: 'teleport', ...t, position: pos });
           break;
         }
-        this.executeTeleportPlayer(action);
+        if (this.soloTargetMatches(action)) this.executeTeleportPlayer(action);
         break;
       }
       case 'modify_player_health': {
         // v6.2.1: server mode queues a per-player effect (the acting player
         // only); singleplayer keeps the shared-store behavior.
         if (this.isServerAuthority()) {
+          const t = this.playerTargetOf(action);
           const amount = this.paramNumber('', action.params.health, 0);
-          if (action.params.relative !== false) this.pushPlayerEffect({ kind: 'damage', value: amount });
-          else this.pushPlayerEffect({ kind: 'set_health', value: amount });
+          if (action.params.relative !== false) this.pushPlayerEffect({ kind: 'damage', ...t, value: amount });
+          else this.pushPlayerEffect({ kind: 'set_health', ...t, value: amount });
           break;
         }
-        this.executeModifyPlayerHealth(action);
+        if (this.soloTargetMatches(action)) this.executeModifyPlayerHealth(action);
         break;
       }
       case 'set_health': {
         const maxHp = useStudioStore.getState().playState.characterMaxHealth;
         const hp = Math.max(0, Math.min(maxHp, this.paramNumber('', action.params.health, 100)));
         if (this.isServerAuthority()) {
-          this.pushPlayerEffect({ kind: 'set_health', value: hp });
+          this.pushPlayerEffect({ kind: 'set_health', ...this.playerTargetOf(action), value: hp });
           break;
         }
+        if (!this.soloTargetMatches(action)) break;
+        const prevHp = useStudioStore.getState().playState.characterHealth;
         useStudioStore.getState().setPlayState({ characterHealth: hp });
+        if (hp < prevHp) this.emitPlayerDamaged(this.currentActorName(), hp - prevHp, hp);
+        if (hp <= 0 && prevHp > 0) this.emitPlayerDied(this.currentActorName());
         useStudioStore.getState().addConsoleMessage('info', `[WeildCode] Player health set to ${hp}`);
         break;
       }
       case 'kill_player': {
         if (this.isServerAuthority()) {
-          this.pushPlayerEffect({ kind: 'kill' });
+          this.pushPlayerEffect({ kind: 'kill', ...this.playerTargetOf(action) });
           break;
         }
+        if (!this.soloTargetMatches(action)) break;
         useStudioStore.getState().setPlayState({ characterHealth: 0 });
+        this.emitPlayerDied(this.currentActorName());
         useStudioStore.getState().addConsoleMessage('info', `[WeildCode] Player killed (game rule)`);
         break;
       }
       case 'heal_player': {
         if (this.isServerAuthority()) {
-          this.pushPlayerEffect({ kind: 'heal' });
+          this.pushPlayerEffect({ kind: 'heal', ...this.playerTargetOf(action) });
           break;
         }
+        if (!this.soloTargetMatches(action)) break;
         const maxHp = useStudioStore.getState().playState.characterMaxHealth;
         useStudioStore.getState().setPlayState({ characterHealth: maxHp });
         useStudioStore.getState().addConsoleMessage('info', `[WeildCode] Player healed to full (${maxHp} HP)`);
@@ -798,6 +1056,7 @@ class WeildCodeEngine {
         this.timers.set(timerKey, {
           ruleId,
           partId: '',
+          actions: action.children, // v7 FIX: the timer re-runs the CHILDREN
           intervalSeconds,
           repeat: 'every',
           elapsed: 0,
@@ -852,13 +1111,14 @@ class WeildCodeEngine {
       if (action.type === 'wait') {
         // v1.7: clamped so a 0-second wait can't wake 60 times a second.
         const seconds = Math.max(WeildCodeEngine.MIN_INTERVAL, this.paramNumber(partId, action.params.seconds, 1));
-        const waitKey = `${partId}_${ruleId}_${i}`;
+        const waitKey = `${partId}_${ruleId}_${i}_${this.waitSeq++}`;
         this.pendingWaits.set(waitKey, {
           ruleId,
           partId,
           actionIndex: i,
           remainingSeconds: seconds,
           actor: this.currentActor, // v6.2.1: keep the triggering player
+          actions, // v7: resume THIS array (nested waits resumed wrongly before)
         });
         return; // Stop executing further actions; will resume after wait
       }
@@ -876,6 +1136,59 @@ class WeildCodeEngine {
     if (!part || !isPart(part)) return;
 
     switch (action.type) {
+      case 'if_condition': {
+        // v7: the customizable IF - THEN children when true, ELSE children
+        // when false. Part rules can read "this part"'s properties.
+        const branch = this.evaluateIfCondition(partId, action) ? action.children : (action.elseChildren ?? []);
+        if (branch && branch.length > 0) this.executeActions(partId, branch, ruleId, depth + 1);
+        break;
+      }
+      case 'modify_property': {
+        this.executeModifyProperty(partId, action);
+        break;
+      }
+      case 'set_player_speed': {
+        const t = this.playerTargetOf(action);
+        const speed = Math.max(0, this.paramNumber(partId, action.params.speed, 10.8));
+        if (this.isServerAuthority()) {
+          this.pushPlayerEffect({ kind: 'set_speed', ...t, value: speed, relative: action.params.relative === true });
+          break;
+        }
+        if (!this.soloTargetMatches(action)) break;
+        const cur = useStudioStore.getState().playState.characterSpeed || 10.8;
+        const next = action.params.relative === true ? Math.max(0, cur + speed) : speed;
+        useStudioStore.getState().setPlayState({ characterSpeed: next });
+        useStudioStore.getState().addConsoleMessage('info', `[WeildCode] Player speed set to ${Math.round(next * 10) / 10}`);
+        break;
+      }
+      case 'set_spawn_point': {
+        const t = this.playerTargetOf(action);
+        const pos = this.resolveSpawnPosition(partId, action);
+        if (!pos) {
+          useStudioStore.getState().addConsoleMessage('warn', `[WeildCode] set_spawn_point: could not resolve the spawn position`);
+          break;
+        }
+        if (this.isServerAuthority()) {
+          this.pushPlayerEffect({ kind: 'set_spawn', ...t, spawn: pos });
+          break;
+        }
+        if (!this.soloTargetMatches(action)) break;
+        useStudioStore.getState().setPlayState({ spawnPointOverride: pos });
+        useStudioStore.getState().addConsoleMessage('info', `[WeildCode] Spawn point set to (${pos.x.toFixed(1)}, ${pos.y.toFixed(1)}, ${pos.z.toFixed(1)})`);
+        break;
+      }
+      case 'respawn_player': {
+        if (this.isServerAuthority()) {
+          this.pushPlayerEffect({ kind: 'respawn', ...this.playerTargetOf(action) });
+          break;
+        }
+        if (!this.soloTargetMatches(action)) break;
+        // v7: bump the counter - the play viewport teleports the body to
+        // the spawn + restores full health on the next frame (no death).
+        const st = useStudioStore.getState();
+        st.setPlayState({ pendingRespawn: st.playState.pendingRespawn + 1 });
+        break;
+      }
       case 'create_part': {
         this.executeCreatePart(partId, action);
         break;
@@ -1034,7 +1347,7 @@ class WeildCodeEngine {
         // per-player teleport (the acting player only).
         if (this.isServerAuthority()) {
           const pos = this.resolveTeleportToPartPosition(partId, action);
-          if (pos) this.pushPlayerEffect({ kind: 'teleport', position: pos });
+          if (pos) this.pushPlayerEffect({ kind: 'teleport', ...this.playerTargetOf(action), position: pos });
           break;
         }
         this.executeTeleportPlayerToPart(partId, action);
@@ -1042,36 +1355,30 @@ class WeildCodeEngine {
       }
       case 'teleport_player': {
         if (this.isServerAuthority()) {
-          const pos = this.paramVec3('', action.params.position, { x: 0, y: 5, z: 0 });
-          const p = action.params.position || {};
-          const cur = useStudioStore.getState().playState.characterPosition;
-          this.pushPlayerEffect({
-            kind: 'teleport',
-            position: {
-              x: p.relativeX ? cur.x + (pos.x || 0) : (pos.x || 0),
-              y: p.relativeY ? cur.y + (pos.y || 0) : (pos.y || 0),
-              z: p.relativeZ ? cur.z + (pos.z || 0) : (pos.z || 0),
-            },
-          });
+          const pos = this.resolveTeleportPosition(partId, action);
+          if (pos) this.pushPlayerEffect({ kind: 'teleport', ...this.playerTargetOf(action), position: pos });
           break;
         }
-        this.executeTeleportPlayer(action);
+        if (this.soloTargetMatches(action)) this.executeTeleportPlayer(action);
         break;
       }
       case 'kill_player': {
         if (this.isServerAuthority()) {
-          this.pushPlayerEffect({ kind: 'kill' });
+          this.pushPlayerEffect({ kind: 'kill', ...this.playerTargetOf(action) });
           break;
         }
+        if (!this.soloTargetMatches(action)) break;
         useStudioStore.getState().setPlayState({ characterHealth: 0 });
+        this.emitPlayerDied(this.currentActorName());
         useStudioStore.getState().addConsoleMessage('info', `[WeildCode] Player killed`);
         break;
       }
       case 'heal_player': {
         if (this.isServerAuthority()) {
-          this.pushPlayerEffect({ kind: 'heal' });
+          this.pushPlayerEffect({ kind: 'heal', ...this.playerTargetOf(action) });
           break;
         }
+        if (!this.soloTargetMatches(action)) break;
         const maxHp = useStudioStore.getState().playState.characterMaxHealth;
         useStudioStore.getState().setPlayState({ characterHealth: maxHp });
         useStudioStore.getState().addConsoleMessage('info', `[WeildCode] Player healed to full (${maxHp} HP)`);
@@ -1105,6 +1412,7 @@ class WeildCodeEngine {
         this.timers.set(timerKey, {
           ruleId,
           partId,
+          actions: action.children, // v7 FIX: the timer re-runs the CHILDREN
           intervalSeconds,
           repeat: 'every',
           elapsed: 0,
@@ -1143,6 +1451,24 @@ class WeildCodeEngine {
         const fontSize = this.paramNumber(partId, action.params.fontSize, 24);
         const backgroundColor = action.params.backgroundColor || '#000000';
         const duration = this.paramNumber(partId, action.params.duration, 3);
+        // v7: targeted messages go to the chosen players only (server mode).
+        const msgTarget = this.playerTargetOf(action);
+        if (this.isServerAuthority() && msgTarget.target !== 'all') {
+          this.pushPlayerEffect({
+            kind: 'message',
+            ...msgTarget,
+            message: {
+              message,
+              position: position as 'top' | 'bottom',
+              textColor,
+              fontStyle: fontStyle as 'normal' | 'bold' | 'italic' | 'bold-italic',
+              fontSize,
+              backgroundColor,
+              duration,
+            },
+          });
+          break;
+        }
         useStudioStore.getState().addScreenMessage({
           message,
           position: position as 'top' | 'bottom',
@@ -1331,22 +1657,27 @@ class WeildCodeEngine {
         // v6.2.1: server mode queues a per-player effect (the acting player
         // only); singleplayer keeps the shared-store behavior.
         if (this.isServerAuthority()) {
+          const t = this.playerTargetOf(action);
           const amount = this.paramNumber(partId, action.params.health, 0);
-          if (action.params.relative !== false) this.pushPlayerEffect({ kind: 'damage', value: amount });
-          else this.pushPlayerEffect({ kind: 'set_health', value: amount });
+          if (action.params.relative !== false) this.pushPlayerEffect({ kind: 'damage', ...t, value: amount });
+          else this.pushPlayerEffect({ kind: 'set_health', ...t, value: amount });
           break;
         }
-        this.executeModifyPlayerHealth(action);
+        if (this.soloTargetMatches(action)) this.executeModifyPlayerHealth(action);
         break;
       }
       case 'set_health': {
         const maxHp = useStudioStore.getState().playState.characterMaxHealth;
         const hp = Math.max(0, Math.min(maxHp, this.paramNumber(partId, action.params.health, 100)));
         if (this.isServerAuthority()) {
-          this.pushPlayerEffect({ kind: 'set_health', value: hp });
+          this.pushPlayerEffect({ kind: 'set_health', ...this.playerTargetOf(action), value: hp });
           break;
         }
+        if (!this.soloTargetMatches(action)) break;
+        const prevHp = useStudioStore.getState().playState.characterHealth;
         useStudioStore.getState().setPlayState({ characterHealth: hp });
+        if (hp < prevHp) this.emitPlayerDamaged(this.currentActorName(), hp - prevHp, hp);
+        if (hp <= 0 && prevHp > 0) this.emitPlayerDied(this.currentActorName());
         useStudioStore.getState().addConsoleMessage('info', `[WeildCode] Player health set to ${hp}`);
         break;
       }
@@ -1362,15 +1693,32 @@ class WeildCodeEngine {
     const position = this.paramVec3(sourcePartId, action.params.position, { x: 0, y: 1, z: 0 });
     const color = action.params.color || '#4ff7f5';
 
-    // If source part exists, offset relative to it
+    // v7: explicit "relative to" - this part (the classic offset), world
+    // (absolute coordinates), or another named part's current position.
+    const relativeTo = action.params.relativeTo || 'this part';
     const sourcePart = state.objects.get(sourcePartId);
-    const finalPos = sourcePart && isPart(sourcePart)
-      ? {
-          x: sourcePart.position.x + (position.x || 0),
-          y: sourcePart.position.y + (position.y || 0),
-          z: sourcePart.position.z + (position.z || 0),
-        }
-      : position;
+    let finalPos = position;
+    if (relativeTo === 'world') {
+      finalPos = position;
+    } else if (relativeTo === 'named part') {
+      const anchorName = this.paramString(sourcePartId, action.params.relativeToName, '');
+      const anchor = this.findPartByName(anchorName);
+      if (!anchor) {
+        state.addConsoleMessage('warn', `[WeildCode] create_part: part "${anchorName}" not found`);
+        return;
+      }
+      finalPos = {
+        x: anchor.position.x + (position.x || 0),
+        y: anchor.position.y + (position.y || 0),
+        z: anchor.position.z + (position.z || 0),
+      };
+    } else if (sourcePart && isPart(sourcePart)) {
+      finalPos = {
+        x: sourcePart.position.x + (position.x || 0),
+        y: sourcePart.position.y + (position.y || 0),
+        z: sourcePart.position.z + (position.z || 0),
+      };
+    }
 
     // Create the part using the store's addPart
     // We need to bypass addPart since it uses its own naming
@@ -1435,6 +1783,26 @@ class WeildCodeEngine {
     const state = useStudioStore.getState();
     const part = state.objects.get(partId);
     if (!part || !isPart(part)) return;
+
+    // v7: "relative to another part" - the position lands as an offset on
+    // the NAMED part's current position (a platform can follow an anchor
+    // part anywhere it goes). Both modes behave the same here.
+    if ((action.params.relativeTo || 'self') === 'named') {
+      const anchorName = this.paramString(partId, action.params.relativeToName, '');
+      const anchor = this.findPartByName(anchorName);
+      if (!anchor) {
+        useStudioStore.getState().addConsoleMessage('warn', `[WeildCode] move: part "${anchorName}" not found`);
+        return;
+      }
+      useStudioStore.getState().updateObject(partId, {
+        position: {
+          x: anchor.position.x + (position.x || 0),
+          y: anchor.position.y + (position.y || 0),
+          z: anchor.position.z + (position.z || 0),
+        },
+      });
+      return;
+    }
 
     if (mode === 'absolute') {
       useStudioStore.getState().updateObject(partId, { position: { ...position } });
@@ -1563,64 +1931,18 @@ class WeildCodeEngine {
     const tp: StudioPart = targetPart;
 
     // Compute the teleport position based on the chosen face.
-    // The player is placed just outside the face so they don't get stuck inside the part.
-    const px = tp.position.x;
-    const py = tp.position.y;
-    const pz = tp.position.z;
-    const sx = tp.size.x;
-    const sy = tp.size.y;
-    const sz = tp.size.z;
-    // Player offset from the face surface (so they stand ON the face, not embedded in it)
-    const PLAYER_HALF_HEIGHT = 1.0; // approx half the character height
-
-    let teleportPos: { x: number; y: number; z: number };
-    switch (face) {
-      case 'top':
-        teleportPos = { x: px, y: py + sy / 2 + PLAYER_HALF_HEIGHT, z: pz };
-        break;
-      case 'bottom':
-        teleportPos = { x: px, y: py - sy / 2 - PLAYER_HALF_HEIGHT, z: pz };
-        break;
-      case 'left': // -X
-        teleportPos = { x: px - sx / 2 - 0.5, y: py, z: pz };
-        break;
-      case 'right': // +X
-        teleportPos = { x: px + sx / 2 + 0.5, y: py, z: pz };
-        break;
-      case 'front': // -Z
-        teleportPos = { x: px, y: py, z: pz - sz / 2 - 0.5 };
-        break;
-      case 'back': // +Z
-        teleportPos = { x: px, y: py, z: pz + sz / 2 + 0.5 };
-        break;
-      case 'center':
-      default:
-        teleportPos = { x: px, y: py, z: pz };
-        break;
-    }
-
-    // Apply user-specified offset
-    teleportPos.x += offset.x || 0;
-    teleportPos.y += offset.y || 0;
-    teleportPos.z += offset.z || 0;
-    return teleportPos;
+    // v7: extracted into resolveFacePosition so set_spawn_point can place
+    // spawns on part faces with the exact same math.
+    return this.resolveFacePosition(tp, face, offset);
   }
 
   // ─── Teleport Player ───
-  // Teleport the player to an xyz position. Each axis has a "relative" flag -
-  // when true, the value is ADDED to the current position; when false, it REPLACES it.
+  // Teleport the player to an xyz position (per-axis relative flags), or -
+  // v7 - "relative to a named part" (the position becomes an offset from
+  // that part's CURRENT position).
   private executeTeleportPlayer(action: WeildCodeAction) {
-    const pos = this.paramVec3('', action.params.position, { x: 0, y: 5, z: 0 });
-    const relativeX = !!(action.params.position?.relativeX);
-    const relativeY = !!(action.params.position?.relativeY);
-    const relativeZ = !!(action.params.position?.relativeZ);
-
-    const currentPos = useStudioStore.getState().playState.characterPosition;
-    const newPos = {
-      x: relativeX ? currentPos.x + (pos.x || 0) : (pos.x || 0),
-      y: relativeY ? currentPos.y + (pos.y || 0) : (pos.y || 0),
-      z: relativeZ ? currentPos.z + (pos.z || 0) : (pos.z || 0),
-    };
+    const newPos = this.resolveTeleportPosition('', action);
+    if (!newPos) return;
 
     useStudioStore.getState().setPlayState({ teleportPosition: newPos });
     useStudioStore.getState().addConsoleMessage('info', `[WeildCode] Teleported player to (${newPos.x.toFixed(1)}, ${newPos.y.toFixed(1)}, ${newPos.z.toFixed(1)})`);
@@ -1641,6 +1963,10 @@ class WeildCodeEngine {
       : Math.max(0, Math.min(maxHp, healthDelta));
 
     state.setPlayState({ characterHealth: newHp });
+    // v7: life-state events (solo path - the server fires these from its
+    // own per-player hp records instead).
+    if (newHp < currentHp) this.emitPlayerDamaged(this.currentActorName(), newHp - currentHp, newHp);
+    if (newHp <= 0 && currentHp > 0) this.emitPlayerDied(this.currentActorName());
     useStudioStore.getState().addConsoleMessage('info', `[WeildCode] Player health: ${currentHp} → ${newHp} (${relative ? 'relative' : 'absolute'})`);
   }
 
@@ -1945,10 +2271,13 @@ class WeildCodeEngine {
   /** Resolve a TEXT param with a safe fallback. */
   private paramString(partId: string, raw: unknown, fallback: string): string {
     if (raw === undefined || raw === null) return fallback;
-    if (typeof raw === 'string') return raw;
+    if (typeof raw === 'string') return this.interpolate(partId, raw);
     if (typeof raw === 'number') return String(raw);
     const v = this.resolveParamValue(partId, raw);
-    return v === undefined || v === null ? fallback : String(v);
+    const s = v === undefined || v === null ? fallback : String(v);
+    // v7: $(name) interpolation applies to ANY text param - messages,
+    // part names, filters: "Score: $(score)" shows the live value.
+    return this.interpolate(partId, s);
   }
 
   /** Resolve a VECTOR3-ish param ({x,y,z} with any axis being a literal,
@@ -2243,6 +2572,229 @@ class WeildCodeEngine {
   }
 
   // ─── Event Handlers (called from Viewport3D + the store) ───
+
+  // ─── v7: the new rule machinery (IF conditions, properties, spawns) ───
+
+  /** Solo-path event emitters (thin aliases of the public handlers, so
+   * rule code and the play viewports share one guarded path). */
+  private emitPlayerDamaged(username: string, amount: number, healthAfter: number): void {
+    this.handlePlayerDamaged(username, amount, healthAfter);
+  }
+  private emitPlayerDied(username: string): void {
+    this.handlePlayerDied(username);
+  }
+
+  /** First part with the given name (null when missing). */
+  private findPartByName(name: string): StudioPart | null {
+    if (!name) return null;
+    let found: StudioPart | null = null;
+    useStudioStore.getState().objects.forEach((obj) => {
+      if (!found && isPart(obj) && obj.name === name) found = obj;
+    });
+    return found;
+  }
+
+  /** The acting part by id (null when missing). */
+  private findPartById(partId: string): StudioPart | null {
+    const obj = useStudioStore.getState().objects.get(partId);
+    return obj && isPart(obj) ? obj : null;
+  }
+
+  /** v7: evaluate an if_condition comparison (THEN branch when true). */
+  private evaluateIfCondition(partId: string, action: WeildCodeAction): boolean {
+    const left = this.evalOperand(partId, action.params.left);
+    const right = this.evalOperand(partId, action.params.right);
+    return this.compareOperands(left, action.params.operator || '=', right);
+  }
+
+  /** Resolve one operand spec to a number or string. */
+  private evalOperand(partId: string, op: unknown): number | string {
+    if (op === null || op === undefined || typeof op !== 'object' || Array.isArray(op)) return 0;
+    const o = op as OperandSpec;
+    switch (o.source) {
+      case 'player': {
+        // v7: player stats as VALUES - "if player health < 30 then ...",
+        // "if player speed > 20 then ...", "$(health)" in text.
+        const stats = this.statsFor(this.currentActorName());
+        if (o.stat === 'username') return this.currentActorName();
+        if (o.stat === 'maxHealth') return stats.maxHealth;
+        if (o.stat === 'speed') return stats.speed > 0 ? stats.speed : 10.8;
+        return stats.health;
+      }
+      case 'part': {
+        const part = o.value
+          ? this.findPartByName(this.interpolate(partId, String(o.value)))
+          : this.findPartById(partId);
+        if (!part) return 0;
+        return this.partPropertyValue(part, o.prop || 'x');
+      }
+      case 'variable':
+        return this.lookupVariableValue(partId, this.interpolate(partId, String(o.value ?? '')));
+      case 'text':
+        return this.interpolate(partId, String(o.value ?? ''));
+      case 'number':
+      default:
+        return this.paramNumber(partId, o.value, 0);
+    }
+  }
+
+  /** A part property by key (for IF conditions + part operands). */
+  private partPropertyValue(part: StudioPart, prop: string): number | string {
+    switch (prop) {
+      case 'x': return Math.round(part.position.x * 100) / 100;
+      case 'y': return Math.round(part.position.y * 100) / 100;
+      case 'z': return Math.round(part.position.z * 100) / 100;
+      case 'sizeX': return part.size.x;
+      case 'sizeY': return part.size.y;
+      case 'sizeZ': return part.size.z;
+      case 'anchored': return part.anchored ? 1 : 0;
+      case 'canCollide': return part.canCollide ? 1 : 0;
+      case 'transparency': return part.transparency;
+      case 'reflectance': return part.reflectance;
+      case 'color': return part.color;
+      case 'material': return part.material;
+      case 'name': return part.name;
+      case 'mass': return Math.round(part.size.x * part.size.y * part.size.z * part.density * 100) / 100;
+      default: return 0;
+    }
+  }
+
+  /** Compare two operand values with the chosen operator (numeric when
+   * both sides look like numbers, text comparison otherwise). */
+  private compareOperands(left: number | string, operator: string, right: number | string): boolean {
+    const lStr = String(left);
+    const rStr = String(right);
+    const lNum = Number(lStr);
+    const rNum = Number(rStr);
+    const bothNumeric = lStr.trim() !== '' && rStr.trim() !== '' && isFinite(lNum) && isFinite(rNum);
+    switch (operator) {
+      case 'contains': return lStr.toLowerCase().includes(rStr.toLowerCase());
+      case '!=': return bothNumeric ? lNum !== rNum : lStr !== rStr;
+      case '<': return bothNumeric ? lNum < rNum : lStr < rStr;
+      case '>': return bothNumeric ? lNum > rNum : lStr > rStr;
+      case '<=': return bothNumeric ? lNum <= rNum : lStr <= rStr;
+      case '>=': return bothNumeric ? lNum >= rNum : lStr >= rStr;
+      case '=':
+      default: return bothNumeric ? lNum === rNum : lStr === rStr;
+    }
+  }
+
+  /** v7: modify_property - set a typed property on this part (or a named
+   * part). Returns false when there was nothing valid to change. */
+  private executeModifyProperty(partId: string, action: WeildCodeAction, gameRule = false): boolean {
+    const target = action.params.target || 'self';
+    const targetName = this.paramString(partId, action.params.targetName, '');
+    let targetPart: StudioPart | null = null;
+    if (target === 'named' && targetName) {
+      targetPart = this.findPartByName(targetName);
+      if (!targetPart) {
+        useStudioStore.getState().addConsoleMessage('warn', `[WeildCode] modify_property: part "${targetName}" not found`);
+        return false;
+      }
+    } else if (!gameRule) {
+      targetPart = this.findPartById(partId);
+    }
+    if (!targetPart) return false;
+
+    const property = action.params.property || 'anchored';
+    let patch: Record<string, any> | null = null;
+    switch (property) {
+      case 'anchored': patch = { anchored: action.params.boolValue !== false }; break;
+      case 'canCollide': patch = { canCollide: action.params.boolValue !== false }; break;
+      case 'transparency': patch = { transparency: this.clamp01(this.paramNumber(partId, action.params.numberValue, 0)) }; break;
+      case 'reflectance': patch = { reflectance: this.clamp01(this.paramNumber(partId, action.params.numberValue, 0)) }; break;
+      case 'friction': patch = { friction: Math.max(0, this.paramNumber(partId, action.params.numberValue, 0.5)) }; break;
+      case 'elasticity': patch = { elasticity: Math.max(0, this.paramNumber(partId, action.params.numberValue, 0.2)) }; break;
+      case 'density': patch = { density: Math.max(0.01, this.paramNumber(partId, action.params.numberValue, 1)) }; break;
+      case 'color': patch = { color: action.params.colorValue || '#4ff7f5' }; break;
+      case 'material': patch = { material: this.paramString(partId, action.params.stringValue, 'Plastic') || 'Plastic' }; break;
+      case 'name': {
+        const name = this.paramString(partId, action.params.stringValue, '').trim();
+        if (!name) return false;
+        patch = { name };
+        break;
+      }
+      default: return false;
+    }
+    useStudioStore.getState().updateObject(targetPart.id, patch as any);
+    useStudioStore.getState().addConsoleMessage('info', `[WeildCode] ${property} of "${targetPart.name}" set`);
+    return true;
+  }
+
+  /** v7: resolve a teleport_player position - per-axis relative flags, or
+   * "relative to a named part" (the position becomes an offset from that
+   * part's current position). Shared by the solo + server paths. */
+  private resolveTeleportPosition(partId: string, action: WeildCodeAction): { x: number; y: number; z: number } | null {
+    const pos = this.paramVec3(partId, action.params.position, { x: 0, y: 5, z: 0 });
+    if ((action.params.relativeTo || 'none') === 'named') {
+      const anchorName = this.paramString(partId, action.params.relativeToName, '');
+      const anchor = this.findPartByName(anchorName);
+      if (!anchor) {
+        useStudioStore.getState().addConsoleMessage('warn', `[WeildCode] teleport_player: part "${anchorName}" not found`);
+        return null;
+      }
+      return {
+        x: anchor.position.x + (pos.x || 0),
+        y: anchor.position.y + (pos.y || 0),
+        z: anchor.position.z + (pos.z || 0),
+      };
+    }
+    const p = action.params.position || {};
+    const cur = useStudioStore.getState().playState.characterPosition;
+    return {
+      x: p.relativeX ? cur.x + (pos.x || 0) : (pos.x || 0),
+      y: p.relativeY ? cur.y + (pos.y || 0) : (pos.y || 0),
+      z: p.relativeZ ? cur.z + (pos.z || 0) : (pos.z || 0),
+    };
+  }
+
+  /** v7: resolve a set_spawn_point position (a position, or next to a
+   * named part on the chosen face + offset). */
+  private resolveSpawnPosition(partId: string, action: WeildCodeAction): { x: number; y: number; z: number } | null {
+    if ((action.params.at || 'position') === 'part') {
+      const partName = this.paramString(partId, action.params.partName, '');
+      const anchor = this.findPartByName(partName);
+      if (!anchor) {
+        useStudioStore.getState().addConsoleMessage('warn', `[WeildCode] set_spawn_point: part "${partName}" not found`);
+        return null;
+      }
+      const offset = this.paramVec3(partId, action.params.offset, { x: 0, y: 0, z: 0 });
+      return this.resolveFacePosition(anchor, action.params.face || 'top', offset);
+    }
+    const pos = this.paramVec3(partId, action.params.position, { x: 0, y: 1, z: 0 });
+    return { x: pos.x || 0, y: pos.y || 0, z: pos.z || 0 };
+  }
+
+  /** v7: shared face-position resolver (top/bottom/sides/center of a part
+   * plus an offset) - used by teleport_player_to_part AND set_spawn_point.
+   * The player is placed just OUTSIDE the face so they never spawn inside
+   * the part. */
+  private resolveFacePosition(tp: StudioPart, face: string, offset: { x: number; y: number; z: number }): { x: number; y: number; z: number } {
+    const px = tp.position.x;
+    const py = tp.position.y;
+    const pz = tp.position.z;
+    const sx = tp.size.x;
+    const sy = tp.size.y;
+    const sz = tp.size.z;
+    // Player offset from the face surface (stands ON the face, not embedded).
+    const PLAYER_HALF_HEIGHT = 1.0;
+
+    let pos: { x: number; y: number; z: number };
+    switch (face) {
+      case 'top': pos = { x: px, y: py + sy / 2 + PLAYER_HALF_HEIGHT, z: pz }; break;
+      case 'bottom': pos = { x: px, y: py - sy / 2 - PLAYER_HALF_HEIGHT, z: pz }; break;
+      case 'left': pos = { x: px - sx / 2 - 0.5, y: py, z: pz }; break;   // -X
+      case 'right': pos = { x: px + sx / 2 + 0.5, y: py, z: pz }; break;  // +X
+      case 'front': pos = { x: px, y: py, z: pz - sz / 2 - 0.5 }; break;  // -Z
+      case 'back': pos = { x: px, y: py, z: pz + sz / 2 + 0.5 }; break;   // +Z
+      case 'center': default: pos = { x: px, y: py, z: pz }; break;
+    }
+
+    pos.x += offset.x || 0;
+    pos.y += offset.y || 0;
+    pos.z += offset.z || 0;
+    return pos;
+  }
 
   /** v6.2.1: `actor` is the player who clicked (multiplayer authority
    * passes the clicker's username so kill/heal/damage/teleport actions hit

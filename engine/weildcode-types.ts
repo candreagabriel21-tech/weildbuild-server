@@ -20,7 +20,10 @@ export type TriggerType =
   // ─── v1.5: GAME-level triggers (attached to the game, not a part) ───
   | 'on_player_join'     // A player joins the game (optional username filter)
   | 'on_player_leave'    // A player leaves the game (optional username filter)
-  | 'on_chat_message';   // A player sends a chat message (optional filters)
+  | 'on_chat_message'    // A player sends a chat message (optional filters)
+  // ─── v7: life-state triggers (rules react to damage + death) ───
+  | 'on_player_damaged'  // A player's health decreases (rules or void)
+  | 'on_player_died';    // A player dies (health hits 0 or the void)
 
 export interface TriggerParam {
   key: string;
@@ -29,6 +32,52 @@ export interface TriggerParam {
   default?: any;
   options?: { label: string; value: string }[];
 }
+
+// ─── v7: comparison operands (the customizable IF condition) ───
+// One side of an if_condition comparison. The editor builds these from a
+// source dropdown + value input; the engine resolves them to a number or
+// string at run time.
+export type OperandSource = 'number' | 'text' | 'variable' | 'player' | 'part';
+
+export interface OperandSpec {
+  source: OperandSource;
+  /** Literal number/text, the variable name (source=variable), or the
+   * target part's name (source=part, blank = the acting part). */
+  value?: string;
+  /** source=player: which stat to read. */
+  stat?: 'health' | 'maxHealth' | 'speed' | 'username';
+  /** source=part: which property to read. */
+  prop?: 'x' | 'y' | 'z' | 'sizeX' | 'sizeY' | 'sizeZ' | 'anchored' | 'canCollide' | 'transparency' | 'reflectance' | 'color' | 'material' | 'name' | 'mass';
+}
+
+/** Build a fresh operand with sensible defaults (used by the editor). */
+export function createBlankOperand(source: OperandSource = 'number'): OperandSpec {
+  if (source === 'player') return { source, stat: 'health' };
+  if (source === 'part') return { source, prop: 'x', value: '' };
+  if (source === 'variable') return { source, value: '' };
+  if (source === 'text') return { source, value: '' };
+  return { source: 'number', value: '0' };
+}
+
+/** The shared "who does this apply to?" selector for player actions. */
+export const PLAYER_TARGET_PARAM = {
+  key: 'target',
+  label: 'Apply to',
+  type: 'select' as const,
+  default: 'this',
+  options: [
+    { label: 'This player (who triggered it)', value: 'this' },
+    { label: 'All players', value: 'all' },
+    { label: 'A specific player (name)...', value: 'username' },
+  ],
+};
+
+export const PLAYER_TARGET_NAME_PARAM = {
+  key: 'playerName',
+  label: 'Player name',
+  type: 'string' as const,
+  default: '',
+};
 
 export interface TriggerDefinition {
   type: TriggerType;
@@ -316,6 +365,37 @@ export const TRIGGER_DEFINITIONS: TriggerDefinition[] = [
       },
     ],
   },
+  // ─── v7: life-state triggers ───
+  {
+    type: 'on_player_damaged',
+    label: 'When a player takes damage',
+    description: 'Fires when a player loses health (rules, damage actions)',
+    icon: 'HeartCrack',
+    gameOnly: true,
+    params: [
+      {
+        key: 'username',
+        label: 'Only this player (blank = everyone)',
+        type: 'string',
+        default: '',
+      },
+    ],
+  },
+  {
+    type: 'on_player_died',
+    label: 'When a player dies',
+    description: 'Fires when a player dies (health reaches 0 or they fall into the void)',
+    icon: 'Skull',
+    gameOnly: true,
+    params: [
+      {
+        key: 'username',
+        label: 'Only this player (blank = everyone)',
+        type: 'string',
+        default: '',
+      },
+    ],
+  },
 ];
 
 // ─── Actions (Things that happen when a trigger fires) ───
@@ -363,12 +443,18 @@ export type ActionType =
   | 'separate_part'       // Model tab: split the part into 2 halves
   | 'add_body_mover'      // Attach a body mover (force/velocity/gyro/...)
   | 'remove_body_mover'   // Remove body movers from the part
-  | 'set_health';         // Set the player's health to a value
+  | 'set_health'          // Set the player's health to a value
+  // ─── v7: control flow, properties, life ───
+  | 'if_condition'        // If / else with a customizable comparison
+  | 'modify_property'     // Change a property (anchored, can collide, ...)
+  | 'set_player_speed'    // Set the player's walk speed
+  | 'set_spawn_point'     // Change where (a) player(s) respawn
+  | 'respawn_player';     // Teleport player(s) to spawn at full health
 
 export interface ActionParam {
   key: string;
   label: string;
-  type: 'number' | 'string' | 'select' | 'vector3' | 'color' | 'boolean' | 'vector3_relative';
+  type: 'number' | 'string' | 'select' | 'vector3' | 'color' | 'boolean' | 'vector3_relative' | 'operand';
   default?: any;
   options?: { label: string; value: string }[];
 }
@@ -382,6 +468,8 @@ export interface ActionDefinition {
   /** If true, this action can contain nested child actions */
   hasChildren?: boolean;
   childLabel?: string;
+  /** v7: if_condition also renders an ELSE column. */
+  elseChildLabel?: string;
 }
 
 /** Full catalog of available actions */
@@ -400,6 +488,13 @@ export const ACTION_DEFINITIONS: ActionDefinition[] = [
       ]},
       { key: 'partName', label: 'Name', type: 'string', default: 'NewPart' },
       { key: 'position', label: 'Position (x,y,z)', type: 'vector3', default: { x: 0, y: 1, z: 0 } },
+      // v7: where the position is measured from.
+      { key: 'relativeTo', label: 'Relative to', type: 'select', default: 'this part', options: [
+        { label: 'This part', value: 'this part' },
+        { label: 'World (absolute)', value: 'world' },
+        { label: 'Another part (name)...', value: 'named part' },
+      ]},
+      { key: 'relativeToName', label: 'Part name', type: 'string', default: '' },
       { key: 'color', label: 'Color', type: 'color', default: '#4ff7f5' },
     ],
   },
@@ -440,6 +535,13 @@ export const ACTION_DEFINITIONS: ActionDefinition[] = [
         { label: 'By offset', value: 'offset' },
       ]},
       { key: 'position', label: 'Position / Offset (x,y,z)', type: 'vector3', default: { x: 0, y: 1, z: 0 } },
+      // v7: move RELATIVE TO another part - the offset is applied to the
+      // named part's CURRENT position (a platform can follow an anchor).
+      { key: 'relativeTo', label: 'Relative to', type: 'select', default: 'self', options: [
+        { label: 'This part (normal)', value: 'self' },
+        { label: 'Another part (name)...', value: 'named' },
+      ]},
+      { key: 'relativeToName', label: 'Part name', type: 'string', default: '' },
     ],
   },
   {
@@ -644,6 +746,8 @@ export const ACTION_DEFINITIONS: ActionDefinition[] = [
     description: 'Teleport the player to a named part (top, bottom, or side)',
     icon: 'MapPin',
     params: [
+      PLAYER_TARGET_PARAM,
+      PLAYER_TARGET_NAME_PARAM,
       { key: 'targetName', label: 'Target part name', type: 'string', default: '' },
       { key: 'face', label: 'Teleport to', type: 'select', default: 'top', options: [
         { label: 'Top of part', value: 'top' },
@@ -663,15 +767,25 @@ export const ACTION_DEFINITIONS: ActionDefinition[] = [
     description: 'Teleport the player to a position. Per-axis "relative" adds to current position.',
     icon: 'Move',
     params: [
+      PLAYER_TARGET_PARAM,
+      PLAYER_TARGET_NAME_PARAM,
       { key: 'position', label: 'Position (x,y,z)', type: 'vector3_relative', default: { x: 0, y: 5, z: 0, relativeX: false, relativeY: false, relativeZ: false } },
+      // v7: teleport next to a named part instead of raw coordinates.
+      { key: 'relativeTo', label: 'Relative to', type: 'select', default: 'none', options: [
+        { label: 'World / per-axis relative (normal)', value: 'none' },
+        { label: 'Another part (name)...', value: 'named' },
+      ]},
+      { key: 'relativeToName', label: 'Part name', type: 'string', default: '' },
     ],
   },
   {
     type: 'modify_player_health',
-    label: 'Modify player\'s health',
+    label: 'Damage / modify player\'s health',
     description: 'Modify the player\'s health by health points. "Relative" adds to current health.',
     icon: 'Heart',
     params: [
+      PLAYER_TARGET_PARAM,
+      PLAYER_TARGET_NAME_PARAM,
       { key: 'health', label: 'Health points', type: 'number', default: -10 },
       { key: 'relative', label: 'Relative (add to current)', type: 'boolean', default: true },
     ],
@@ -681,14 +795,20 @@ export const ACTION_DEFINITIONS: ActionDefinition[] = [
     label: 'Kill player',
     description: 'Set the player\'s health to 0 (kills the player)',
     icon: 'Skull',
-    params: [],
+    params: [
+      PLAYER_TARGET_PARAM,
+      PLAYER_TARGET_NAME_PARAM,
+    ],
   },
   {
     type: 'heal_player',
     label: 'Heal player',
     description: 'Restore the player\'s health to full',
     icon: 'Heart',
-    params: [],
+    params: [
+      PLAYER_TARGET_PARAM,
+      PLAYER_TARGET_NAME_PARAM,
+    ],
   },
   {
     type: 'repeat',
@@ -731,6 +851,9 @@ export const ACTION_DEFINITIONS: ActionDefinition[] = [
     description: 'Show a message on the player\'s screen',
     icon: 'Type',
     params: [
+      // v7: who sees the message ("all players" = classic broadcast).
+      PLAYER_TARGET_PARAM,
+      PLAYER_TARGET_NAME_PARAM,
       { key: 'message', label: 'Message', type: 'string', default: 'Hello, world!' },
       { key: 'position', label: 'Position', type: 'select', default: 'bottom', options: [
         { label: 'Top of screen', value: 'top' },
@@ -902,7 +1025,109 @@ export const ACTION_DEFINITIONS: ActionDefinition[] = [
     description: 'Set the player health to a value (0-100)',
     icon: 'Heart',
     params: [
+      PLAYER_TARGET_PARAM,
+      PLAYER_TARGET_NAME_PARAM,
       { key: 'health', label: 'Health', type: 'number', default: 100 },
+    ],
+  },
+  // ─── v7: control flow, properties, life ───
+  {
+    type: 'if_condition',
+    label: 'If / Else',
+    description: 'Run the THEN actions when the comparison is true, the ELSE actions when it is false',
+    icon: 'GitBranch',
+    params: [
+      { key: 'left', label: 'If', type: 'operand', default: { source: 'player', stat: 'health' } },
+      { key: 'operator', label: 'Comparison', type: 'select', default: '<', options: [
+        { label: '=', value: '=' },
+        { label: '\u2260 (not equal)', value: '!=' },
+        { label: '<', value: '<' },
+        { label: '>', value: '>' },
+        { label: '\u2264 (at most)', value: '<=' },
+        { label: '\u2265 (at least)', value: '>=' },
+        { label: 'contains (text)', value: 'contains' },
+      ]},
+      { key: 'right', label: 'Value', type: 'operand', default: { source: 'number', value: '50' } },
+    ],
+    hasChildren: true,
+    childLabel: 'Then',
+    elseChildLabel: 'Else',
+  },
+  {
+    type: 'modify_property',
+    label: 'Modify property',
+    description: 'Change a property of this part or a named part (anchored, can collide, ...)',
+    icon: 'SlidersHorizontal',
+    params: [
+      { key: 'target', label: 'Target', type: 'select', default: 'self', options: [
+        { label: 'This object', value: 'self' },
+        { label: 'Named object', value: 'named' },
+      ]},
+      { key: 'targetName', label: 'Object name', type: 'string', default: '' },
+      { key: 'property', label: 'Property', type: 'select', default: 'anchored', options: [
+        { label: 'Anchored', value: 'anchored' },
+        { label: 'Can collide', value: 'canCollide' },
+        { label: 'Transparency', value: 'transparency' },
+        { label: 'Reflectance', value: 'reflectance' },
+        { label: 'Friction', value: 'friction' },
+        { label: 'Elasticity', value: 'elasticity' },
+        { label: 'Density', value: 'density' },
+        { label: 'Color', value: 'color' },
+        { label: 'Material', value: 'material' },
+        { label: 'Name', value: 'name' },
+      ]},
+      { key: 'boolValue', label: 'On / Off (anchored, collide)', type: 'boolean', default: true },
+      { key: 'numberValue', label: 'Number (transparency, friction, ...)', type: 'number', default: 0 },
+      { key: 'stringValue', label: 'Text (material, name)', type: 'string', default: '' },
+      { key: 'colorValue', label: 'Color', type: 'color', default: '#4ff7f5' },
+    ],
+  },
+  {
+    type: 'set_player_speed',
+    label: 'Set player speed',
+    description: 'Change how fast the player walks (default 10.8) - make runners, snails, speed boosts',
+    icon: 'Gauge',
+    params: [
+      PLAYER_TARGET_PARAM,
+      PLAYER_TARGET_NAME_PARAM,
+      { key: 'speed', label: 'Speed', type: 'number', default: 10.8 },
+      { key: 'relative', label: 'Relative (add to current)', type: 'boolean', default: false },
+    ],
+  },
+  {
+    type: 'set_spawn_point',
+    label: 'Set spawn point',
+    description: 'Change where the player respawns after dying (a position or next to a part)',
+    icon: 'MapPin',
+    params: [
+      PLAYER_TARGET_PARAM,
+      PLAYER_TARGET_NAME_PARAM,
+      { key: 'at', label: 'Spawn at', type: 'select', default: 'position', options: [
+        { label: 'A position', value: 'position' },
+        { label: 'Next to a part (name)', value: 'part' },
+      ]},
+      { key: 'position', label: 'Position (x,y,z)', type: 'vector3', default: { x: 0, y: 1, z: 0 } },
+      { key: 'partName', label: 'Part name', type: 'string', default: '' },
+      { key: 'face', label: 'Side of part', type: 'select', default: 'top', options: [
+        { label: 'Top of part', value: 'top' },
+        { label: 'Bottom of part', value: 'bottom' },
+        { label: 'Left of part (-X)', value: 'left' },
+        { label: 'Right of part (+X)', value: 'right' },
+        { label: 'Front of part (-Z)', value: 'front' },
+        { label: 'Back of part (+Z)', value: 'back' },
+        { label: 'Center of part', value: 'center' },
+      ]},
+      { key: 'offset', label: 'Offset (x,y,z)', type: 'vector3', default: { x: 0, y: 0, z: 0 } },
+    ],
+  },
+  {
+    type: 'respawn_player',
+    label: 'Respawn player',
+    description: 'Send the player back to their spawn point at full health (no death)',
+    icon: 'RotateCcw',
+    params: [
+      PLAYER_TARGET_PARAM,
+      PLAYER_TARGET_NAME_PARAM,
     ],
   },
 ];
@@ -913,7 +1138,9 @@ export interface WeildCodeAction {
   id: string;
   type: ActionType;
   params: Record<string, any>;
-  children?: WeildCodeAction[];  // Nested actions for repeat/tell_object
+  children?: WeildCodeAction[];  // Nested actions for repeat/tell_object/if(then)
+  /** v7: the ELSE branch of if_condition. */
+  elseChildren?: WeildCodeAction[];
   enabled: boolean;
 }
 
@@ -956,6 +1183,7 @@ export function createBlankAction(type: ActionType): WeildCodeAction {
     type,
     params,
     children: def?.hasChildren ? [] : undefined,
+    elseChildren: def?.elseChildLabel ? [] : undefined,
     enabled: true,
   };
 }
