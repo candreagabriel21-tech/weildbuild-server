@@ -2531,10 +2531,13 @@ export const useStudioStore = create<StudioStore>((set, get) => ({
       makeCharPart('Head', 'head', { x: 0, y: headY + HEAD_H / 2, z: 0 }, { x: HEAD_W, y: HEAD_H, z: HEAD_D }, skinColor),
       makeCharPart('Face', 'face', { x: 0, y: headY + HEAD_H / 2, z: HEAD_D / 2 + 0.002 }, { x: HEAD_W * 0.95, y: HEAD_H * 0.95, z: 0.01 }, skinColor),
       makeCharPart('Torso', 'torso', { x: 0, y: torsoY + TORSO_H / 2, z: 0 }, { x: TORSO_W, y: TORSO_H, z: TORSO_D }, shirtColor),
-      makeCharPart('LeftArm', 'leftArm', { x: -(TORSO_W / 2 + ARM_W / 2 + ARM_GAP), y: torsoY + ARM_H / 2, z: 0 }, { x: ARM_W, y: ARM_H, z: ARM_D }, skinColor),
-      makeCharPart('RightArm', 'rightArm', { x: TORSO_W / 2 + ARM_W / 2 + ARM_GAP, y: torsoY + ARM_H / 2, z: 0 }, { x: ARM_W, y: ARM_H, z: ARM_D }, skinColor),
-      makeCharPart('LeftLeg', 'leftLeg', { x: -(LEG_W / 2 + LEG_GAP / 2), y: LEG_H / 2, z: 0 }, { x: LEG_W, y: LEG_H, z: LEG_D }, pantsColor),
-      makeCharPart('RightLeg', 'rightLeg', { x: LEG_W / 2 + LEG_GAP / 2, y: LEG_H / 2, z: 0 }, { x: LEG_W, y: LEG_H, z: LEG_D }, pantsColor),
+      // PASS-4 FIX (limb swap): the character's own LEFT side is +X (the
+      // platform's characters face +Z at yaw 0, so left = +X, right = -X).
+      // The old placement had left/right swapped everywhere.
+      makeCharPart('LeftArm', 'leftArm', { x: TORSO_W / 2 + ARM_W / 2 + ARM_GAP, y: torsoY + ARM_H / 2, z: 0 }, { x: ARM_W, y: ARM_H, z: ARM_D }, skinColor),
+      makeCharPart('RightArm', 'rightArm', { x: -(TORSO_W / 2 + ARM_W / 2 + ARM_GAP), y: torsoY + ARM_H / 2, z: 0 }, { x: ARM_W, y: ARM_H, z: ARM_D }, skinColor),
+      makeCharPart('LeftLeg', 'leftLeg', { x: LEG_W / 2 + LEG_GAP / 2, y: LEG_H / 2, z: 0 }, { x: LEG_W, y: LEG_H, z: LEG_D }, pantsColor),
+      makeCharPart('RightLeg', 'rightLeg', { x: -(LEG_W / 2 + LEG_GAP / 2), y: LEG_H / 2, z: 0 }, { x: LEG_W, y: LEG_H, z: LEG_D }, pantsColor),
     ];
 
     const newObjects = new Map(state.objects);

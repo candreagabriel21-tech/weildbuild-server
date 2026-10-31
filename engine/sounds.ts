@@ -88,6 +88,16 @@ async function loadSound(name: string): Promise<AudioBuffer | null> {
     // v1.1: the new UI click sound for the candy buttons across the app
     // (login, join, play, sidebar, signout, exit, avatar, leave game).
     click: '/sounds/effects/click.mp3',
+    // v7.1: Tower Sword Fight (Pre-added Game) tool sounds. Loaded on
+    // demand the same way as the effects above; the TSF game module
+    // references these by name via the playSoundCb wired in the hook.
+    tsf_draw_sword: '/sounds/tower-sword-fight/draw_sword.mp3',
+    tsf_draw_regen_staff: '/sounds/tower-sword-fight/draw_regen_staff.mp3',
+    tsf_bazooka_shoot: '/sounds/tower-sword-fight/bazooka_shoot.mp3',
+    tsf_sword_use: '/sounds/tower-sword-fight/sword_use.mp3',
+    // v7.1 pass 4: the grappling hook (the owner's uploaded files).
+    tsf_hook_shoot: '/sounds/tower-sword-fight/hook_shoot.mp3',
+    tsf_grap_hook_select: '/sounds/tower-sword-fight/grap_hook_select.mp3',
   };
 
   const path = paths[name];
@@ -149,6 +159,12 @@ export async function playSound(name: string, volume: number = 0.5): Promise<voi
       scary_laugh: 330,
       used_tool: 520,
       click: 660,
+      tsf_draw_sword: 520,
+      tsf_draw_regen_staff: 440,
+      tsf_bazooka_shoot: 110,
+      tsf_sword_use: 700,
+      tsf_hook_shoot: 900,
+      tsf_grap_hook_select: 620,
     };
     osc.frequency.value = freqs[name] || 440;
     osc.start();

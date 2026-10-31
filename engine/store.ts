@@ -130,6 +130,15 @@ export interface GameData {
    * studio-project.ts. The actual type is StudioProjectState.
    */
   studioState?: any;
+  /**
+   * v7.1: an optional in-game mode tag for Pre-added Games. When set
+   * (e.g. 'tower-sword-fight'), the play viewport activates the matching
+   * embedded game system (combat, NPCs, inventory, ...). Undefined on
+   * user-built games = plain world, no special behavior. Pre-added games
+   * MUST NOT change how the platform treats normal games; this flag only
+   * flips behavior inside the play viewport for the tagged game.
+   */
+  game_mode?: 'tower-sword-fight';
 }
 
 export interface PrimitiveData {
