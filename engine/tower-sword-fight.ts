@@ -62,8 +62,9 @@ export const TSF_MAX_HP = 100;
 export const TSF_SPAWN_INVINCIBLE = 5;       // seconds after (re)spawn
 export const TSF_FLEE_HP_PCT = 0.3;          // NPC flees below this HP fraction
 export const TSF_NPC_SPEED = 7.5;            // studs/sec (under player walk 10.8)
+export const TSF_NPC_SPRINT_SPEED = 12.5;    // pass 5: sprint - ABOVE player walk, used when far + straight-line
 export const TSF_RESPAWN_DELAY = 2.5;        // seconds dead before respawn
-export const TSF_NPC_COUNT = 5;              // pass 4: 5 NPCs, player-hunters only
+export const TSF_NPC_COUNT = 6;              // pass 5: 6 NPCs, player-hunters only
 export const TSF_VOID_Y = -25;               // NPCs below this die (fell/flung off)
 export const TSF_NPC_JUMP_SPEED = 11.5;      // matches CHAR_JUMP_SPEED (player parity)
 
@@ -112,9 +113,8 @@ export const TSF_STAFF_RADIUS = 2;            // 4x4x4
 // first (in flight OR attached), the rope vanishes and the player just
 // falls.
 export const TSF_HOOK_SPEED = 55;             // studs/sec flight
-export const TSF_HOOK_LIFETIME = 10;          // seconds before it is destroyed
-export const TSF_HOOK_ATTACH_HOLD = 30;       // attached: no decay for 30s
-export const TSF_HOOK_COOLDOWN = 11;          // tool cooldown (1s > lifetime)
+export const TSF_HOOK_LIFETIME = 10;          // total life: it ALWAYS decays 10s after firing - attached or not (pass 5)
+export const TSF_HOOK_COOLDOWN = 11;         // tool cooldown (1s > lifetime)
 export const TSF_HOOK_DRAG_SPEED = 26;        // studs/sec pull toward the anchor
 export const TSF_HOOK_ARRIVE_DIST = 1.6;      // stop dragging this close
 export const TSF_HOOK_NPC_RANGE = 60;         // AI: hook only when this far
@@ -184,7 +184,7 @@ export const TSF_CROSSHAIR_TOOLS: ReadonlySet<TSFToolId> = new Set(['bazooka', '
 
 // ─── NPC entity ───
 
-export type TSFNpcMode = 'chase' | 'flee' | 'attack' | 'flee-bomb' | 'ranged' | 'hook-flight';
+export type TSFNpcMode = 'chase' | 'flee' | 'attack' | 'flee-bomb' | 'ranged' | 'hook-flight' | 'dodge' | 'circle';
 
 export interface TSFNpc {
   id: string;
@@ -226,6 +226,13 @@ export interface TSFNpc {
   // Jump bookkeeping.
   jumpCooldown: number;      // seconds until allowed to jump again
   lastGroundedY: number;
+  // Pass-5 duel behavior: circling the player (angle in radians around
+  // the player, plus the direction of orbit ±1).
+  circleAround: number | null;  // the ANGLE to hold while orbiting, null = off
+  circleDir: 1 | -1;
+  // Sprint timer: the AI sets this to run at sprint speed; the tick
+  // decays it (the walk-cycle driver is velocity-based either way).
+  sprintFor: number;
   // A* path (world positions, feet-origin) + progress index.
   path: THREE.Vector3[];
   targetId: string | null;
@@ -253,6 +260,9 @@ export interface TSFBomb {
 
 export interface TSFRocket {
   id: string;
+  /** 'player' or the owning NPC's id (pass 5: NPCs dodge the PLAYER's
+   *  rockets, and a rocket never collides with its own owner). */
+  ownerId: string;
   position: THREE.Vector3;
   velocity: THREE.Vector3;
   life: number;             // seconds until it decays on its own
@@ -261,9 +271,11 @@ export interface TSFRocket {
 
 /**
  * One grappling hook in flight or attached (player OR NPC owned).
- * Lifetime: 10s in flight. On attach: life is REBILLED to 30s and the
- * owner is dragged toward the anchor; on expiry (either phase) the hook
- * is destroyed - if the owner was being dragged, they just fall.
+ * Lifetime (pass 5): the FULL 10 seconds from firing, ALWAYS. Attached
+ * hooks used to rebill to 30s - that's why the rope would hang around
+ * forever. Now: 10s from the shot, attached or not; drag runs while
+ * attached; at 0 the hook (and its rope) is destroyed and the owner, if
+ * being dragged, just falls.
  */
 export interface TSFHook {
   id: string;
@@ -595,6 +607,9 @@ export class TowerSwordFightManager {
   selectTool(tool: TSFToolId | null) {
     if (!this.active || this.player.selectedTool === tool) return;
     this.player.selectedTool = tool;
+    // Pass 5: putting the hook away (switching to anything else) kills
+    // the player's live hook INSTANTLY - rope included.
+    if (this.player.hook?.alive) this.killHook(this.player.hook);
     this.rev++;
     const def = TSF_TOOLS.find((t) => t.id === tool);
     if (def?.drawSound) this.playSoundCb?.(def.drawSound, 0.5);
@@ -640,6 +655,7 @@ export class TowerSwordFightManager {
         origin.addScaledVector(cam, 1.0);
         this.rockets.push({
           id: `tsf-rocket-${this.nextId++}`,
+          ownerId: 'player',
           position: origin,
           velocity: cam.clone().multiplyScalar(TSF_ROCKET_SPEED),
           life: TSF_ROCKET_LIFETIME,
@@ -649,6 +665,8 @@ export class TowerSwordFightManager {
         break;
       }
       case 'hook': {
+        // fireHook kills the previous hook first (one hook per owner) -
+        // re-firing replaces the old hook + rope instantly.
         this.fireHook('player', this.playerPos, cam);
         break;
       }
@@ -736,11 +754,12 @@ export class TowerSwordFightManager {
         this.updateHookRopeFrom(h);
         h.position.addScaledVector(h.velocity, dt);
         h.life -= dt;
-        // Attach: the hook center enters a collidable surface.
+        // Attach: the hook center enters a collidable surface. The life
+        // keeps counting down from the SAME 10s (no rebill) - attached
+        // hooks decay 10s after firing, exactly like the spec.
         if (this.worldHitTest?.(h.position)) {
           h.attached = true;
           h.velocity.set(0, 0, 0);
-          h.life = TSF_HOOK_ATTACH_HOLD;   // attached: no decay for 30s
           this.rev++;
         } else if (h.life <= 0) {
           this.killHook(h);
@@ -795,6 +814,7 @@ export class TowerSwordFightManager {
       if (dist > TSF_HOOK_ARRIVE_DIST) {
         if (npc.body) {
           to.normalize();
+          // The FULL velocity (3-axis): the drag owns the flight.
           npc.body.velocity.set(
             to.x * TSF_HOOK_DRAG_SPEED,
             to.y * TSF_HOOK_DRAG_SPEED,
@@ -1063,6 +1083,9 @@ export class TowerSwordFightManager {
     // Hooks (flight / attach / drag / expire).
     this.tickHooks(dt);
 
+    // Player velocity estimate (pro lead aim for NPC rockets).
+    this.refreshPlayerVel(dt);
+
     // Bombs: spec fuse schedule.
     for (const b of this.bombs) {
       if (!b.alive) continue;
@@ -1099,6 +1122,7 @@ export class TowerSwordFightManager {
       }
       for (const npc of this.npcs) {
         if (!npc.alive) continue;
+        if (r.ownerId === npc.id) continue;   // never collides with its own owner
         if (npc.position.distanceTo(r.position) < 1.4) {
           r.alive = false;
           this.explode(r.position, TSF_ROCKET_RADIUS);
@@ -1175,6 +1199,8 @@ export class TowerSwordFightManager {
     npc.wiggleDir = 1;
     npc.jumpCooldown = 0;
     npc.walkPhase = 0;
+    npc.circleAround = null;
+    npc.sprintFor = 0;
     npc.path = [];
     npc.pathIndex = 0;
     npc.pathRepaintIn = 0;
@@ -1241,46 +1267,157 @@ export class TowerSwordFightManager {
     // The body faces the target when standing, the move dir when walking.
     npc.yaw = this.lerpAngle(npc.yaw, desiredYaw, Math.min(1, dt * 8));
 
-    // RANGED (far): bazooka, or the grappling hook when even farther.
-    if (flatDist > TSF_HOOK_NPC_RANGE && heightGap > 4) {
-      npc.mode = 'ranged';
-      npc.heldTool = 'hook';
-      npc.velocity.set(0, 0, 0);
+    // HOOK-FLIGHT: the drag owns the body velocity - the AI would
+    // clobber it (this is why NPC hooks "never worked"). Skip the AI
+    // entirely until the hook dies or the NPC arrives.
+    if (npc.mode === 'hook-flight') {
       this.decayWalk(npc, dt);
-      this.applyNpcVelocity(npc);
-      if (npc.attackCooldown <= 0 && !npc.hook) {
-        const aim = targetPos.clone().sub(npc.position);
-        aim.y += 1.2; // aim at the chest
-        aim.normalize();
-        // Lead the shot slightly toward the player's head height.
-        this.fireHook(npc.id, npc.position, aim);
-        npc.attackCooldown = TSF_HOOK_COOLDOWN + Math.random() * 2;
-      }
       return;
     }
-    if (flatDist > 30 && flatDist <= TSF_HOOK_NPC_RANGE && heightGap > 4) {
-      npc.mode = 'ranged';
+
+    // Unit direction to the player (flat). Computed once; the ranged,
+    // melee and mid-range branches all steer along it.
+    const straight = toTargetFlat.clone().normalize();
+
+    // The body faces the target when standing, the move dir when walking.
+    npc.yaw = this.lerpAngle(npc.yaw, desiredYaw, Math.min(1, dt * 8));
+
+    // ─── Pass-5 duel behaviors (highest reaction priority) ───
+
+    // DODGE: the PLAYER's rocket is inbound (and this NPC is on its
+    // flight line). Sidestep hard, perpendicular to the rocket's path.
+    // (Aimed at the player's rockets only - NPC rockets are friendly.)
+    const dodge = this.inboundPlayerRocket(npc);
+    if (dodge && npc.invincibleFor <= 0) {
+      npc.mode = 'dodge';
       npc.heldTool = 'bazooka';
-      npc.velocity.set(0, 0, 0);
-      this.decayWalk(npc, dt);
+      const awayFromLine = new THREE.Vector3(-dodge.dir.z, 0, dodge.dir.x) // right normal
+        .multiplyScalar(dodge.side);
+      npc.velocity.copy(awayFromLine).multiplyScalar(TSF_NPC_SPRINT_SPEED * 0.92);
+      npc.yaw = this.lerpAngle(npc.yaw, Math.atan2(awayFromLine.x, awayFromLine.z), Math.min(1, dt * 12));
+      if (npc.jumpCooldown <= 0 && Math.random() < 0.25) this.tryNpcJump(npc, 0);
+      this.advanceWalk(npc, dt);
       this.applyNpcVelocity(npc);
-      if (npc.attackCooldown <= 0) {
-        const aim = targetPos.clone().sub(npc.position);
-        aim.y += 1.2;
-        aim.normalize();
-        const origin = npc.position.clone();
-        origin.y += 1.2;
-        origin.addScaledVector(aim, 1.0);
-        this.rockets.push({
-          id: `tsf-rocket-${this.nextId++}`,
-          position: origin,
-          velocity: aim.multiplyScalar(TSF_ROCKET_SPEED),
-          life: TSF_ROCKET_LIFETIME,
-          alive: true,
-        });
-        this.playSoundCb?.('tsf_bazooka_shoot', 0.4);
-        npc.attackCooldown = TSF_ROCKET_COOLDOWN + Math.random() * 2;
-        this.rev++;
+      return;
+    }
+
+    // CIRCLE: the player is swinging a SWORD at close range. The NPC
+    // jumps and orbits around the player, staying OUTSIDE the blade
+    // arc while still pressing the attack (it circles with its sword
+    // out, ready to counter the moment the swing ends).
+    const playerSwinging = this.player.swingTimer > 0;
+    if (playerSwinging && flatDist <= 5.5) {
+      npc.mode = 'circle';
+      npc.heldTool = 'sword';
+      if (npc.circleAround === null) {
+        npc.circleAround = Math.atan2(npc.position.x - targetPos.x, npc.position.z - targetPos.z);
+        npc.circleDir = Math.random() < 0.5 ? 1 : -1;
+        if (npc.jumpCooldown <= 0) this.tryNpcJump(npc, 0);   // hop as the swing comes in
+      }
+      // Hold a radius just outside the sword arc (3.2) + a small margin.
+      const holdR = TSF_SWORD_RANGE + 0.9;
+      const orbitSpeed = 0.9 * Math.PI * 2 * (TSF_NPC_SPEED / holdR); // rad/sec at NPC speed
+      npc.circleAround += orbitSpeed * dt * npc.circleDir;
+      const cx = targetPos.x + Math.sin(npc.circleAround) * holdR;
+      const cz = targetPos.z + Math.cos(npc.circleAround) * holdR;
+      const toHold = new THREE.Vector3(cx - npc.position.x, 0, cz - npc.position.z);
+      if (toHold.lengthSq() > 0.04) {
+        toHold.normalize();
+        npc.velocity.copy(toHold).multiplyScalar(TSF_NPC_SPEED);
+        npc.yaw = this.lerpAngle(npc.yaw, Math.atan2(toHold.x, toHold.z), Math.min(1, dt * 10));
+      } else {
+        npc.velocity.set(0, 0, 0);
+        npc.yaw = this.lerpAngle(npc.yaw, desiredYaw, Math.min(1, dt * 10));   // face the player
+      }
+      this.advanceWalk(npc, dt);
+      this.applyNpcVelocity(npc);
+      return;
+    } else if (npc.circleAround !== null && !playerSwinging) {
+      npc.circleAround = null;   // the swing is over - back to normal
+    }
+
+    // ─── RANGED: fire on the move, keep closing in (pass 5) ───
+    // The bazooka is the FAVORED tool: it's used from 10..70 studs out,
+    // at any height. The hook is the specialist tool: only when the
+    // player is far away AND there's a clear anchor cast - a wall, a
+    // tower side, or the ground the hook can bite into between the NPC
+    // and the player. Both fire WHILE WALKING toward the player; the
+    // AI never stands still at range anymore.
+    const canSeePlayer = !this.straightBlocked(npc.position, targetPos) || heightGap > 4;
+    if (flatDist > 10 && flatDist <= 70 && canSeePlayer && npc.invincibleFor <= 0) {
+      npc.mode = 'ranged';
+
+      // Walk toward the player (closing in, per the owner's spec).
+      let dir: THREE.Vector3;
+      const needsPath = heightGap > 3 || this.straightBlocked(npc.position, targetPos);
+      if (needsPath) {
+        if (npc.pathRepaintIn <= 0) {
+          npc.path = this.computePath(npc.position, targetPos);
+          npc.pathIndex = 0;
+          npc.pathRepaintIn = 1.2;
+        }
+        npc.pathRepaintIn = Math.max(0, npc.pathRepaintIn - dt);
+        const wp = this.nextWaypoint(npc);
+        if (wp) {
+          const toWp = wp.clone().sub(npc.position);
+          toWp.y = 0;
+          dir = toWp.lengthSq() > 1 ? toWp.normalize() : straight;
+        } else dir = straight;
+      } else {
+        npc.path = [];
+        npc.pathIndex = 0;
+        dir = straight;
+      }
+      dir = this.avoidEdge(npc, dir, targetPos) ?? dir;
+      npc.velocity.copy(dir).multiplyScalar(TSF_NPC_SPEED);
+      npc.yaw = this.lerpAngle(npc.yaw, Math.atan2(dir.x, dir.z), Math.min(1, dt * 10));
+      this.advanceWalk(npc, dt);
+      this.applyNpcVelocity(npc);
+
+      // ── Tool choice: BAZOOKA first (favored), hook as the specialist ──
+      // Pro aim: lead the target's motion (the player keeps moving
+      // while the rocket flies).
+      const leadT = flatDist / TSF_ROCKET_SPEED;
+      const aimAt = targetPos.clone()
+        .addScaledVector(this.lastPlayerVel(), leadT * 0.85);
+      aimAt.y += 1.2;   // chest height
+
+      const hookClear = flatDist > TSF_HOOK_NPC_MIN_RANGE + 8
+        && this.hookAnchorCastClear(npc.position, targetPos);
+      const useHook = flatDist > TSF_HOOK_NPC_RANGE && hookClear;
+
+      if (useHook) {
+        npc.heldTool = 'hook';
+        if (npc.attackCooldown <= 0 && !npc.hook) {
+          // Pro hook cast: aim at a surface that will actually catch the
+          // hook - the ground/platform just BEHIND the player on their
+          // side, so the drag pulls the NPC right at them.
+          const aim = this.proHookAim(npc.position, targetPos);
+          if (aim) {
+            this.fireHook(npc.id, npc.position, aim);
+            npc.attackCooldown = TSF_HOOK_COOLDOWN + Math.random() * 2;
+          }
+        }
+      } else {
+        npc.heldTool = 'bazooka';
+        if (npc.attackCooldown <= 0) {
+          const aim = aimAt.clone().sub(npc.position);
+          aim.normalize();
+          const origin = npc.position.clone();
+          origin.y += 1.2;
+          origin.addScaledVector(aim, 1.0);
+          this.rockets.push({
+            id: `tsf-rocket-${this.nextId++}`,
+            ownerId: npc.id,
+            position: origin,
+            velocity: aim.multiplyScalar(TSF_ROCKET_SPEED),
+            life: TSF_ROCKET_LIFETIME,
+            alive: true,
+          });
+          this.playSoundCb?.('tsf_bazooka_shoot', 0.4);
+          npc.attackCooldown = TSF_ROCKET_COOLDOWN + Math.random() * 1.5;
+          this.rev++;
+        }
       }
       return;
     }
@@ -1315,14 +1452,15 @@ export class TowerSwordFightManager {
       return;
     }
 
-    // MID RANGE: path toward the player.
+    // MID RANGE (2.6..10, or unreachable-ranged leftovers): path toward
+    // the player.
     npc.mode = 'chase';
     npc.heldTool = flatDist > 12 ? 'bazooka' : 'sword';
     let dir: THREE.Vector3;
 
     // Pathfinding: A* over the walk graph when the straight line is
     // blocked or the target is on another level; otherwise straight.
-    const straight = toTargetFlat.clone().normalize();
+    // (`straight` is declared before the ranged branch above.)
     const needsPath = heightGap > 3 || this.straightBlocked(npc.position, targetPos);
     if (needsPath) {
       if (npc.pathRepaintIn <= 0) {
@@ -1370,13 +1508,39 @@ export class TowerSwordFightManager {
       npc.stuckProbe = { x: npc.position.x, z: npc.position.z, t: 0 };
     }
 
+    // APPROACH THE PLAYER'S HOOK (pass 5): the player's hook is flying
+    // toward something - the NPC steers to converge with the anchor
+    // spot, i.e. walks toward where the hook is going to bite.
+    const playerHook = this.hooks.find(
+      (hh) => hh.ownerId === 'player' && hh.alive && !hh.attached,
+    );
+    if (playerHook) {
+      const spot = playerHook.position.clone().addScaledVector(playerHook.velocity, 0.35); // ~0.35s ahead
+      const toSpot = spot.clone().sub(npc.position);
+      toSpot.y = 0;
+      if (toSpot.length() > 4) {
+        const blended = dir.clone().add(toSpot.normalize().multiplyScalar(0.8));
+        if (blended.lengthSq() > 0.001) dir = blended.normalize();
+      }
+    }
+
+    // SPRINT (pass 5): far away + a clear straight line = SPRINT. The
+    // owner's spec: NPCs close distance like they mean it (their sprint
+    // is ABOVE the player's walk speed).
+    const farSprint = flatDist > 26
+      && !needsPath
+      && Math.abs(toTarget.y) < 4;
+    npc.sprintFor = farSprint ? 0.4 : 0;
+    const speed = farSprint ? TSF_NPC_SPRINT_SPEED : TSF_NPC_SPEED;
+
     // Mid-range jump: hopping while closing in keeps the pressure on and
-    // clears small lips.
-    if (npc.jumpCooldown <= 0 && flatDist > 6 && flatDist < 26 && Math.random() < 0.008) {
+    // clears small lips. Pass 5: MORE often (the owner wants lively
+    // NPCs), and always a hop on the final approach.
+    if (npc.jumpCooldown <= 0 && flatDist > 4 && flatDist < 30 && Math.random() < 0.05) {
       this.tryNpcJump(npc, 0);
     }
 
-    npc.velocity.copy(dir).multiplyScalar(TSF_NPC_SPEED);
+    npc.velocity.copy(dir).multiplyScalar(speed);
     npc.yaw = this.lerpAngle(npc.yaw, Math.atan2(dir.x, dir.z), Math.min(1, dt * 10));
     this.advanceWalk(npc, dt);
     this.applyNpcVelocity(npc);
@@ -1484,6 +1648,135 @@ export class TowerSwordFightManager {
     return best;
   }
 
+  /** The player's last observed velocity (a small EMA; also recorded in
+   *  tick() every frame). Used for pro lead aim. */
+  private lastPlayerVelCache = new THREE.Vector3();
+  private lastPlayerVelAnchor: THREE.Vector3 | null = null;
+  private lastPlayerVel(): THREE.Vector3 {
+    // The caller wants a read-only reference; refresh is done in tick().
+    return this.lastPlayerVelCache;
+  }
+  private refreshPlayerVel(dt: number) {
+    if (dt <= 0) return;
+    // First call: just seed the anchor, no velocity yet.
+    if (this.lastPlayerVelAnchor === null) {
+      this.lastPlayerVelAnchor = this.playerPos.clone();
+      return;
+    }
+    const inst = new THREE.Vector3(
+      (this.playerPos.x - this.lastPlayerVelAnchor.x) / dt,
+      0,   // flat aim only - vertical lead fights the arc
+      (this.playerPos.z - this.lastPlayerVelAnchor.z) / dt,
+    );
+    // Clamp to sane values (teleports shouldn't fake a 500-stud sprint).
+    if (inst.length() > 30) inst.setLength(30);
+    this.lastPlayerVelCache.lerp(inst, Math.min(1, dt * 6));
+    this.lastPlayerVelAnchor.copy(this.playerPos);
+  }
+
+  /**
+   * The PLAYER's rocket inbound on this NPC, if any: returns the
+   * rocket's unit flight direction + which side this NPC should
+   * sidestep to (the side it's ALREADY off the line by). NPCs do NOT
+   * dodge NPC rockets (those are friendly). Only rockets that would
+   * arrive within ~1.6s count - later ones get re-checked each frame.
+   */
+  private inboundPlayerRocket(npc: TSFNpc): { rocket: TSFRocket; dir: THREE.Vector3; side: 1 | -1 } | null {
+    for (const r of this.rockets) {
+      if (!r.alive || r.ownerId !== 'player') continue;
+      const rel = npc.position.clone().sub(r.position);
+      rel.y = 0;
+      const dir = r.velocity.clone(); dir.y = 0;
+      const speed = dir.length();
+      if (speed < 1) continue;
+      dir.divideScalar(speed);
+      const along = rel.dot(dir);                       // how far down the flight line
+      const flat = rel.length();
+      if (along <= 0 || along > TSF_ROCKET_SPEED * 1.6) continue;   // behind / too far ahead
+      const offLine = Math.sqrt(Math.max(0, flat * flat - along * along));
+      if (offLine > 3.4) continue;                      // not actually aimed at us
+      const cross = dir.x * rel.z - dir.z * rel.x;      // sign of our offset
+      const side: 1 | -1 = cross >= 0 ? -1 : 1;        // step AWAY from the line
+      return { rocket: r, dir, side };
+    }
+    return null;
+  }
+
+  /**
+   * Pro hook cast precondition: is there a surface for the hook to
+   * BITE between here and the player (or just beyond them)? Samples
+   * the flight line at chest height; true if any sample is inside
+   * geometry. Without this, NPCs wasted hooks into the open air.
+   */
+  private hookAnchorCastClear(from: THREE.Vector3, to: THREE.Vector3): boolean {
+    if (!this.worldHitTest) return false;
+    const dir = to.clone().sub(from);
+    const len = dir.length();
+    if (len < 4) return false;
+    dir.normalize();
+    const steps = Math.min(30, Math.max(6, Math.floor(len / 1.5)));
+    for (let i = 1; i <= steps; i++) {
+      const t = i / steps;
+      const p = from.clone().addScaledVector(dir, len * t);
+      p.y += 1.2;   // chest height on the flight line
+      if (i === steps) {
+        // The last sample: try a hair PAST the player too - the tower
+        // side behind them is the anchor that actually catches.
+        const past = from.clone().addScaledVector(dir, len * t + 2.2);
+        past.y += 1.2;
+        if (this.worldHitTest(p) || this.worldHitTest(past)) return true;
+        continue;
+      }
+      if (this.worldHitTest(p)) return true;
+    }
+    return false;
+  }
+
+  /**
+   * Pro hook aim: pick the exact direction that lands the hook ON a
+   * surface (the first geometry the flight ray from the NPC's fist
+   * hits, biased toward the player's tower). Returns null when nothing
+   * catches within range - the AI then doesn't waste the shot.
+   */
+  private proHookAim(from: THREE.Vector3, to: THREE.Vector3): THREE.Vector3 | null {
+    if (!this.worldHitTest) return null;
+    const origin = from.clone();
+    origin.y += 1.2;
+    // Candidate directions: straight at the player's chest, plus a few
+    // pitched variants (their tower side is usually up-slope).
+    const base = to.clone().sub(origin);
+    const len = base.length();
+    if (len < 4) return null;
+    const forward = base.clone().normalize();
+    const cands: THREE.Vector3[] = [forward];
+    const right = new THREE.Vector3(-forward.z, 0, forward.x).normalize();
+    for (const pitch of [0.25, 0.45, 0.7]) {
+      cands.push(forward.clone().addScaledVector(right, 0).setY(forward.y + pitch).normalize());
+      cands.push(forward.clone().addScaledVector(right, pitch * 0.6).setY(forward.y + pitch * 0.5).normalize());
+      cands.push(forward.clone().addScaledVector(right, -pitch * 0.6).setY(forward.y + pitch * 0.5).normalize());
+    }
+    cands.push(new THREE.Vector3(forward.x, forward.y + 0.9, forward.z).normalize());
+    for (const c of cands) {
+      // Walk the ray; the first hit within TSF_HOOK_LIFETIME * speed
+      // that ISN'T the NPC's own body column is our anchor.
+      for (let d = 2; d < Math.min(TSF_HOOK_SPEED * TSF_HOOK_LIFETIME, len + 8); d += 1.1) {
+        const p = origin.clone().addScaledVector(c, d);
+        if (this.worldHitTest(p)) {
+          // Ignore hits within 2.5 of the NPC (its own platform lip).
+          if (p.distanceTo(origin) < 2.5) break;
+          return c;
+        }
+      }
+    }
+    return null;
+  }
+
+  /**
+   * Shared rocket firing (player + NPC). Kept inline at the call sites
+   * (they differ in origin), but the owner tag + sound live here for
+   * the NPC path.
+   */
+
   /** Push the AI's desired horizontal velocity into the world. */
   private applyNpcVelocity(npc: TSFNpc) {
     if (npc.body) {
@@ -1532,6 +1825,9 @@ export class TowerSwordFightManager {
       jumping: false,
       jumpCooldown: 0,
       lastGroundedY: spawn.y,
+      circleAround: null,
+      circleDir: 1,
+      sprintFor: 0,
       targetId: null,
       stuckFor: 0,
       wiggleFor: 0,
