@@ -75,6 +75,11 @@ export const TSF_SWORD_DAMAGE = 20;
 export const TSF_SWORD_COOLDOWN = 0.8;
 export const TSF_SWORD_RANGE = 3.2;
 export const TSF_SWORD_ARC = Math.PI * 0.55;
+// Pass 6: the sword arc is checked FLAT (X/Z) - without this vertical
+// gate an NPC on the ground could hit a player standing on a tower 10
+// studs above (and vice versa). ~2.2 = one body height + a small margin:
+// same level or one small step connects, a tower height does not.
+export const TSF_SWORD_Y_TOLERANCE = 2.2;
 export const TSF_SWING_TIME = 0.45;            // seconds, wall-to-wall
 export const TSF_SWING_CONTACT_AT = 0.6;       // fraction of the swing when damage lands
 
@@ -184,7 +189,7 @@ export const TSF_CROSSHAIR_TOOLS: ReadonlySet<TSFToolId> = new Set(['bazooka', '
 
 // ─── NPC entity ───
 
-export type TSFNpcMode = 'chase' | 'flee' | 'attack' | 'flee-bomb' | 'ranged' | 'hook-flight' | 'dodge' | 'circle';
+export type TSFNpcMode = 'chase' | 'flee' | 'attack' | 'flee-bomb' | 'ranged' | 'hook-flight' | 'circle';
 
 export interface TSFNpc {
   id: string;
@@ -858,11 +863,11 @@ export class TowerSwordFightManager {
     if (!npc || !npc.alive) return;
     if (npc.invincibleFor > 0) return;
     npc.hp = Math.max(0, npc.hp - amount);
-    if (npc.hp <= 0) this.killNpc(npc, true);
+    if (npc.hp <= 0) this.killNpc(npc);
     this.rev++;
   }
 
-  private killNpc(npc: TSFNpc, byPlayer: boolean) {
+  private killNpc(npc: TSFNpc) {
     if (!npc.alive) return;
     npc.alive = false;
     npc.respawnIn = TSF_RESPAWN_DELAY;
@@ -880,7 +885,11 @@ export class TowerSwordFightManager {
       { size: [0.34, 0.69, 0.39], color: npc.pants, off: [0.19, 0.34, 0] },
     ]);
     this.removeNpcBody(npc);
-    if (byPlayer) this.player.kills++;
+    // Pass 6: EVERY NPC death ticks the player's kill counter - including
+    // NPC-on-NPC "accidents" (their own rocket splash, a mixup bomb) and
+    // void falls. The counter is the session scoreboard; there is no other
+    // player to credit.
+    this.player.kills++;
     this.playSoundCb?.('scream', 0.5);
     this.rev++;
   }
@@ -967,6 +976,9 @@ export class TowerSwordFightManager {
       for (const npc of this.npcs) {
         if (!npc.alive || npc.invincibleFor > 0) continue;
         const to = npc.position.clone().sub(origin);
+        // Pass 6: the sword arc is FLAT - gate the hit on vertical overlap
+        // FIRST. No more hitting a player on a tower from the ground.
+        if (Math.abs(to.y) > TSF_SWORD_Y_TOLERANCE) continue;
         to.y = 0;
         const dist = to.length();
         if (dist > TSF_SWORD_RANGE) continue;
@@ -975,9 +987,23 @@ export class TowerSwordFightManager {
           if (dot < Math.cos(TSF_SWORD_ARC)) continue;
         }
         this.damageNpc(npc.id, TSF_SWORD_DAMAGE);
+        // Pass 6 (owner's spec): a 50% chance the struck NPC "dodges" -
+        // an evasive hop away from the player the instant the blade
+        // lands. Replaces the old bazooka-dodge behavior.
+        if (npc.alive && npc.body && Math.random() < 0.5) {
+          const away = npc.position.clone().sub(this.playerPos);
+          away.y = 0;
+          if (away.lengthSq() < 0.001) away.set(Math.random() - 0.5, 0, Math.random() - 0.5);
+          away.normalize();
+          this.tryNpcJump(npc, 0.5);
+          npc.body.velocity.x = away.x * TSF_NPC_SPEED * 1.15;
+          npc.body.velocity.z = away.z * TSF_NPC_SPEED * 1.15;
+        }
       }
     } else if (this.player.alive && this.player.invincibleFor <= 0) {
       const to = this.playerPos.clone().sub(origin);
+      // Pass 6: same vertical gate for NPC swings at the player.
+      if (Math.abs(to.y) > TSF_SWORD_Y_TOLERANCE) return;
       to.y = 0;
       const dist = to.length();
       if (dist <= TSF_SWORD_RANGE) {
@@ -1015,6 +1041,30 @@ export class TowerSwordFightManager {
 
   /** Random respawn point for the host to feed spawnPointOverride. */
   getRandomRespawn(): { x: number; y: number; z: number } {
+    return this.randomSpawn();
+  }
+
+  /**
+   * Pass 6: a death the manager can't see coming - the player falling
+   * into the void (or any host-side kill outside TSF combat). TSF
+   * combat deaths already kill the hook + count the death inside
+   * damagePlayer(); the void path went straight to the host's death
+   * animation, leaving a live hook + rope hanging in the air and no
+   * DEATHS tick (the owner's "string doesn't decay if you die" report).
+   * Idempotent per death: it does nothing while the manager's player
+   * is already dead. Returns a FRESH random spawn for the respawn
+   * teleport, or null when the call was a no-op.
+   */
+  externalDeath(): { x: number; y: number; z: number } | null {
+    if (!this.active) return null;
+    if (!this.player.alive) return null;   // already counted (TSF path)
+    this.player.hp = 0;
+    this.player.alive = false;
+    this.player.deaths++;
+    if (this.player.hook) this.killHook(this.player.hook);
+    // Hand the death back through the SAME flow a TSF death uses: the
+    // host plays the animation, then respawns at the returned spawn.
+    this.onPlayerDieCb?.();
     return this.randomSpawn();
   }
 
@@ -1168,9 +1218,11 @@ export class TowerSwordFightManager {
       // Jumping flag for the renderer's jump pose (airborne = fast vy).
       npc.jumping = npc.body ? Math.abs(npc.body.velocity.y) > 3 : false;
       npc.lastGroundedY = npc.position.y;
-      // Void check (fallen / flung off the map).
+      // Void check (fallen / flung off the map). Counts as a kill for
+      // the player too (pass 6: every NPC death ticks the scoreboard -
+      // most void falls START with an NPC rocket/bomb fling).
       if (npc.position.y < TSF_VOID_Y) {
-        this.killNpc(npc, false);
+        this.killNpc(npc);
         this.rev++;
         continue;
       }
@@ -1282,24 +1334,20 @@ export class TowerSwordFightManager {
     // The body faces the target when standing, the move dir when walking.
     npc.yaw = this.lerpAngle(npc.yaw, desiredYaw, Math.min(1, dt * 8));
 
-    // ─── Pass-5 duel behaviors (highest reaction priority) ───
+    // ─── Pass-6 behaviors ───
 
-    // DODGE: the PLAYER's rocket is inbound (and this NPC is on its
-    // flight line). Sidestep hard, perpendicular to the rocket's path.
-    // (Aimed at the player's rockets only - NPC rockets are friendly.)
-    const dodge = this.inboundPlayerRocket(npc);
-    if (dodge && npc.invincibleFor <= 0) {
-      npc.mode = 'dodge';
-      npc.heldTool = 'bazooka';
-      const awayFromLine = new THREE.Vector3(-dodge.dir.z, 0, dodge.dir.x) // right normal
-        .multiplyScalar(dodge.side);
-      npc.velocity.copy(awayFromLine).multiplyScalar(TSF_NPC_SPRINT_SPEED * 0.92);
-      npc.yaw = this.lerpAngle(npc.yaw, Math.atan2(awayFromLine.x, awayFromLine.z), Math.min(1, dt * 12));
-      if (npc.jumpCooldown <= 0 && Math.random() < 0.25) this.tryNpcJump(npc, 0);
-      this.advanceWalk(npc, dt);
-      this.applyNpcVelocity(npc);
-      return;
+    // DROPPED THE HOOK (owner's spec): an NPC that switches away from
+    // the grappling hook (or holsters it to flee) loses its live hook
+    // INSTANTLY, exactly like the player's put-away rule. Otherwise a
+    // fleeing NPC kept dragging itself around on a rope nobody could
+    // see a reason for.
+    if (npc.heldTool !== 'hook' && npc.hook?.alive) {
+      this.killHook(npc.hook);
     }
+
+    // DODGE is REMOVED (pass 6, owner's spec: "remove the dodging
+    // missile from bazooka feature"). The only dodge left in the game
+    // is the 50% sword-hit hop in resolveSwordHit.
 
     // CIRCLE: the player is swinging a SWORD at close range. The NPC
     // jumps and orbits around the player, staying OUTSIDE the blade
@@ -1343,7 +1391,13 @@ export class TowerSwordFightManager {
     // tower side, or the ground the hook can bite into between the NPC
     // and the player. Both fire WHILE WALKING toward the player; the
     // AI never stands still at range anymore.
-    const canSeePlayer = !this.straightBlocked(npc.position, targetPos) || heightGap > 4;
+    // Pass 6: canSeePlayer is a TRUE 3D line-of-sight now. The old
+    // height-gap escape hatch let NPCs fire rockets and hooks
+    // straight through walls whenever the player was on a different
+    // height - that's the owner's "they try to shoot through walls"
+    // report. No more: a wall between the NPC and the player means no
+    // shot; the AI closes in instead.
+    const canSeePlayer = !this.straightBlocked(npc.position, targetPos);
     if (flatDist > 10 && flatDist <= 70 && canSeePlayer && npc.invincibleFor <= 0) {
       npc.mode = 'ranged';
 
@@ -1675,32 +1729,14 @@ export class TowerSwordFightManager {
   }
 
   /**
-   * The PLAYER's rocket inbound on this NPC, if any: returns the
+   * The player's rocket inbound on this NPC, if any: returns the
    * rocket's unit flight direction + which side this NPC should
    * sidestep to (the side it's ALREADY off the line by). NPCs do NOT
    * dodge NPC rockets (those are friendly). Only rockets that would
    * arrive within ~1.6s count - later ones get re-checked each frame.
+   * REMOVED pass 6 (owner's spec): the bazooka-dodge behavior is gone;
+   * nothing calls this anymore. Kept out entirely.
    */
-  private inboundPlayerRocket(npc: TSFNpc): { rocket: TSFRocket; dir: THREE.Vector3; side: 1 | -1 } | null {
-    for (const r of this.rockets) {
-      if (!r.alive || r.ownerId !== 'player') continue;
-      const rel = npc.position.clone().sub(r.position);
-      rel.y = 0;
-      const dir = r.velocity.clone(); dir.y = 0;
-      const speed = dir.length();
-      if (speed < 1) continue;
-      dir.divideScalar(speed);
-      const along = rel.dot(dir);                       // how far down the flight line
-      const flat = rel.length();
-      if (along <= 0 || along > TSF_ROCKET_SPEED * 1.6) continue;   // behind / too far ahead
-      const offLine = Math.sqrt(Math.max(0, flat * flat - along * along));
-      if (offLine > 3.4) continue;                      // not actually aimed at us
-      const cross = dir.x * rel.z - dir.z * rel.x;      // sign of our offset
-      const side: 1 | -1 = cross >= 0 ? -1 : 1;        // step AWAY from the line
-      return { rocket: r, dir, side };
-    }
-    return null;
-  }
 
   /**
    * Pro hook cast precondition: is there a surface for the hook to

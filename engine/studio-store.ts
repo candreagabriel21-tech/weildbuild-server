@@ -3014,3 +3014,11 @@ export const useStudioStore = create<StudioStore>((set, get) => ({
   },
 }));
 
+// E2E/dev handle (matches __weildPhysicsWorld / __tsfManager): live
+// verification scripts and the studio can drive the store from the
+// console, e.g. restoring the embedded Tower Sword Fight arena for its
+// card thumbnail capture.
+if (typeof window !== 'undefined') {
+  (window as any).__weildStudioStore = useStudioStore;
+}
+
