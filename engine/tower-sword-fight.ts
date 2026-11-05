@@ -119,10 +119,16 @@ export const TSF_STAFF_RADIUS = 2;            // 4x4x4
 // falls.
 export const TSF_HOOK_SPEED = 55;             // studs/sec flight
 export const TSF_HOOK_LIFETIME = 10;          // total life: it ALWAYS decays 10s after firing - attached or not (pass 5)
-export const TSF_HOOK_COOLDOWN = 11;         // tool cooldown (1s > lifetime)
+export const TSF_HOOK_COOLDOWN = 11;         // tool cooldown (player; 1s > lifetime)
+// v7.1 pass 7 (owner's spec: "let NPCs use the grapple hook more
+// often"): NPCs get their OWN, much shorter hook cooldown so they can
+// re-fire every few seconds instead of waiting the player's 11s. They
+// also fire from a lower range threshold so the hook is their go-to
+// gap-closer across most of the ranged band, not just the far edge.
+export const TSF_HOOK_NPC_COOLDOWN = 4;      // NPC-only hook cooldown (<< player's 11)
 export const TSF_HOOK_DRAG_SPEED = 26;        // studs/sec pull toward the anchor
 export const TSF_HOOK_ARRIVE_DIST = 1.6;      // stop dragging this close
-export const TSF_HOOK_NPC_RANGE = 60;         // AI: hook only when this far
+export const TSF_HOOK_NPC_RANGE = 32;         // AI: prefer the hook from this far (was 60 - only the far edge)
 export const TSF_HOOK_NPC_MIN_RANGE = 18;     // ...and at least this far (else walk)
 
 // NPC hitbox: identical to the player's default pill (the platform's
@@ -155,6 +161,25 @@ export const TSF_PLAYER_BRIDGE: TSFPlayerBridge = {
   x: 0, y: 0, z: 0, bodyYaw: 0, camX: 0, camY: 0, camZ: 1, camYaw: 0, grounded: true,
 };
 
+// ─── Aim bridge (v7.1 pass 7, owner's spec) ───
+// The bazooka + grappling hook no longer fire along the camera's view
+// direction (the center-screen crosshair). They fire toward the WORLD
+// POINT UNDER THE CURSOR: click a tower, the rocket/hook goes there.
+// To convert a screen click into a world aim, the manager needs the
+// live R3F camera + the canvas DOM element. Both live INSIDE the Canvas
+// (useThree), but playerUseTool is called from OUTSIDE it (the window
+// mousedown listener in StudioPlayViewport). So an in-Canvas component
+// (TsfAimSync) writes them here every mount; the click handler reads
+// them to build the click NDC, and the manager raycasts through it.
+export const TSF_AIM: { camera: THREE.Camera | null; dom: HTMLCanvasElement | null } = {
+  camera: null,
+  dom: null,
+};
+export function setTsfAimCamera(camera: THREE.Camera | null, dom: HTMLCanvasElement | null) {
+  TSF_AIM.camera = camera;
+  TSF_AIM.dom = dom;
+}
+
 /** The player's right-arm rotation override (radians about X; null = the
  *  normal walk animation owns the arm). Set per frame by the TSF view,
  *  applied by CharacterPartsRenderer (player) and WeildBuildCharacter
@@ -183,9 +208,14 @@ export const TSF_TOOLS: TSFToolDef[] = [
   { id: 'hook',    label: 'Hook',    hotkey: '5', cooldown: TSF_HOOK_COOLDOWN,  drawSound: 'tsf_grap_hook_select', useSound: 'tsf_hook_shoot',        icon: 'hook' },
 ];
 
-/** Tools that show the aiming crosshair while held (spec: bazooka; the
- *  hook uses the same crosshair per the owner's pass-4 spec). */
-export const TSF_CROSSHAIR_TOOLS: ReadonlySet<TSFToolId> = new Set(['bazooka', 'hook']);
+/** Tools that show the aiming crosshair while held.
+ *  v7.1 pass 7 (owner's spec): the bazooka + grappling hook no longer
+ *  require the crosshair - they fire toward the world point under the
+ *  cursor instead of the screen center. The center-screen reticle is
+ *  no longer the aim reference, so neither tool shows it anymore. The
+ *  set is kept (empty) so the view's crosshair component still early-
+ *  returns; the symbol stays imported everywhere it was before. */
+export const TSF_CROSSHAIR_TOOLS: ReadonlySet<TSFToolId> = new Set();
 
 // ─── NPC entity ───
 
@@ -606,6 +636,43 @@ export class TowerSwordFightManager {
     return new THREE.Vector3(TSF_PLAYER_BRIDGE.camX, TSF_PLAYER_BRIDGE.camY, TSF_PLAYER_BRIDGE.camZ);
   }
 
+  /** v7.1 pass 7: the aim direction for a CLICK. Builds a ray from the
+   *  R3F camera through the click's screen NDC, marches it against the
+   *  arena's collidable surfaces (the same worldHitTest the rockets use)
+   *  to find the world point under the cursor, and returns the NORMALIZED
+   *  direction from the player's muzzle (chest height) to that point - so
+   *  the bazooka rocket / grappling hook converge on the spot you clicked
+   *  regardless of the camera's offset from the player. If the ray hits
+   *  nothing (clicked the open sky), it aims at a far point along the ray.
+   *  Falls back to the camera view direction when the camera isn't wired
+   *  up yet (no TsfAimSync) so the tool still fires. */
+  private aimFromClick(ndcX: number, ndcY: number): THREE.Vector3 {
+    const cam = TSF_AIM.camera;
+    if (!cam) return this.getPlayerCamDir();
+    const ray = new THREE.Raycaster();
+    ray.setFromCamera(new THREE.Vector2(ndcX, ndcY), cam);
+    const ro = ray.ray.origin;       // camera world position
+    const rd = ray.ray.direction;    // already normalized
+    // March the ray to the first collidable surface under the cursor.
+    let target: THREE.Vector3 | null = null;
+    if (this.worldHitTest) {
+      const maxDist = 160;
+      for (let d = 1.0; d <= maxDist; d += 1.0) {
+        const p = ro.clone().addScaledVector(rd, d);
+        if (this.worldHitTest(p)) { target = p; break; }
+      }
+    }
+    if (!target) target = ro.clone().addScaledVector(rd, 120);
+    // Aim from the muzzle (chest height at the player's feet-origin), not
+    // from the camera - the rocket spawns here, so this is what makes it
+    // actually fly TO the clicked point instead of parallel to the ray.
+    const muzzle = this.playerPos.clone();
+    muzzle.y += 1.2;
+    const aim = target.clone().sub(muzzle);
+    if (aim.lengthSq() < 1e-4) return this.getPlayerCamDir();
+    return aim.normalize();
+  }
+
   getPlayerPos(): THREE.Vector3 { return this.playerPos; }
   getPlayerBodyYaw(): number { return TSF_PLAYER_BRIDGE.bodyYaw; }
 
@@ -620,8 +687,14 @@ export class TowerSwordFightManager {
     if (def?.drawSound) this.playSoundCb?.(def.drawSound, 0.5);
   }
 
-  /** Player used the selected tool (click / E). Returns true if it fired. */
-  playerUseTool(): boolean {
+  /** Player used the selected tool (click / E). Returns true if it fired.
+   *
+   *  v7.1 pass 7 (owner's spec): the bazooka + grappling hook no longer
+   *  require the crosshair. Pass the click's NDC (screen-space -1..1,
+   *  y-up) and they fire toward the WORLD POINT UNDER THE CURSOR instead
+   *  of the screen center. null (the E key, or a click we couldn't map)
+   *  falls back to the camera view direction so the keyboard still works. */
+  playerUseTool(clickNdc: { x: number; y: number } | null = null): boolean {
     if (!this.active || !this.player.alive) return false;
     const tool = this.player.selectedTool;
     if (!tool) return false;
@@ -631,8 +704,15 @@ export class TowerSwordFightManager {
     this.player.cooldowns[tool] = def.cooldown;
     if (def.useSound) this.playSoundCb?.(def.useSound, 0.55);
 
-    // Tools aim along the CAMERA view direction (the crosshair).
+    // The sword/bomb/staff still aim along the camera view direction
+    // (center screen). The bazooka + hook aim at the clicked world point
+    // when a click NDC is available; otherwise they fall back to the
+    // camera direction (E key, or no canvas bound yet).
     const cam = this.getPlayerCamDir();
+    const aim =
+      clickNdc && (tool === 'bazooka' || tool === 'hook')
+        ? this.aimFromClick(clickNdc.x, clickNdc.y)
+        : cam;
 
     switch (tool) {
       case 'sword': {
@@ -657,12 +737,12 @@ export class TowerSwordFightManager {
       case 'bazooka': {
         const origin = this.playerPos.clone();
         origin.y += 1.2;
-        origin.addScaledVector(cam, 1.0);
+        origin.addScaledVector(aim, 1.0);
         this.rockets.push({
           id: `tsf-rocket-${this.nextId++}`,
           ownerId: 'player',
           position: origin,
-          velocity: cam.clone().multiplyScalar(TSF_ROCKET_SPEED),
+          velocity: aim.clone().multiplyScalar(TSF_ROCKET_SPEED),
           life: TSF_ROCKET_LIFETIME,
           alive: true,
         });
@@ -672,7 +752,7 @@ export class TowerSwordFightManager {
       case 'hook': {
         // fireHook kills the previous hook first (one hook per owner) -
         // re-firing replaces the old hook + rope instantly.
-        this.fireHook('player', this.playerPos, cam);
+        this.fireHook('player', this.playerPos, aim);
         break;
       }
       case 'staff': {
@@ -1449,7 +1529,9 @@ export class TowerSwordFightManager {
           const aim = this.proHookAim(npc.position, targetPos);
           if (aim) {
             this.fireHook(npc.id, npc.position, aim);
-            npc.attackCooldown = TSF_HOOK_COOLDOWN + Math.random() * 2;
+            // v7.1 pass 7: NPC-only cooldown (TSF_HOOK_NPC_COOLDOWN), much
+            // shorter than the player's 11s, so NPCs re-fire the hook often.
+            npc.attackCooldown = TSF_HOOK_NPC_COOLDOWN + Math.random() * 0.8;
           }
         }
       } else {
