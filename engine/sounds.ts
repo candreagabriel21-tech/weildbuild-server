@@ -98,6 +98,17 @@ async function loadSound(name: string): Promise<AudioBuffer | null> {
     // v7.1 pass 4: the grappling hook (the owner's uploaded files).
     tsf_hook_shoot: '/sounds/tower-sword-fight/hook_shoot.mp3',
     tsf_grap_hook_select: '/sounds/tower-sword-fight/grap_hook_select.mp3',
+    // v7.1 pass 10: Build to Survive (Pre-added Game). The zombie .m4a/.mp3
+    // clips weren't uploaded with the world, so these fall back to the
+    // synthesized tone in the freqs table below until the owner drops the
+    // real files into /sounds/build-to-survive/.
+    bts_place: '/sounds/build-to-survive/place.mp3',
+    bts_break: '/sounds/build-to-survive/break.mp3',
+    bts_claim: '/sounds/build-to-survive/claim.mp3',
+    bts_zombie_sound: '/sounds/build-to-survive/zombie_sound.m4a',
+    bts_zombie_attack: '/sounds/build-to-survive/zombie_attack.mp3',
+    bts_disaster_warn: '/sounds/build-to-survive/disaster_warn.mp3',
+    bts_survive: '/sounds/build-to-survive/survive.mp3',
   };
 
   const path = paths[name];
@@ -165,6 +176,13 @@ export async function playSound(name: string, volume: number = 0.5): Promise<voi
       tsf_sword_use: 700,
       tsf_hook_shoot: 900,
       tsf_grap_hook_select: 620,
+      bts_place: 660,
+      bts_break: 180,
+      bts_claim: 880,
+      bts_zombie_sound: 90,
+      bts_zombie_attack: 140,
+      bts_disaster_warn: 220,
+      bts_survive: 990,
     };
     osc.frequency.value = freqs[name] || 440;
     osc.start();

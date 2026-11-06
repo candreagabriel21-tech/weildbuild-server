@@ -7,9 +7,9 @@
 // the player's live transform through a bridge, and drives the studio
 // store / physics world for damage + placed-block collision.
 //
-// PHASES: build (5 min, claim a plot, place/break parts, saves to the
+// PHASES: build (2:30, claim a plot, place/break parts, saves to the
 // device) -> disaster (one of 7: tsunami, flood, meteorites, acid rain,
-// zombies, the ground is lava, tornado) -> next round (keep your build).
+// zombies, the ground is lava, tornado; lasts 20s) -> next round (keep your build).
 //
 // PLACED BLOCKS are real studio objects added via useStudioStore.addObject,
 // so the existing PartMesh renders them and rebuildIfNeeded() (which fires
@@ -28,16 +28,18 @@ import {
   BTS_PLOTS, BTS_DISASTER, BTS_DISASTERS, BTS_DISASTER_NAMES,
   type BtsPlot, type BtsDisasterId,
 } from '@/data/buildToSurviveArena';
-import { BTS_PARTS, type BtsPartDef } from '@/data/buildToSurviveItems';
+import { BTS_PARTS, type BtsPartDef, type BtsToolId } from '@/data/buildToSurviveItems';
 
 // ─── Constants ───
 const BTS_MAX_HP = 100;
 const BTS_INVINCIBLE = 3;          // spawn invincibility (s)
-const BTS_BUILD_TIME = BTS_DISASTER.BUILD_TIME_SECONDS;     // 300
-const BTS_DISASTER_TIME = 60;      // survive this long
+const BTS_BUILD_TIME = BTS_DISASTER.BUILD_TIME_SECONDS;     // 150 (2:30)
+const BTS_DISASTER_TIME = 20;      // survive this long (pass 11: 20s)
 const BTS_BLOCK_SIZE = 1;          // grid cell size
 const BTS_BREAK_HOLD = 2;          // hold to break (s) - spec
 const BTS_PLACE_COOLDOWN = 0.18;   // anti-spam between placements (s)
+const BTS_REACH = 7;               // pass 11: raycast reach (blocks)
+const BTS_PLOT_FLOOR = 0.625;      // pass 11: plot slab top - blocks rest on it
 
 // Zombie tuning (spec: 20 zombies, 20 dmg on touch, forest-green + plain shirt + camo pants + spooked face)
 const BTS_ZOMBIE_COUNT = BTS_DISASTER.ZOMBIE_COUNT;
@@ -93,9 +95,14 @@ export function setBtsAimCamera(camera: THREE.Camera | null, dom: HTMLElement | 
   BTS_AIM.dom = dom;
 }
 
+// pass 11: the right-arm override ref (mirrors TSF_ARM_OVERRIDE). The held-
+// tool renderer writes the tool-hold angle here each frame; WeildBuildCharacter
+// (the player) reads it via rightArmRotationRef and overrides the walk anim.
+export const BTS_ARM_OVERRIDE: { current: number | null } = { current: null };
+
 // ─── Types ───
 export type BtsPhase = 'build' | 'disaster' | 'ended';
-export type BtsMode = 'place' | 'break' | null;
+export type BtsMode = 'place' | 'break' | 'wrench' | null;
 
 export interface BtsPlacedBlock {
   id: string;
@@ -104,6 +111,7 @@ export interface BtsPlacedBlock {
   cell: [number, number];     // integer grid cell [cx, cz]
   y: number;                  // centre y
   sizeY: number;
+  rot: [number, number, number]; // pass 11: wrench rotation (Euler XYZ degrees)
 }
 
 export interface BtsZombie {
@@ -123,6 +131,9 @@ export interface BtsGhost {
   shape: BtsPlacedBlock['shape']; color: string;
   x: number; y: number; z: number; sizeY: number;
   breakId: string | null; breakProgress: number; // 0..1
+  // pass 11: raycast-driven placement target + wrench selection.
+  placeCx: number; placeCy: number; placeCz: number;
+  wrenchId: string | null;
 }
 
 export interface BtsDisasterState {
@@ -148,6 +159,11 @@ export interface BtsSnapshot {
   claimedPlotId: string | null;
   mode: BtsMode;
   selectedPartId: string | null;
+  // pass 11: tool + wrench selection + plot proximity + claimer name.
+  tool: BtsToolId | null;
+  wrenchSelectedId: string | null;
+  currentPlotId: string | null;   // plot the player is standing in (claim pop-up)
+  claimerName: string;            // who claimed the local player's plot (labels)
   ghost: BtsGhost;
   disaster: BtsDisasterState;
   zombies: BtsZombie[];
@@ -168,7 +184,7 @@ export function btsPlotAt(x: number, z: number): BtsPlot | null {
 
 /** Build a studio object for a placed part (added via addObject -> auto render + collide). */
 let btsIdCounter = 1;
-function makePlacedPart(def: BtsPartDef, cx: number, cy: number, cz: number): any {
+function makePlacedPart(def: BtsPartDef, cx: number, cy: number, cz: number, rot: [number, number, number] = [0, 0, 0]): any {
   const id = `bts_placed_${Date.now().toString(36)}_${btsIdCounter++}`;
   const isSphere = def.shape === 'Sphere';
   const isWedge = def.shape === 'Wedge';
@@ -178,7 +194,7 @@ function makePlacedPart(def: BtsPartDef, cx: number, cy: number, cz: number): an
     type: def.shape,
     position: { x: cx, y: cy, z: cz },
     size: { x: BTS_BLOCK_SIZE, y: BTS_BLOCK_SIZE, z: BTS_BLOCK_SIZE },
-    rotation: { x: 0, y: 0, z: 0 },
+    rotation: { x: rot[0], y: rot[1], z: rot[2] },
     color: def.color,
     material: 'Plastic',
     transparency: 0,
@@ -217,6 +233,12 @@ export class BuildToSurviveManager {
 
   mode: BtsMode = null;
   selectedPartId: string | null = null;
+  // pass 11: the active tool (hammer/pickaxe/wrench) + the wrench-selected
+  // block + the local player's name (drives the plot-claim labels).
+  tool: BtsToolId | null = null;
+  wrenchSelectedId: string | null = null;
+  localUsername = 'You';
+  claimerName = '';
   private placeCd = 0;
   private breakHoldId: string | null = null;
   private breakHoldT = 0;
@@ -252,6 +274,7 @@ export class BuildToSurviveManager {
   onPlayerDie(cb: () => void) { this.onPlayerDieCb = cb; }
   onPhaseChange(cb: (phase: BtsPhase, disaster: BtsDisasterId | null) => void) { this.onPhaseCb = cb; }
   setPlaySound(cb: (name: string, vol?: number) => void) { this.playSoundCb = cb; }
+  setLocalUsername(name: string) { this.localUsername = name; }
 
   // ─── Lifecycle ───
   tryStart(): boolean {
@@ -282,6 +305,9 @@ export class BuildToSurviveManager {
     this.tornado = null;
     this.mode = null;
     this.selectedPartId = null;
+    this.tool = null;
+    this.wrenchSelectedId = null;
+    this.claimerName = '';
   }
 
   // ─── Plot claim ───
@@ -290,28 +316,106 @@ export class BuildToSurviveManager {
     const p = btsPlotAt(this.playerPos.x, this.playerPos.z);
     if (!p) return { ok: false, reason: 'stand on a plot to claim it' };
     this.claimedPlot = p;
+    this.claimerName = this.localUsername;
     // Load any saved build for this plot from the device.
     this.loadBuild(p.id);
     this.playSoundCb?.('bts_claim', 0.6);
     return { ok: true, plot: p };
   }
 
-  /** The cell the player is aiming at (in front of them, snapped to the grid). */
-  private aimCell(): { cx: number; cz: number; valid: boolean } {
-    const d = this.camDir;
-    const horiz = new THREE.Vector3(d.x, 0, d.z);
-    if (horiz.lengthSq() < 1e-4) horiz.set(0, 0, -1);
-    horiz.normalize();
-    const reach = 4.5;
-    const tx = this.playerPos.x + horiz.x * reach;
-    const tz = this.playerPos.z + horiz.z * reach;
-    const cx = gridSnap(tx);
-    const cz = gridSnap(tz);
+  /** Minecraft-like raycast from the camera through the aim point against
+   *  the placed blocks + the plot floor (pass 11). Returns the first hit,
+   *  its face normal, and the cell a new block would occupy if placed on
+   *  that face (so you can place on tops AND sides, like Minecraft). Reach
+   *  is BTS_REACH blocks; the plot floor sits at BTS_PLOT_FLOOR so blocks
+   *  rest on top of the plot slab, not embedded in it. */
+  private raycastAim(): {
+    hitBlock: BtsPlacedBlock | null;
+    groundHit: boolean;
+    point: THREE.Vector3;
+    normal: THREE.Vector3;
+    place: { cx: number; cy: number; cz: number };
+    valid: boolean;
+  } {
+    const cam = BTS_AIM.camera;
+    const origin = cam
+      ? cam.position.clone()
+      : new THREE.Vector3(this.playerPos.x, this.playerPos.y + 1.5, this.playerPos.z);
+    const dir = this.camDir.lengthSq() > 1e-6 ? this.camDir.clone().normalize() : new THREE.Vector3(0, 0, -1);
+    const reach = BTS_REACH;
+
+    let bestT = Infinity;
+    let bestBlock: BtsPlacedBlock | null = null;
+    const bestPoint = new THREE.Vector3();
+    const bestNormal = new THREE.Vector3(0, 1, 0);
+
+    // Slab-method ray-AABB against each placed block (unit cubes).
+    for (const b of this.placed.values()) {
+      const cx = b.cell[0], cz = b.cell[1];
+      const hx = BTS_BLOCK_SIZE / 2, hy = b.sizeY / 2, hz = BTS_BLOCK_SIZE / 2;
+      const minX = cx - hx, maxX = cx + hx;
+      const minY = b.y - hy, maxY = b.y + hy;
+      const minZ = cz - hz, maxZ = cz + hz;
+      // Parallel-axis guard: if the ray is parallel to a slab and the
+      // origin is outside it, no hit on this block; if inside, that axis
+      // imposes no constraint (±1e18 sentinel).
+      const sx = Math.abs(dir.x) < 1e-8 ? (origin.x >= minX && origin.x <= maxX ? -1e18 : 1e18) : 1 / dir.x;
+      const sy = Math.abs(dir.y) < 1e-8 ? (origin.y >= minY && origin.y <= maxY ? -1e18 : 1e18) : 1 / dir.y;
+      const sz = Math.abs(dir.z) < 1e-8 ? (origin.z >= minZ && origin.z <= maxZ ? -1e18 : 1e18) : 1 / dir.z;
+      const tx1 = (minX - origin.x) * sx, tx2 = (maxX - origin.x) * sx;
+      const ty1 = (minY - origin.y) * sy, ty2 = (maxY - origin.y) * sy;
+      const tz1 = (minZ - origin.z) * sz, tz2 = (maxZ - origin.z) * sz;
+      const tmin = Math.max(Math.min(tx1, tx2), Math.min(ty1, ty2), Math.min(tz1, tz2));
+      const tmax = Math.min(Math.max(tx1, tx2), Math.max(ty1, ty2), Math.max(tz1, tz2));
+      if (tmax < Math.max(0, tmin) || tmin > reach) continue;
+      const t = Math.max(0, tmin);
+      if (t < bestT) {
+        bestT = t;
+        bestBlock = b;
+        bestPoint.copy(origin).addScaledVector(dir, t);
+        // Face normal: the axis whose hit point is nearest its slab face.
+        const lx = bestPoint.x - cx, ly = bestPoint.y - b.y, lz = bestPoint.z - cz;
+        const ax = Math.abs(lx) / hx, ay = Math.abs(ly) / hy, az = Math.abs(lz) / hz;
+        if (ax >= ay && ax >= az) bestNormal.set(lx > 0 ? 1 : -1, 0, 0);
+        else if (ay >= ax && ay >= az) bestNormal.set(0, ly > 0 ? 1 : -1, 0);
+        else bestNormal.set(0, 0, lz > 0 ? 1 : -1);
+      }
+    }
+
+    // Plot floor plane (y = BTS_PLOT_FLOOR) - only if no block is closer.
+    if (dir.y < -1e-4) {
+      const t = (BTS_PLOT_FLOOR - origin.y) / dir.y;
+      if (t >= 0 && t < reach && t < bestT) {
+        const px = origin.x + dir.x * t, pz = origin.z + dir.z * t;
+        if (this.claimedPlot &&
+            px >= this.claimedPlot.xMin && px <= this.claimedPlot.xMax &&
+            pz >= this.claimedPlot.zMin && pz <= this.claimedPlot.zMax) {
+          bestT = t; bestBlock = null;
+          bestPoint.set(px, BTS_PLOT_FLOOR, pz);
+          bestNormal.set(0, 1, 0);
+        }
+      }
+    }
+    const groundHit = !bestBlock && bestT < Infinity;
+
+    // Place target = the cell adjacent to the hit face.
+    const place = { cx: 0, cy: 0, cz: 0 };
+    if (bestBlock) {
+      place.cx = bestBlock.cell[0] + Math.round(bestNormal.x);
+      place.cz = bestBlock.cell[1] + Math.round(bestNormal.z);
+      place.cy = bestBlock.y + bestNormal.y * bestBlock.sizeY;
+    } else if (groundHit) {
+      place.cx = gridSnap(bestPoint.x);
+      place.cz = gridSnap(bestPoint.z);
+      place.cy = BTS_PLOT_FLOOR + BTS_BLOCK_SIZE / 2;
+    }
+
     const valid = !!this.claimedPlot &&
-      cx >= this.claimedPlot.xMin && cx <= this.claimedPlot.xMax &&
-      cz >= this.claimedPlot.zMin && cz <= this.claimedPlot.zMax &&
-      (this.playerPos.y + 8) < BTS_DISASTER.BUILD_HEIGHT_MAX;
-    return { cx, cz, valid };
+      place.cx >= this.claimedPlot.xMin && place.cx <= this.claimedPlot.xMax &&
+      place.cz >= this.claimedPlot.zMin && place.cz <= this.claimedPlot.zMax &&
+      (place.cy + BTS_BLOCK_SIZE / 2) < BTS_DISASTER.BUILD_HEIGHT_MAX;
+
+    return { hitBlock: bestBlock, groundHit, point: bestPoint, normal: bestNormal, place, valid };
   }
 
   /** Top surface y at a cell (baseplate top 0.5, or the highest placed block there). */
@@ -338,11 +442,28 @@ export class BuildToSurviveManager {
     return best;
   }
 
-  // ─── Part selection / mode ───
+  // ─── Tool / part selection (pass 11: hammer / pickaxe / wrench) ───
+  selectTool(tool: BtsToolId | null) {
+    this.tool = tool;
+    this.wrenchSelectedId = null;
+    this.breakHoldId = null; this.breakHoldT = 0;
+    if (tool === 'hammer') {
+      // place mode only if a part is already chosen; otherwise the menu opens
+      this.mode = this.selectedPartId ? 'place' : null;
+    } else if (tool === 'pickaxe') {
+      this.mode = 'break'; this.selectedPartId = null;
+    } else if (tool === 'wrench') {
+      this.mode = 'wrench'; this.selectedPartId = null;
+    } else {
+      this.mode = null; this.selectedPartId = null;
+    }
+  }
   selectPart(partId: string | null) {
-    if (partId === null) { this.mode = null; this.selectedPartId = null; return; }
+    if (partId === null) { this.selectedPartId = null; if (this.tool === 'hammer') this.mode = null; return; }
     this.selectedPartId = partId;
+    this.tool = 'hammer';
     this.mode = 'place';
+    this.wrenchSelectedId = null;
     this.breakHoldId = null; this.breakHoldT = 0;
   }
   setMode(mode: BtsMode) {
@@ -355,17 +476,16 @@ export class BuildToSurviveManager {
     if (this.phase === 'build') this.beginDisaster();
   }
 
-  // ─── Place / break (triggered by the host on click / tap) ───
+  // ─── Place / break / select / rotate (triggered by the host on click / tap) ───
   private placeAtGhost() {
-    if (this.phase !== 'build' || !this.claimedPlot || this.mode !== 'place' || !this.selectedPartId) return;
+    if (this.phase !== 'build' || !this.claimedPlot || this.tool !== 'hammer' || !this.selectedPartId) return;
     if (this.placeCd > 0) return;
     const def = BTS_PARTS.find(p => p.id === this.selectedPartId);
     if (!def) return;
-    const { cx, cz, valid } = this.aimCell();
-    if (!valid) return;
-    const top = this.cellTopY(cx, cz);
+    const aim = this.raycastAim();
+    if (!aim.valid) return;
+    const { cx, cy, cz } = aim.place;
     const sizeY = BTS_BLOCK_SIZE;
-    const cy = top + sizeY / 2;
     if (cy + sizeY / 2 > BTS_DISASTER.BUILD_HEIGHT_MAX) return;
     const part = makePlacedPart(def, cx, cy, cz);
     try {
@@ -373,37 +493,55 @@ export class BuildToSurviveManager {
     } catch { return; }
     this.placed.set(part.id, {
       id: part.id, shape: def.shape, color: def.color,
-      cell: [cx, cz], y: cy, sizeY,
+      cell: [cx, cz], y: cy, sizeY, rot: [0, 0, 0],
     });
     this.placeCd = BTS_PLACE_COOLDOWN;
     this.playSoundCb?.('bts_place', 0.5);
     this.saveBuild();
   }
 
-  /** Break button held: progress toward removing the top block at the aim cell. */
-  private tickBreak(dt: number) {
-    if (this.phase !== 'build' || this.mode !== 'break' || !this.claimedPlot) {
-      this.breakHoldId = null; this.breakHoldT = 0; return;
-    }
-    const { cx, cz } = this.aimCell();
-    const top = this.topBlockAt(cx, cz);
-    if (!top) { this.breakHoldId = null; this.breakHoldT = 0; return; }
-    if (this.breakHoldId !== top.id) { this.breakHoldId = top.id; this.breakHoldT = 0; }
-    this.breakHoldT += dt;
-    if (this.breakHoldT >= BTS_BREAK_HOLD) {
-      try { useStudioStore.getState().removeObject(top.id); } catch { /* gone */ }
-      this.placed.delete(top.id);
-      this.breakHoldId = null; this.breakHoldT = 0;
-      this.playSoundCb?.('bts_break', 0.6);
-      this.saveBuild();
-    }
+  /** Pickaxe: instantly break the block under the aim ray (no hold timer). */
+  private breakAtAim() {
+    if (this.phase !== 'build' || this.tool !== 'pickaxe') return;
+    const aim = this.raycastAim();
+    const target = aim.hitBlock;
+    if (!target) return;
+    try { useStudioStore.getState().removeObject(target.id); } catch { /* gone */ }
+    this.placed.delete(target.id);
+    if (this.wrenchSelectedId === target.id) this.wrenchSelectedId = null;
+    this.playSoundCb?.('bts_break', 0.6);
+    this.saveBuild();
   }
 
-  /** Host calls this on the place/break trigger key or button. */
+  /** Wrench: select the block under the aim ray for rotation. */
+  private selectAtAim() {
+    if (this.phase !== 'build' || this.tool !== 'wrench') return;
+    const aim = this.raycastAim();
+    this.wrenchSelectedId = aim.hitBlock ? aim.hitBlock.id : null;
+  }
+
+  /** Wrench: rotate the selected block 90deg on the given axis (x / y / z).
+   *  The block is a real 3D studio object, so its rotation is written back
+   *  to the store and re-rendered immediately. */
+  rotateSelected(axis: 'x' | 'y' | 'z') {
+    if (this.phase !== 'build' || this.tool !== 'wrench' || !this.wrenchSelectedId) return;
+    const b = this.placed.get(this.wrenchSelectedId);
+    if (!b) { this.wrenchSelectedId = null; return; }
+    const i = axis === 'x' ? 0 : axis === 'y' ? 1 : 2;
+    b.rot[i] = (b.rot[i] + 90) % 360;
+    try {
+      useStudioStore.getState().updateObject(b.id, { rotation: { x: b.rot[0], y: b.rot[1], z: b.rot[2] } });
+    } catch { /* ignore */ }
+    this.playSoundCb?.('bts_place', 0.3);
+    this.saveBuild();
+  }
+
+  /** Host calls this on the click/tap trigger (place / break / select). */
   triggerAction() {
     if (this.phase !== 'build') return;
-    if (this.mode === 'place') this.placeAtGhost();
-    // break uses the hold timer in tick(), not a one-shot trigger.
+    if (this.tool === 'hammer') this.placeAtGhost();
+    else if (this.tool === 'pickaxe') this.breakAtAim();
+    else if (this.tool === 'wrench') this.selectAtAim();
   }
 
   // ─── Save / load (per device, per plot) ───
@@ -412,7 +550,7 @@ export class BuildToSurviveManager {
     if (!this.claimedPlot) return;
     try {
       const rows = [...this.placed.values()].map(b => ({
-        shape: b.shape, color: b.color, cell: b.cell, y: b.y, sizeY: b.sizeY,
+        shape: b.shape, color: b.color, cell: b.cell, y: b.y, sizeY: b.sizeY, rot: b.rot,
       }));
       localStorage.setItem(this.saveKey(), JSON.stringify(rows));
     } catch { /* storage full / disabled */ }
@@ -423,12 +561,13 @@ export class BuildToSurviveManager {
     if (!Array.isArray(rows) || rows.length === 0) return;
     for (const r of rows) {
       const def = BTS_PARTS.find(p => p.shape === r.shape && p.color === r.color) || BTS_PARTS[0];
-      const part = makePlacedPart(def, r.cell[0], r.y, r.cell[1]);
+      const rot: [number, number, number] = Array.isArray(r.rot) ? r.rot : [0, 0, 0];
+      const part = makePlacedPart(def, r.cell[0], r.y, r.cell[1], rot);
       part.color = r.color; part._shape = r.shape;
       try { useStudioStore.getState().addObject(part); } catch { continue; }
       this.placed.set(part.id, {
         id: part.id, shape: r.shape, color: r.color,
-        cell: r.cell as [number, number], y: r.y, sizeY: r.sizeY,
+        cell: r.cell as [number, number], y: r.y, sizeY: r.sizeY, rot,
       });
     }
   }
@@ -474,6 +613,8 @@ export class BuildToSurviveManager {
     };
     this.mode = null;
     this.selectedPartId = null;
+    this.tool = null;
+    this.wrenchSelectedId = null;
     this.breakHoldId = null; this.breakHoldT = 0;
     if (id === 'zombies') this.spawnZombies();
     if (id === 'tornado') {
@@ -534,7 +675,6 @@ export class BuildToSurviveManager {
 
     if (this.phase === 'build') {
       this.buildTimer -= dt;
-      this.tickBreak(dt);
       if (this.buildTimer <= 0) this.beginDisaster();
     } else if (this.phase === 'disaster') {
       this.disasterT -= dt;
@@ -694,27 +834,25 @@ export class BuildToSurviveManager {
 
   // ─── Snapshot (read by the host HUD + scene each frame) ───
   private buildGhost(): BtsGhost {
-    if (this.phase !== 'build' || !this.claimedPlot || this.mode === null) {
-      return { visible: false, valid: false, mode: null, shape: 'Block', color: '#fff', x: 0, y: 0, z: 0, sizeY: 1, breakId: null, breakProgress: 0 };
-    }
-    const { cx, cz, valid } = this.aimCell();
+    const empty: BtsGhost = { visible: false, valid: false, mode: null, shape: 'Block', color: '#fff', x: 0, y: 0, z: 0, sizeY: 1, breakId: null, breakProgress: 0, placeCx: 0, placeCy: 0, placeCz: 0, wrenchId: null };
+    if (this.phase !== 'build' || !this.claimedPlot || !this.tool) return empty;
+    const aim = this.raycastAim();
     const def = this.selectedPartId ? BTS_PARTS.find(p => p.id === this.selectedPartId) : null;
-    if (this.mode === 'place' && def) {
-      const top = this.cellTopY(cx, cz);
-      const cy = top + BTS_BLOCK_SIZE / 2;
-      return { visible: true, valid, mode: 'place', shape: def.shape, color: def.color, x: cx, y: cy, z: cz, sizeY: BTS_BLOCK_SIZE, breakId: null, breakProgress: 0 };
+    if (this.tool === 'hammer' && def) {
+      const { cx, cy, cz } = aim.place;
+      return { visible: true, valid: aim.valid, mode: 'place', shape: def.shape, color: def.color, x: cx, y: cy, z: cz, sizeY: BTS_BLOCK_SIZE, breakId: null, breakProgress: 0, placeCx: cx, placeCy: cy, placeCz: cz, wrenchId: null };
     }
-    if (this.mode === 'break') {
-      const top = this.topBlockAt(cx, cz);
-      const progress = this.breakHoldId ? Math.min(1, this.breakHoldT / BTS_BREAK_HOLD) : 0;
-      return {
-        visible: !!top, valid: !!top, mode: 'break',
-        shape: top?.shape ?? 'Block', color: top?.color ?? '#fff',
-        x: cx, y: top?.y ?? 0, z: cz, sizeY: top?.sizeY ?? 1,
-        breakId: top?.id ?? null, breakProgress: progress,
-      };
+    if (this.tool === 'pickaxe') {
+      const b = aim.hitBlock;
+      return { visible: !!b, valid: !!b, mode: 'break', shape: b?.shape ?? 'Block', color: b?.color ?? '#fff', x: b?.cell[0] ?? 0, y: b?.y ?? 0, z: b?.cell[1] ?? 0, sizeY: b?.sizeY ?? 1, breakId: b?.id ?? null, breakProgress: 1, placeCx: 0, placeCy: 0, placeCz: 0, wrenchId: null };
     }
-    return { visible: false, valid: false, mode: null, shape: 'Block', color: '#fff', x: 0, y: 0, z: 0, sizeY: 1, breakId: null, breakProgress: 0 };
+    if (this.tool === 'wrench') {
+      const b = aim.hitBlock;
+      const sel = this.wrenchSelectedId ? this.placed.get(this.wrenchSelectedId) : null;
+      const shown = sel ?? b;
+      return { visible: !!shown, valid: !!shown, mode: 'wrench', shape: shown?.shape ?? 'Block', color: shown?.color ?? '#fff', x: shown?.cell[0] ?? 0, y: shown?.y ?? 0, z: shown?.cell[1] ?? 0, sizeY: shown?.sizeY ?? 1, breakId: null, breakProgress: 0, placeCx: 0, placeCy: 0, placeCz: 0, wrenchId: this.wrenchSelectedId };
+    }
+    return empty;
   }
 
   getSnapshot(): BtsSnapshot {
@@ -727,6 +865,10 @@ export class BuildToSurviveManager {
       claimedPlotId: this.claimedPlot?.id ?? null,
       mode: this.mode,
       selectedPartId: this.selectedPartId,
+      tool: this.tool,
+      wrenchSelectedId: this.wrenchSelectedId,
+      currentPlotId: btsPlotAt(this.playerPos.x, this.playerPos.z)?.id ?? null,
+      claimerName: this.claimerName,
       ghost: this.buildGhost(),
       disaster: {
         ...this.disaster,
