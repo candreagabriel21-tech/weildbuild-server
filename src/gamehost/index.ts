@@ -25,6 +25,7 @@ import { verifyTicket } from "../shared/jwt";
 import { corsOrigin } from "../shared/http";
 import { GameInstanceManager, GameInstance } from "./instances";
 import { WorldSimManager, tryBuildWorkerBundle } from "./world-sims";
+import { BtsRoomManager, isBtsGameId } from "./bts-rooms";
 
 assertSecrets("gamehost");
 
@@ -37,6 +38,20 @@ worldSims.onSnapshot((instanceId, snap) => {
   // transforms, rule-driven part updates, relayed sound cues, screen
   // messages). Clients reconcile their local prediction against this.
   io.to(`instance:${instanceId}`).emit("game:state", snap);
+});
+// v7.1 pass 12 (fix 3): Build to Survive multiplayer rooms. The pre-added
+// game used to be hard-routed to solo on the client. These rooms run the
+// game's phases/disasters/zombies/HP authoritatively and relay players +
+// placed blocks - remote players ride the SAME game:state channel the
+// world-runtime worker uses, so the existing client renders them without
+// any new rendering code.
+const btsRooms = new BtsRoomManager(manager);
+btsRooms.onGameState((instanceId, payload, targetedSocketId) => {
+  if (targetedSocketId) io.to(targetedSocketId).emit("game:state", payload);
+  else io.to(`instance:${instanceId}`).emit("game:state", payload);
+});
+btsRooms.onBtsState((instanceId, payload) => {
+  io.to(`instance:${instanceId}`).emit("bts:state", payload);
 });
 // v7: TARGETED screen messages (print_message with a target selector).
 // The worker names recipients by username; map them to the live sockets in
@@ -472,6 +487,7 @@ io.on("connection", (socket) => {
       // Stale or parked: evict the old entry, then continue with this join.
       manager.removePlayer(duplicate.socketId, instance.id);
       worldSims.playerLeft(instance.id, duplicate.socketId, username);
+      btsRooms.leave(instance.id, duplicate.socketId);
       io.to(`instance:${instance.id}`).emit("game:playerLeft", { socketId: duplicate.socketId, username });
       io.to(`instance:${instance.id}`).emit("game:players", manager.getPlayers(instance));
       if (duplicate.live) {
@@ -528,9 +544,16 @@ io.on("connection", (socket) => {
     // v1.1: boot the server-authoritative simulation for this instance (idempotent;
     // the world loads from Main once) and register the player. Until the sim is
     // ready the client's prediction runs alone - snapshots reconcile it after.
-    void worldSims.ensureSim(joined).then(() => {
-      worldSims.playerJoined(instanceId, socket.id, username);
-    });
+    // v7.1 pass 12: Build to Survive instances run the dedicated BTS room
+    // instead (no world fetch - the client bundles the arena itself).
+    if (isBtsGameId(instance.gameId)) {
+      btsRooms.ensureRoom(instance);
+      btsRooms.join(instance.id, socket.id, username);
+    } else {
+      void worldSims.ensureSim(joined).then(() => {
+        worldSims.playerJoined(instanceId, socket.id, username);
+      });
+    }
 
     console.log(
       `[gamehost] ${username} joined instance ${instanceId} (${joined.players.size}/${joined.maxPlayers})`
@@ -549,7 +572,36 @@ io.on("connection", (socket) => {
     if (!instance) return;
     if (!instance.players.has(socket.id)) return;
     socket.data.lastSeen = Date.now(); // duplicate guard liveness
+    // v7.1 pass 12: BTS rooms consume the reports directly (they relay
+    // players themselves); every other instance feeds the world worker.
+    if (isBtsGameId(instance.gameId)) {
+      btsRooms.pstate(instance.id, socket.id, {
+        x: Number(p.x) || 0,
+        y: Number(p.y) || 0,
+        z: Number(p.z) || 0,
+        yaw: Number(p.yaw) || 0,
+        walking: !!p.walking,
+        jumping: !!p.jumping,
+        sprint: !!p.sprint,
+      });
+      return;
+    }
     worldSims.pstate(instance.id, socket.id, p);
+  });
+
+  // ── bts:action { instanceId, kind: 'place'|'break'|'rotate'|'claim', ... } ──
+  // v7.1 pass 12 (fix 3): a Build to Survive player's build/claim request.
+  // The room validates it (phase, plot ownership, cooldown, record shape)
+  // and rebroadcasts the effect to the room - blocks ride the existing
+  // partUpdates channel, claims ride bts:state.
+  socket.on("bts:action", (payload: unknown) => {
+    const p = asRecord(payload);
+    const instance = resolvePlayerInstance(socket.id, p.instanceId);
+    if (!instance) return;
+    if (!instance.players.has(socket.id)) return;
+    if (!isBtsGameId(instance.gameId)) return;
+    socket.data.lastSeen = Date.now(); // duplicate guard liveness
+    btsRooms.action(instance.id, socket.id, p);
   });
 
   // ── game:syncWorld ──
@@ -718,6 +770,7 @@ io.on("connection", (socket) => {
     const removed = manager.removePlayer(socket.id, instanceId);
     if (!removed) return;
     worldSims.playerLeft(removed.instance.id, socket.id, removed.player.username);
+    btsRooms.leave(removed.instance.id, socket.id);
 
     const room = `instance:${removed.instance.id}`;
     socket.leave(room);
@@ -734,6 +787,7 @@ io.on("connection", (socket) => {
     console.log(`[gamehost] disconnect ${socket.id} (${authName(socket)})`);
     if (!removed) return;
     worldSims.playerLeft(removed.instance.id, socket.id, removed.player.username);
+    btsRooms.leave(removed.instance.id, socket.id);
     const room = `instance:${removed.instance.id}`;
     socket.leave(room);
     io.to(room).emit("game:playerLeft", { socketId: socket.id, username: removed.player.username });
@@ -791,6 +845,7 @@ function shutdown(signal: string): void {
   shuttingDown = true;
   console.log(`\n[gamehost] ${signal} received, shutting down...`);
   worldSims.stopAll();
+  btsRooms.stopAll();
   manager.stop();
   io.close(() => {
     // io.close() also closes the attached HTTP server; this is the safety net.

@@ -133,10 +133,25 @@ export async function findOrCreateInstance(
 ): Promise<{ result?: PlacementResult; error?: string }> {
   await sweepStale();
 
-  const game = await prisma.game.findUnique({ where: { id: gameId } });
-  if (!game) return { error: "Game not found" };
-  const maxPlayers =
-    ((game.extraData as any)?.max_players as number) || DEFAULT_MAX_PLAYERS_PER_INSTANCE;
+  // v7.1 pass 12 (fix 3): PRE-ADDED embedded games (ids like
+  // "preadded-build-to-survive") have no DB row - they are bundled with
+  // the platform client. They used to be rejected here ("Game not
+  // found"), which is why the client hard-routed them to solo with no
+  // multiplayer at all. They now place REAL instances like any other
+  // game; the gamehost runs the matching room sim (see bts-rooms.ts).
+  const PREADDED_MAX_PLAYERS: Record<string, number> = {
+    "preadded-build-to-survive": 4, // 4 claimable plots = 4 players
+  };
+  const isPreadded = gameId.startsWith("preadded-");
+  let maxPlayers: number;
+  if (isPreadded) {
+    maxPlayers = PREADDED_MAX_PLAYERS[gameId] || 4;
+  } else {
+    const game = await prisma.game.findUnique({ where: { id: gameId } });
+    if (!game) return { error: "Game not found" };
+    maxPlayers =
+      ((game.extraData as any)?.max_players as number) || DEFAULT_MAX_PLAYERS_PER_INSTANCE;
+  }
 
   // 1. Existing joinable instance (only on alive hosts)
   const staleBefore = new Date(Date.now() - HOST_STALE_MS);

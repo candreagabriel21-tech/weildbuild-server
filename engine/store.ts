@@ -138,7 +138,7 @@ export interface GameData {
    * MUST NOT change how the platform treats normal games; this flag only
    * flips behavior inside the play viewport for the tagged game.
    */
-  game_mode?: 'tower-sword-fight';
+  game_mode?: 'tower-sword-fight' | 'build-to-survive';
 }
 
 export interface PrimitiveData {

@@ -18,12 +18,19 @@
 // parallel Map of the blocks it owns (name prefix 'bts_placed_') for
 // save/load, break targets, and stack-height queries.
 //
-// NOTE (single-player): pre-added games route to serverStatus="solo" (no
-// gamehost socket), exactly like Tower Sword Fight. True 4-player
-// multiplayer would need the gamehost worker to run this sim server-side.
+// MULTIPLAYER (pass 12, fix 3): when StudioPlayViewport links the manager
+// to a live game session (setNetwork + lib/bts-net), the manager switches
+// to NETWORK mode: the server (gamehost bts-rooms.ts) owns the phases,
+// the disasters, the zombies, every player's hp and the plot claims, and
+// this client only (a) applies the bts:state snapshots, (b) mirrors the
+// blocks that arrive via the game:state partUpdates channel into its
+// placed-block map (same render + collision path as solo), and (c) sends
+// place/break/rotate/claim requests. Test Play and offline sessions run
+// the full local simulation exactly as before.
 
 import * as THREE from 'three';
 import { useStudioStore } from './studio-store';
+import type { BtsServerState, BtsAction } from './bts-net';
 import {
   BTS_PLOTS, BTS_DISASTER, BTS_DISASTERS, BTS_DISASTER_NAMES,
   type BtsPlot, type BtsDisasterId,
@@ -164,6 +171,8 @@ export interface BtsSnapshot {
   wrenchSelectedId: string | null;
   currentPlotId: string | null;   // plot the player is standing in (claim pop-up)
   claimerName: string;            // who claimed the local player's plot (labels)
+  claims: Record<string, string>; // pass 12: plotId -> username (multiplayer labels)
+  onlineCount: number;            // pass 12: players in the room (multiplayer HUD)
   ghost: BtsGhost;
   disaster: BtsDisasterState;
   zombies: BtsZombie[];
@@ -239,6 +248,13 @@ export class BuildToSurviveManager {
   wrenchSelectedId: string | null = null;
   localUsername = 'You';
   claimerName = '';
+  /** pass 12 (fix 4): last pointer position on the canvas in NDC
+   *  (-1..1, +y up). Written by the host on pointer move/down; the aim
+   *  raycast unprojects THROUGH it so place/break/select act where the
+   *  player actually clicked ("click anywhere"), not at the crosshair.
+   *  Null until the first pointer event - then the aim falls back to the
+   *  camera look direction. */
+  pointerNdc: { x: number; y: number } | null = null;
   private placeCd = 0;
   private breakHoldId: string | null = null;
   private breakHoldT = 0;
@@ -250,6 +266,16 @@ export class BuildToSurviveManager {
   meteorites: BtsMeteorite[] = [];
   explosions: BtsExplosion[] = [];
   tornado: { x: number; z: number; t: number; dx: number; dz: number } | null = null;
+
+  // ─── pass 12 (fix 3): multiplayer state ───
+  // True while a gamehost session drives the phases/disasters/zombies/hp
+  // (see lib/bts-net). The local simulation is suspended; snapshots rule.
+  netMode = false;
+  private sendAction: ((action: BtsAction) => void) | null = null;
+  private storeUnsub: (() => void) | null = null;
+  private claims: Record<string, string> = {};
+  onlineCount = 1;
+  private seenExplosionIds = new Set<number>();
 
   disaster: BtsDisasterState = {
     id: null, name: '', t: 0,
@@ -275,6 +301,186 @@ export class BuildToSurviveManager {
   onPhaseChange(cb: (phase: BtsPhase, disaster: BtsDisasterId | null) => void) { this.onPhaseCb = cb; }
   setPlaySound(cb: (name: string, vol?: number) => void) { this.playSoundCb = cb; }
   setLocalUsername(name: string) { this.localUsername = name; }
+
+  // ─── pass 12 (fix 3): multiplayer mode ───
+
+  /**
+   * Link/unlink the manager to a live gamehost session. With a sender the
+   * manager suspends its local phase/disaster/zombie simulation and runs
+   * from the server's bts:state snapshots (applied via applyServerState);
+   * with null it returns to the full local solo simulation.
+   */
+  setNetwork(send: ((action: BtsAction) => void) | null) {
+    this.sendAction = send;
+    const wasNet = this.netMode;
+    this.netMode = !!send;
+    if (this.netMode && !wasNet) {
+      // Going online: mirror every _bts block already in the studio store
+      // (they may have arrived via the game:state partUpdates channel
+      // before the link was wired) and keep mirroring from now on.
+      this.mirrorBlocksFromStore();
+      this.storeUnsub = useStudioStore.subscribe(() => this.mirrorBlocksFromStore());
+    } else if (!this.netMode && wasNet) {
+      // Going offline: stop mirroring and resume the local simulation.
+      if (this.storeUnsub) { try { this.storeUnsub(); } catch { /* gone */ } this.storeUnsub = null; }
+      this.claims = {};
+      this.seenExplosionIds.clear();
+    }
+  }
+
+  /**
+   * Mirror the studio store's _bts blocks into the placed-block map so the
+   * ghost/break/wrench raycasts see EVERY block (locally placed, placed by
+   * other players via partUpdates, or synced on join). Idempotent by id.
+   */
+  private mirrorBlocksFromStore() {
+    const objects = useStudioStore.getState().objects;
+    if (!objects) return;
+    const liveIds = new Set<string>();
+    objects.forEach((obj: any) => {
+      if (!obj || obj._bts !== true) return;
+      liveIds.add(obj.id);
+      const pos = obj.position, size = obj.size, rot = obj.rotation;
+      if (!pos || !size) return;
+      const rotDeg: [number, number, number] = [
+        (rot?.x ?? 0), (rot?.y ?? 0), (rot?.z ?? 0),
+      ];
+      const existing = this.placed.get(obj.id);
+      const entry: BtsPlacedBlock = {
+        id: obj.id,
+        shape: (obj._shape ?? obj.type ?? 'Block') as BtsPlacedBlock['shape'],
+        color: obj.color ?? '#fff',
+        cell: [Number(pos.x) || 0, Number(pos.z) || 0],
+        y: Number(pos.y) || 0,
+        sizeY: Number(size.y) || 1,
+        rot: rotDeg,
+      };
+      if (!existing ||
+        existing.cell[0] !== entry.cell[0] || existing.cell[1] !== entry.cell[1] ||
+        existing.y !== entry.y || existing.rot[0] !== rotDeg[0] ||
+        existing.rot[1] !== rotDeg[1] || existing.rot[2] !== rotDeg[2]) {
+        this.placed.set(obj.id, entry);
+      }
+    });
+    // Drop entries whose studio object vanished (broken by anyone).
+    for (const id of Array.from(this.placed.keys())) {
+      if (!liveIds.has(id)) this.placed.delete(id);
+    }
+  }
+
+  /**
+   * Apply one bts:state snapshot from the authority (gamehost bts-rooms).
+   * Owns the phase machine, the disaster state, the zombies, the claims
+   * and every player's life state while in net mode.
+   */
+  applyServerState(s: BtsServerState) {
+    if (!this.netMode || !s || typeof s !== 'object') return;
+
+    // ── Phase machine (server-owned) ──
+    const prevPhase = this.phase;
+    const prevDisasterId = this.disaster.id;
+    this.phase = s.phase === 'ended' ? 'ended' : (s.phase === 'disaster' ? 'disaster' : 'build');
+    this.buildTimer = Math.max(0, Number(s.buildTimer) || 0);
+    this.disasterT = Math.max(0, Number(s.disasterT) || 0);
+    this.round = Number(s.round) || this.round;
+    if (this.phase === 'disaster') {
+      this.disaster = {
+        id: (s.disaster?.id ?? null) as BtsDisasterId | null,
+        name: String(s.disaster?.name ?? ''),
+        t: this.disaster.t,
+        tsunamiZ: Number(s.disaster?.tsunamiZ) || 0,
+        floodY: Number(s.disaster?.floodY) || 0,
+        meteorites: Array.isArray(s.disaster?.meteorites) ? s.disaster.meteorites : [],
+        explosions: Array.isArray(s.disaster?.explosions) ? s.disaster.explosions : [],
+        tornado: s.disaster?.tornado ? { ...s.disaster.tornado } : null,
+        rain: !!s.disaster?.rain,
+        lava: !!s.disaster?.lava,
+      };
+      this.meteorites = this.disaster.meteorites;
+      this.explosions = this.disaster.explosions;
+      this.tornado = this.disaster.tornado
+        ? { ...this.disaster.tornado, dx: 0, dz: 0 }
+        : null;
+    } else {
+      this.disaster = {
+        id: null, name: '', t: 0, tsunamiZ: 0, floodY: 0,
+        meteorites: [], explosions: [], tornado: null, rain: false, lava: false,
+      };
+      this.meteorites = [];
+      this.explosions = [];
+      this.tornado = null;
+      this.zombies = [];
+    }
+
+    // ── Zombies (server-simulated; the renderer reads this.zombies) ──
+    if (Array.isArray(s.zombies)) {
+      this.zombies = s.zombies.map((z) => ({
+        id: Number(z.id) || 0,
+        x: Number(z.x) || 0, y: Number(z.y) || 0, z: Number(z.z) || 0,
+        yaw: Number(z.yaw) || 0,
+        swingT: Number(z.swingT) || 0,
+        hitCd: 0, soundCd: 0,
+        alive: z.alive !== false,
+      }));
+    }
+
+    // ── Claims (plotId -> username) ──
+    this.claims = (s.claims && typeof s.claims === 'object') ? { ...s.claims } : {};
+    const ownPlotId = Object.keys(this.claims).find((pid) => this.claims[pid] === this.localUsername);
+    if (ownPlotId) {
+      const plot = BTS_PLOTS.find((p) => p.id === ownPlotId) ?? null;
+      if (plot && this.claimedPlot?.id !== plot.id) this.claimedPlot = plot;
+      if (!this.claimerName) this.claimerName = this.localUsername;
+    }
+
+    // ── Own life state (server-owned hp; the death/respawn visual flow
+    //    stays on the existing client path, driven by these mirrors) ──
+    const players = s.players && typeof s.players === 'object' ? s.players : {};
+    this.onlineCount = Math.max(1, Object.keys(players).length);
+    let own: { hp: number; alive: boolean; deaths: number; survived: number } | null = null;
+    for (const key of Object.keys(players)) {
+      const entry = players[key];
+      if (entry && typeof entry.username === 'string' && entry.username === this.localUsername) {
+        own = { hp: entry.hp, alive: entry.alive, deaths: entry.deaths, survived: entry.survived };
+        break;
+      }
+    }
+    if (own) {
+      const prevHp = this.player.hp;
+      this.player.hp = Math.max(0, Number(own.hp) || 0);
+      this.player.deaths = Number(own.deaths) || 0;
+      this.player.survived = Number(own.survived) || 0;
+      if (this.player.hp !== prevHp) this.onPlayerHurtCb?.(this.player.hp, this.player.max);
+      if (this.player.alive && own.alive === false) {
+        this.player.alive = false;
+        this.playSoundCb?.('scream', 0.5);
+        this.onPlayerDieCb?.();
+      } else if (!this.player.alive && own.alive === true) {
+        this.player.alive = true;
+        this.invincibleFor = BTS_INVINCIBLE;
+      }
+    }
+
+    // ── Phase-change cues (the same sounds the solo transitions play) ──
+    if (prevPhase !== this.phase) {
+      if (this.phase === 'disaster' && this.disaster.id && this.disaster.id !== prevDisasterId) {
+        this.mode = null;
+        this.selectedPartId = null;
+        this.tool = null;
+        this.wrenchSelectedId = null;
+        this.playSoundCb?.('bts_disaster_warn', 0.7);
+        this.onPhaseCb?.('disaster', this.disaster.id);
+      } else if (this.phase === 'build') {
+        this.playSoundCb?.('bts_survive', 0.6);
+        this.onPhaseCb?.('build', null);
+      }
+    }
+  }
+
+  /** pass 12: forward a build/claim request to the authority (net mode). */
+  private netSend(action: BtsAction) {
+    this.sendAction?.(action);
+  }
 
   // ─── Lifecycle ───
   tryStart(): boolean {
@@ -308,6 +514,13 @@ export class BuildToSurviveManager {
     this.tool = null;
     this.wrenchSelectedId = null;
     this.claimerName = '';
+    // pass 12: drop any network session state.
+    if (this.storeUnsub) { try { this.storeUnsub(); } catch { /* gone */ } this.storeUnsub = null; }
+    this.netMode = false;
+    this.sendAction = null;
+    this.claims = {};
+    this.onlineCount = 1;
+    this.seenExplosionIds.clear();
   }
 
   // ─── Plot claim ───
@@ -315,20 +528,35 @@ export class BuildToSurviveManager {
     if (this.claimedPlot) return { ok: false, reason: 'already claimed' };
     const p = btsPlotAt(this.playerPos.x, this.playerPos.z);
     if (!p) return { ok: false, reason: 'stand on a plot to claim it' };
+    if (this.netMode) {
+      // pass 12: the server owns the claims - it verifies we are standing
+      // on the plot (from our position reports) and confirms to everyone.
+      if (this.claims[p.id] && this.claims[p.id] !== this.localUsername) {
+        return { ok: false, reason: 'plot already claimed' };
+      }
+      this.claims[p.id] = this.localUsername; // optimistic; the server confirms
+      this.netSend({ kind: 'claim', plotId: p.id });
+    }
     this.claimedPlot = p;
     this.claimerName = this.localUsername;
-    // Load any saved build for this plot from the device.
-    this.loadBuild(p.id);
+    // Load any saved build for this plot from the device (solo only - a
+    // multiplayer world belongs to the server).
+    if (!this.netMode) this.loadBuild(p.id);
     this.playSoundCb?.('bts_claim', 0.6);
     return { ok: true, plot: p };
   }
 
-  /** Minecraft-like raycast from the camera through the aim point against
-   *  the placed blocks + the plot floor (pass 11). Returns the first hit,
-   *  its face normal, and the cell a new block would occupy if placed on
-   *  that face (so you can place on tops AND sides, like Minecraft). Reach
-   *  is BTS_REACH blocks; the plot floor sits at BTS_PLOT_FLOOR so blocks
-   *  rest on top of the plot slab, not embedded in it. */
+  /** Minecraft-like raycast against the placed blocks + the plot floor
+   *  (pass 12, fix 4). The ray goes through the POINTER position on the
+   *  canvas (unprojected via the live camera), NOT the screen-centre
+   *  look direction - "click anywhere to place, delete and select". If
+   *  no pointer position is known yet (fresh load, controller), it falls
+   *  back to the camera look direction (crosshair behaviour).
+   *  Returns the first hit, its face normal, and the cell a new block
+   *  would occupy if placed on that face (so you can place on tops AND
+   *  sides, like Minecraft). Reach is BTS_REACH blocks; the plot floor
+   *  sits at BTS_PLOT_FLOOR so blocks rest on top of the plot slab, not
+   *  embedded in it. */
   private raycastAim(): {
     hitBlock: BtsPlacedBlock | null;
     groundHit: boolean;
@@ -338,10 +566,21 @@ export class BuildToSurviveManager {
     valid: boolean;
   } {
     const cam = BTS_AIM.camera;
-    const origin = cam
-      ? cam.position.clone()
-      : new THREE.Vector3(this.playerPos.x, this.playerPos.y + 1.5, this.playerPos.z);
-    const dir = this.camDir.lengthSq() > 1e-6 ? this.camDir.clone().normalize() : new THREE.Vector3(0, 0, -1);
+    let origin: THREE.Vector3;
+    let dir: THREE.Vector3;
+    if (cam && this.pointerNdc) {
+      // pass 12 (fix 4): aim through where the pointer actually is.
+      origin = cam.position.clone();
+      dir = new THREE.Vector3(this.pointerNdc.x, this.pointerNdc.y, 0.5)
+        .unproject(cam)
+        .sub(origin)
+        .normalize();
+    } else {
+      origin = cam
+        ? cam.position.clone()
+        : new THREE.Vector3(this.playerPos.x, this.playerPos.y + 1.5, this.playerPos.z);
+      dir = this.camDir.lengthSq() > 1e-6 ? this.camDir.clone().normalize() : new THREE.Vector3(0, 0, -1);
+    }
     const reach = BTS_REACH;
 
     let bestT = Infinity;
@@ -497,7 +736,11 @@ export class BuildToSurviveManager {
     });
     this.placeCd = BTS_PLACE_COOLDOWN;
     this.playSoundCb?.('bts_place', 0.5);
-    this.saveBuild();
+    // pass 12: net mode forwards the record to the authority (it validates
+    // the plot + cooldown and rebroadcasts to the room); solo saves the
+    // build to the device.
+    if (this.netMode) this.netSend({ kind: 'place', part });
+    else this.saveBuild();
   }
 
   /** Pickaxe: instantly break the block under the aim ray (no hold timer). */
@@ -510,7 +753,8 @@ export class BuildToSurviveManager {
     this.placed.delete(target.id);
     if (this.wrenchSelectedId === target.id) this.wrenchSelectedId = null;
     this.playSoundCb?.('bts_break', 0.6);
-    this.saveBuild();
+    if (this.netMode) this.netSend({ kind: 'break', id: target.id });
+    else this.saveBuild();
   }
 
   /** Wrench: select the block under the aim ray for rotation. */
@@ -533,15 +777,30 @@ export class BuildToSurviveManager {
       useStudioStore.getState().updateObject(b.id, { rotation: { x: b.rot[0], y: b.rot[1], z: b.rot[2] } });
     } catch { /* ignore */ }
     this.playSoundCb?.('bts_place', 0.3);
-    this.saveBuild();
+    if (this.netMode) this.netSend({ kind: 'rotate', id: b.id, rotation: { x: b.rot[0], y: b.rot[1], z: b.rot[2] } });
+    else this.saveBuild();
   }
 
-  /** Host calls this on the click/tap trigger (place / break / select). */
-  triggerAction() {
+  /** Host calls this on the click/tap trigger (place / break / select).
+   *  pass 12 (fix 4): pass the click's NDC so the action ray goes through
+   *  the actual click point on screen; without arguments the last known
+   *  pointer position is used (HUD buttons), falling back to the camera
+   *  look direction when no pointer has been seen yet. */
+  triggerAction(ndcX?: number, ndcY?: number) {
     if (this.phase !== 'build') return;
+    if (typeof ndcX === 'number' && typeof ndcY === 'number' && isFinite(ndcX) && isFinite(ndcY)) {
+      this.pointerNdc = { x: ndcX, y: ndcY };
+    }
     if (this.tool === 'hammer') this.placeAtGhost();
     else if (this.tool === 'pickaxe') this.breakAtAim();
     else if (this.tool === 'wrench') this.selectAtAim();
+  }
+
+  /** pass 12 (fix 4): update the aim pointer position (NDC, +y up). The
+   *  ghost preview and every place/break/select action raycast through
+   *  this point, so what you see under the cursor is what you act on. */
+  setPointerNdc(x: number, y: number) {
+    if (isFinite(x) && isFinite(y)) this.pointerNdc = { x, y };
   }
 
   // ─── Save / load (per device, per plot) ───
@@ -673,6 +932,15 @@ export class BuildToSurviveManager {
     if (this.invincibleFor > 0) this.invincibleFor -= dt;
     if (this.placeCd > 0) this.placeCd -= dt;
 
+    // pass 12 (fix 3): in net mode the server owns the phase machine,
+    // the disasters, the zombies and the hp - only the client-owned
+    // PHYSICS effects (tornado pull, explosion knockback) run locally.
+    if (this.netMode) {
+      this.applyClientSideDisasterForces(dt);
+      this.rev++;
+      return;
+    }
+
     if (this.phase === 'build') {
       this.buildTimer -= dt;
       if (this.buildTimer <= 0) this.beginDisaster();
@@ -684,6 +952,48 @@ export class BuildToSurviveManager {
     }
 
     this.rev++;
+  }
+
+  /**
+   * pass 12 (fix 3): client-owned disaster physics for net mode. Movement
+   * is client-owned in this platform's netcode model, so the pull/shove
+   * forces apply to the LOCAL body only - the tornado position and the
+   * explosion list are server-synced, the damage is server-computed.
+   */
+  private applyClientSideDisasterForces(dt: number) {
+    const world = (window as any).__weildPhysicsWorld;
+    const charBody = world?.characterBody;
+    if (!charBody) return;
+    const px = this.playerPos.x, py = this.playerPos.y, pz = this.playerPos.z;
+
+    // Tornado pull (same force the solo sim applies).
+    if (this.disaster.id === 'tornado' && this.disaster.tornado) {
+      const t = this.disaster.tornado;
+      const dx = t.x - px, dz = t.z - pz;
+      const dist = Math.sqrt(dx * dx + dz * dz);
+      if (dist > BTS_TORNADO_KILL && dist < BTS_TORNADO_PULL_RANGE && dist > 0.01) {
+        const pull = BTS_TORNADO_PULL * (1 - dist / BTS_TORNADO_PULL_RANGE);
+        const vx = charBody.velocity.x + (dx / dist) * pull * dt * 6;
+        const vz = charBody.velocity.z + (dz / dist) * pull * dt * 6;
+        charBody.velocity.set(vx, charBody.velocity.y, vz);
+      }
+    }
+
+    // Meteorite explosion knockback: the first time we SEE an explosion id,
+    // apply the same impulse the solo sim would have (the server already
+    // applied the damage; the shove is local physics).
+    for (const e of this.explosions) {
+      if (this.seenExplosionIds.has(e.id)) continue;
+      this.seenExplosionIds.add(e.id);
+      if (e.t > 0.2) continue; // first sighting is stale (a joiner's sync)
+      const dx = px - e.x, dz = pz - e.z;
+      const dist = Math.sqrt(dx * dx + py * py + dz * dz);
+      if (dist < BTS_METEORITE_RADIUS && dist > 0.01) {
+        const k = 14 * (1 - dist / BTS_METEORITE_RADIUS);
+        charBody.velocity.set((dx / dist) * k, 8, (dz / dist) * k);
+      }
+    }
+    if (this.seenExplosionIds.size > 80) this.seenExplosionIds.clear();
   }
 
   private tickDisaster(dt: number) {
@@ -869,6 +1179,8 @@ export class BuildToSurviveManager {
       wrenchSelectedId: this.wrenchSelectedId,
       currentPlotId: btsPlotAt(this.playerPos.x, this.playerPos.z)?.id ?? null,
       claimerName: this.claimerName,
+      claims: { ...this.claims },
+      onlineCount: this.onlineCount,
       ghost: this.buildGhost(),
       disaster: {
         ...this.disaster,

@@ -31,6 +31,11 @@ export interface VisualSettings {
    * Your own HP is always visible in the HUD; this is only about the
    * floating bars over everyone else. */
   show_player_hp_bars: boolean;
+  /** v7.1 pass 8 (owner's spec - accessibility): look sensitivity
+   *  multiplier for the camera orbit (touch drag + right-mouse drag).
+   *  1.0 = the default feel; lower = slower/finer aim, higher = faster.
+   *  Range 0.3..2.5. Stored per device like the rest of these. */
+  look_sensitivity: number;
 }
 
 // v1.9.3: applying the volume needs the shared audio context (sounds.ts).
@@ -59,12 +64,24 @@ export const DEFAULT_VISUAL_SETTINGS: VisualSettings = {
   mobile_controls: "joystick",
   mobile_controls_default: "auto",
   show_player_hp_bars: true,
+  // v7.1 pass 8: 1.0 = default look speed. Players who want faster aim
+  // crank it up; anyone needing fine control dials it down.
+  look_sensitivity: 1,
 };
 
 /** 1.0: read just the mobile control style (used by the game HUD every frame-free render). */
 export function loadMobileControlStyle(): "joystick" | "dpad" {
   const s = loadVisualSettings();
   return s.mobile_controls === "dpad" ? "dpad" : "joystick";
+}
+
+/** v7.1 pass 8: the look sensitivity multiplier, clamped to a sane
+ *  range. Used by the camera orbit (touch + right-mouse drag). 1.0 is
+ *  the default feel; 0.3..2.5 is the allowed span. */
+export function loadLookSensitivity(): number {
+  const v = loadVisualSettings().look_sensitivity;
+  if (typeof v !== "number" || !isFinite(v)) return 1;
+  return Math.max(0.3, Math.min(2.5, v));
 }
 
 /** 1.0.1: should the on-screen controls start ON for a game session?
