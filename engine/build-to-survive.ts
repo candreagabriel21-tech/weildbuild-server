@@ -45,7 +45,11 @@ const BTS_DISASTER_TIME = 20;      // survive this long (pass 11: 20s)
 const BTS_BLOCK_SIZE = 1;          // grid cell size
 const BTS_BREAK_HOLD = 2;          // hold to break (s) - spec
 const BTS_PLACE_COOLDOWN = 0.18;   // anti-spam between placements (s)
-const BTS_REACH = 7;               // pass 11: raycast reach (blocks)
+// pass 13 (bug 6): tools have NO build/camera range limit - you can place
+// and break anywhere you can click (the old 7-block reach capped how far
+// from the camera you could build). A large sentinel keeps the ray-AABB
+// math finite without imposing a practical limit.
+const BTS_REACH = 1000;            // effectively unlimited (no camera range)
 const BTS_PLOT_FLOOR = 0.625;      // pass 11: plot slab top - blocks rest on it
 
 // Zombie tuning (spec: 20 zombies, 20 dmg on touch, forest-green + plain shirt + camo pants + spooked face)
@@ -70,8 +74,11 @@ const BTS_METEORITE_DMG = 60;      // at centre
 const BTS_ACID_DMG = 10;           // per second sky-exposed (spec)
 const BTS_LAVA_DMG = 12;           // per second on the baseplate (spec)
 const BTS_TORNADO_SPEED = 7;       // wander speed
-const BTS_TORNADO_PULL = 18;       // pull strength
-const BTS_TORNADO_PULL_RANGE = 22; // starts pulling within this
+// pass 13 (bug 7): the tornado drags players from across the map - the pull
+// range is tripled (22 -> 66, wider than the 100-stud map so nowhere is
+// safe) and the pull force is doubled (18 -> 36).
+const BTS_TORNADO_PULL = 36;       // pull strength (was 18)
+const BTS_TORNADO_PULL_RANGE = 66; // starts pulling within this (was 22)
 const BTS_TORNADO_KILL = 3.2;      // touch = death
 
 // The zombie avatar (spec: forest green skin, plain shirt, camo pants, spooked face).
@@ -375,6 +382,10 @@ export class BuildToSurviveManager {
    */
   applyServerState(s: BtsServerState) {
     if (!this.netMode || !s || typeof s !== 'object') return;
+    // pass 13 (bug 9): once the manager is stopped (player left the game)
+    // ignore every snapshot - applying one would re-fire phase-change sounds
+    // (bts_survive / bts_disaster_warn) in a session that no longer exists.
+    if (!this.active) return;
 
     // ── Phase machine (server-owned) ──
     const prevPhase = this.phase;
@@ -514,6 +525,11 @@ export class BuildToSurviveManager {
     this.tool = null;
     this.wrenchSelectedId = null;
     this.claimerName = '';
+    // pass 13 (bug 9): drop the sound callback so NO cue (survive, warning,
+    // zombie, place...) can fire after the player leaves the game. A
+    // stray bts:state snapshot arriving between socket detach and manager
+    // teardown used to re-trigger phase-change sounds in an empty room.
+    this.playSoundCb = undefined;
     // pass 12: drop any network session state.
     if (this.storeUnsub) { try { this.storeUnsub(); } catch { /* gone */ } this.storeUnsub = null; }
     this.netMode = false;
@@ -696,6 +712,9 @@ export class BuildToSurviveManager {
     } else {
       this.mode = null; this.selectedPartId = null;
     }
+    // pass 13 (bug 2): tell the server which tool we hold so other players
+    // see it on our fist (no-op in solo / Test Play).
+    if (this.netMode) this.netSend({ kind: 'tool', tool });
   }
   selectPart(partId: string | null) {
     if (partId === null) { this.selectedPartId = null; if (this.tool === 'hammer') this.mode = null; return; }

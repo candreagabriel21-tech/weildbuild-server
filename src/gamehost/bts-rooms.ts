@@ -69,8 +69,15 @@ const ACID_DMG = 10;
 const LAVA_DMG = 12;
 const TORNADO_SPEED = 7;
 const TORNADO_KILL = 3.2;
-const TORNADO_PULL_RANGE = 22;
+// pass 13 (bug 7): mirror the client's tripled range + doubled force so the
+// server's instant-death touch radius and the (client-applied) pull agree on
+// the same tuning. The pull itself runs on each client's own body.
+const TORNADO_PULL_RANGE = 66;
+const TORNADO_PULL = 36;
 const MAP_HALF = 50;
+// pass 13 (bug 10): the void floor - fall below this and you die (classic
+// building-game rule). Matches the platform's physics voidY default (-50).
+const VOID_Y = -50;
 
 const ZOMBIE_COUNT = 20;
 const ZOMBIE_SPEED = 4.5;
@@ -129,6 +136,9 @@ interface BtsPlayer {
   invincibleFor: number;
   respawnAt: number; // 0 = not waiting; epoch ms when the respawn fires
   respawnTp: { x: number; y: number; z: number } | null; // one-shot tp flag
+  // pass 13 (bug 2): the tool this player is currently holding, so other
+  // players see it glued to their fist (hammer/pickaxe/wrench). null = none.
+  tool: 'hammer' | 'pickaxe' | 'wrench' | null;
 }
 
 interface BtsZombie {
@@ -202,6 +212,7 @@ class BtsRoom {
       invincibleFor: INVINCIBLE_S,
       respawnAt: 0,
       respawnTp: null,
+      tool: null,
     });
     // Targeted join sync: every block so far (partUpdates keyframe) + the
     // roster. The room broadcast below carries the rest.
@@ -225,8 +236,39 @@ class BtsRoom {
     const p = this.players.get(socketId);
     this.players.delete(socketId);
     this.lastPlaceAt.delete(socketId);
-    // Their plot + build STAYS claimed/built (rejoin-friendly).
-    if (p) console.log(`[bts-rooms] ${p.username} left instance ${this.instance.id} (${this.players.size} remain)`);
+    if (p) {
+      // pass 13 (bug 1): when a player leaves, clear their plot + build so
+      // the next player can claim a fresh, empty plot. (Pass 12 deliberately
+      // kept them for rejoin-friendliness, but the owner wants a leave to
+      // WIPE the plot - the build and the claim both go.)
+      // 1. Drop every block on a plot this player owned.
+      const removedBlocks: string[] = [];
+      for (const [id, block] of Array.from(this.blocks)) {
+        if (this.ownsBlockPlot(p, block)) {
+          this.blocks.delete(id);
+          removedBlocks.push(id);
+        }
+      }
+      // 2. Release their plot claim(s).
+      for (const [plotId, owner] of Array.from(this.claims)) {
+        if (owner === p.username) this.claims.delete(plotId);
+      }
+      // 3. Broadcast the block deletions (one partUpdates batch) + a fresh
+      //    bts:state so every client's claim labels + build update at once.
+      if (removedBlocks.length > 0) {
+        this.emitGameState({
+          t: "snapshot",
+          seq: ++this.seq,
+          players: [],
+          parts: [],
+          partUpdates: removedBlocks.map((id) => ({ id, deleted: true })),
+          fx: [],
+          messages: [],
+        });
+      }
+      this.broadcastBtsState(true);
+      console.log(`[bts-rooms] ${p.username} left instance ${this.instance.id} (${this.players.size} remain) - plot + build cleared`);
+    }
   }
 
   /** One pstate report (validated lightly - same spirit as the worker). */
@@ -251,6 +293,18 @@ class BtsRoom {
 
     if (kind === "claim") {
       this.handleClaim(player, String(payload.plotId || ""));
+      return;
+    }
+    // pass 13 (bug 2): tool selection is broadcast so other players see the
+    // held tool. Valid in any phase (you can hold a tool while spectating).
+    if (kind === "tool") {
+      const t = String(payload.tool || "");
+      const valid: 'hammer' | 'pickaxe' | 'wrench' | null =
+        (t === 'hammer' || t === 'pickaxe' || t === 'wrench') ? t : null;
+      if (player.tool !== valid) {
+        player.tool = valid;
+        this.broadcastBtsState(true);
+      }
       return;
     }
     if (this.phase !== "build") return; // building only in the build phase
@@ -374,6 +428,13 @@ class BtsRoom {
     // Life state for everyone.
     for (const p of this.players.values()) {
       if (p.invincibleFor > 0) p.invincibleFor -= dt;
+      // pass 13 (bug 10): void damage - fall below the void floor and die,
+      // then respawn (classic building-game rule). Skipped during the spawn
+      // invincibility window so a fresh join/respawn can't be void-killed by
+      // a stale pstate report.
+      if (p.alive && p.invincibleFor <= 0 && p.y < VOID_Y) {
+        this.damage(p, MAX_HP + 1);
+      }
       if (!p.alive && p.respawnAt > 0 && Date.now() >= p.respawnAt) {
         // Respawn: full hp + a one-shot tp to their plot (or map spawn).
         p.hp = MAX_HP;
@@ -604,6 +665,9 @@ class BtsRoom {
         hp: p.hp,
         dying: !p.alive,
       };
+      // pass 13 (bug 2): the held tool rides the player entry so the client's
+      // remote-player renderer can glue the right model to each player's fist.
+      if (p.tool) entry.btsTool = p.tool;
       if (p.respawnTp) {
         // One-shot teleport: the position fields hold the TARGET (wire
         // contract the client already implements for spawn/respawn tps).

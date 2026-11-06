@@ -24,7 +24,9 @@ export type BtsAction =
   | { kind: 'place'; part: Record<string, unknown> }
   | { kind: 'break'; id: string }
   | { kind: 'rotate'; id: string; rotation: { x: number; y: number; z: number } }
-  | { kind: 'claim'; plotId: string };
+  | { kind: 'claim'; plotId: string }
+  // pass 13 (bug 2): report the held tool so other players see it.
+  | { kind: 'tool'; tool: 'hammer' | 'pickaxe' | 'wrench' | null };
 
 /** The server's bts:state snapshot (mirrors the gamehost's bts-rooms.ts). */
 export interface BtsServerState {
