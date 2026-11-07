@@ -36,6 +36,16 @@ export interface VisualSettings {
    *  1.0 = the default feel; lower = slower/finer aim, higher = faster.
    *  Range 0.3..2.5. Stored per device like the rest of these. */
   look_sensitivity: number;
+  /** pass 13 (perf): graphics quality preset. The owner reports the platform
+   *  lags with only 30-40 objects, mainly because every part re-renders into
+   *  the shadow map every frame. These three knobs let the user trade visuals
+   *  for frames on weaker devices. */
+  /** 0 = shadows off, 1 = near-only (cull distant casters), 2 = full. */
+  shadows: 0 | 1 | 2;
+  /** How far parts render before they're distance-culled (studs). */
+  render_distance: number;
+  /** Max device pixel ratio cap. Lower = coarser but much faster on retina. */
+  max_dpr: number;
 }
 
 // v1.9.3: applying the volume needs the shared audio context (sounds.ts).
@@ -67,6 +77,12 @@ export const DEFAULT_VISUAL_SETTINGS: VisualSettings = {
   // v7.1 pass 8: 1.0 = default look speed. Players who want faster aim
   // crank it up; anyone needing fine control dials it down.
   look_sensitivity: 1,
+  // pass 13 (perf): balanced defaults - shadows ON but distant casters
+  // culled (the biggest frame cost), a generous render distance, and DPR
+  // capped at 2 (1.5 on touch). Weaker devices drop shadows / render distance.
+  shadows: 1,
+  render_distance: 320,
+  max_dpr: 2,
 };
 
 /** 1.0: read just the mobile control style (used by the game HUD every frame-free render). */
@@ -82,6 +98,78 @@ export function loadLookSensitivity(): number {
   const v = loadVisualSettings().look_sensitivity;
   if (typeof v !== "number" || !isFinite(v)) return 1;
   return Math.max(0.3, Math.min(2.5, v));
+}
+
+// ─── pass 13 (perf): graphics-quality loaders ───
+
+/** Shadow mode: 0 = off, 1 = near-only (distant casters culled), 2 = full. */
+export function loadShadows(): 0 | 1 | 2 {
+  const v = loadVisualSettings().shadows;
+  return v === 0 || v === 1 || v === 2 ? v : 1;
+}
+
+/** Render distance (studs) before parts distance-cull. Clamped 40..2000. */
+export function loadRenderDistance(): number {
+  const v = loadVisualSettings().render_distance;
+  if (typeof v !== "number" || !isFinite(v)) return 320;
+  return Math.max(40, Math.min(2000, v));
+}
+
+/** Max device pixel ratio cap. Clamped 0.5..3. */
+export function loadMaxDpr(): number {
+  const v = loadVisualSettings().max_dpr;
+  if (typeof v !== "number" || !isFinite(v)) return 2;
+  return Math.max(0.5, Math.min(3, v));
+}
+
+// ─── pass 13 (perf): live React hook (SSR-safe; no react import needed at
+// module load - this file is imported by the server too). Returns whether the
+// sun should cast shadows RIGHT NOW, and re-renders the caller when it
+// changes. Used by the Canvas `shadows` prop so toggling Shadows: Off in
+// Settings actually disables the shadow map renderer without a reload. ───
+export function useShadowsEnabled(): boolean {
+  // Lazy-import React so the server (which never calls this) isn't forced to
+  // bundle it. The hooks come from the app's single React instance.
+  const React = require("react") as { useState: <T>(init: T | (() => T)) => [T, (v: T) => void]; useEffect: (cb: () => void | (() => void), deps: unknown[]) => void };
+  const [on, setOn] = React.useState<boolean>(() => loadShadows() !== 0);
+  React.useEffect(() => {
+    const handler = () => setOn(loadShadows() !== 0);
+    if (typeof window !== "undefined") {
+      window.addEventListener(VISUAL_SETTINGS_CHANGED, handler);
+      return () => window.removeEventListener(VISUAL_SETTINGS_CHANGED, handler);
+    }
+  }, []);
+  return on;
+}
+
+/** pass 13 (perf): the live render distance, re-rendering the caller on change.
+ *  Used by the cull pass so the Settings slider takes effect immediately. */
+export function useRenderDistance(): number {
+  const React = require("react") as { useState: <T>(init: T | (() => T)) => [T, (v: T) => void]; useEffect: (cb: () => void | (() => void), deps: unknown[]) => void };
+  const [d, setD] = React.useState<number>(() => loadRenderDistance());
+  React.useEffect(() => {
+    const handler = () => setD(loadRenderDistance());
+    if (typeof window !== "undefined") {
+      window.addEventListener(VISUAL_SETTINGS_CHANGED, handler);
+      return () => window.removeEventListener(VISUAL_SETTINGS_CHANGED, handler);
+    }
+  }, []);
+  return d;
+}
+
+/** pass 13 (perf): the live shadow MODE (0/1/2), re-rendering on change.
+ *  The cull pass uses it to decide the shadow-caster cull distance. */
+export function useShadowsMode(): 0 | 1 | 2 {
+  const React = require("react") as { useState: <T>(init: T | (() => T)) => [T, (v: T) => void]; useEffect: (cb: () => void | (() => void), deps: unknown[]) => void };
+  const [m, setM] = React.useState<0 | 1 | 2>(() => loadShadows());
+  React.useEffect(() => {
+    const handler = () => setM(loadShadows());
+    if (typeof window !== "undefined") {
+      window.addEventListener(VISUAL_SETTINGS_CHANGED, handler);
+      return () => window.removeEventListener(VISUAL_SETTINGS_CHANGED, handler);
+    }
+  }, []);
+  return m;
 }
 
 /** 1.0.1: should the on-screen controls start ON for a game session?

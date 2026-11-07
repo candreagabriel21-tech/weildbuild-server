@@ -79,9 +79,15 @@ const MAP_HALF = 50;
 // building-game rule). Matches the platform's physics voidY default (-50).
 const VOID_Y = -50;
 
-const ZOMBIE_COUNT = 20;
+// pass 13 (zombies): only 5 zombies (the owner found 20 too many), they can't
+// hit players who are high up (a vertical reach cap), and they navigate around
+// walls instead of walking through them.
+const ZOMBIE_COUNT = 5;
 const ZOMBIE_SPEED = 4.5;
 const ZOMBIE_TOUCH = 1.7;
+// pass 13 (zombies): a zombie can only hit a player within this Y gap, so a
+// player stood high up on a tower is safe even with a zombie directly below.
+const ZOMBIE_VERTICAL = 2.2;
 const ZOMBIE_DMG = 20;
 const ZOMBIE_HIT_CD = 1.0;
 
@@ -620,6 +626,21 @@ class BtsRoom {
     return true;
   }
 
+  /** pass 13 (zombies): is the grid cell (cx, cz) blocked near the ground for a
+   *  zombie at height atY? A 1-stud block at centre cy blocks the zombie's
+   *  ~1.8-tall body when its span (cy±0.5) overlaps the zombie's body
+   *  (atY-0.4 .. atY+1.4). Used by the wall-avoidance step so zombies route
+   *  around placed walls instead of clipping through them. */
+  private zombieCellBlocked(cx: number, cz: number, atY: number): boolean {
+    for (const b of this.blocks.values()) {
+      if (b.cx !== cx || b.cz !== cz) continue;
+      const bottom = b.cy - 0.5;
+      const top = b.cy + 0.5;
+      if (bottom < atY + 1.4 && top > atY - 0.4) return true;
+    }
+    return false;
+  }
+
   private tickZombies(dt: number): void {
     for (const z of this.zombies) {
       if (!z.alive) continue;
@@ -636,12 +657,26 @@ class BtsRoom {
       const dx = target.x - z.x, dz = target.z - z.z;
       const dist = Math.max(0.001, Math.sqrt(dx * dx + dz * dz));
       const sp = ZOMBIE_SPEED * dt;
-      z.x += (dx / dist) * sp;
-      z.z += (dz / dist) * sp;
-      z.yaw = Math.atan2(dx, dz);
+      // pass 13 (zombies): wall avoidance. Step axis-by-axis so a zombie
+      // routes around a solid block instead of clipping through it; if the
+      // next cell on an axis is blocked, that axis holds and the zombie
+      // slides along the other (both blocked = idle this tick).
+      const stepX = (dx / dist) * sp;
+      const stepZ = (dz / dist) * sp;
+      const nx = z.x + stepX, nz = z.z + stepZ;
+      const blockedX = this.zombieCellBlocked(Math.round(nx), Math.round(z.z), z.y);
+      const blockedZ = this.zombieCellBlocked(Math.round(z.x), Math.round(nz), z.y);
+      if (!blockedX && !blockedZ) { z.x = nx; z.z = nz; }
+      else if (!blockedX) { z.x = nx; }
+      else if (!blockedZ) { z.z = nz; }
+      z.yaw = Math.atan2(target.x - z.x, target.z - z.z);
       if (z.hitCd > 0) z.hitCd -= dt;
       if (z.swingT > 0) z.swingT = Math.max(0, z.swingT - dt * 3);
-      if (dist < ZOMBIE_TOUCH && z.hitCd <= 0 && target.alive) {
+      // pass 13 (zombies): a zombie can only hit a player within ZOMBIE_VERTICAL
+      // on Y - so a player stood high up on a tower is safe, even with a zombie
+      // directly below (the old check ignored Y entirely).
+      const dy = target.y - z.y;
+      if (dist < ZOMBIE_TOUCH && Math.abs(dy) < ZOMBIE_VERTICAL && z.hitCd <= 0 && target.alive) {
         z.hitCd = ZOMBIE_HIT_CD;
         z.swingT = 1;
         this.damage(target, ZOMBIE_DMG);

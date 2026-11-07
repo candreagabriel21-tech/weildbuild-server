@@ -52,10 +52,14 @@ const BTS_PLACE_COOLDOWN = 0.18;   // anti-spam between placements (s)
 const BTS_REACH = 1000;            // effectively unlimited (no camera range)
 const BTS_PLOT_FLOOR = 0.625;      // pass 11: plot slab top - blocks rest on it
 
-// Zombie tuning (spec: 20 zombies, 20 dmg on touch, forest-green + plain shirt + camo pants + spooked face)
+// Zombie tuning (5 zombies, 20 dmg on touch, forest-green + plain shirt + camo pants + spooked face).
+// pass 13 (zombies): count cut to 5; a vertical reach cap so players high up
+// are safe; and wall avoidance so zombies route around solid blocks instead
+// of walking through them.
 const BTS_ZOMBIE_COUNT = BTS_DISASTER.ZOMBIE_COUNT;
 const BTS_ZOMBIE_SPEED = 4.5;
-const BTS_ZOMBIE_TOUCH = 1.7;      // touch range
+const BTS_ZOMBIE_TOUCH = 1.7;      // horizontal touch range
+const BTS_ZOMBIE_VERTICAL = 2.2;   // a zombie can only hit a player within this Y gap
 const BTS_ZOMBIE_DMG = 20;         // spec
 const BTS_ZOMBIE_HIT_CD = 1.0;     // per-zombie attack cooldown
 const BTS_ZOMBIE_SOUND_INTERVAL = 5; // random groan every ~5s
@@ -1131,23 +1135,55 @@ export class BuildToSurviveManager {
     return true;
   }
 
+  /** True if a solid placed block occupies the grid cell at (cx, cz) near the
+   *  ground (used by zombie wall-avoidance: a zombie on the floor is blocked by
+   *  any block in that cell whose bottom is at floor level). */
+  private cellBlocked(cx: number, cz: number, atY: number): boolean {
+    for (const b of this.placed.values()) {
+      if (b.cell[0] !== cx || b.cell[1] !== cz) continue;
+      // A block blocks the zombie if its vertical span overlaps the zombie's
+      // body (the zombie is ~1.8 tall, centred at atY=0.5 -> spans -0.4..1.4).
+      const top = b.y + b.sizeY / 2;
+      const bottom = b.y - b.sizeY / 2;
+      if (bottom < 1.4 && top > atY - 0.4) return true;
+    }
+    return false;
+  }
+
   private tickZombies(dt: number) {
-    const px = this.playerPos.x, pz = this.playerPos.z;
+    const px = this.playerPos.x, pz = this.playerPos.z, py = this.playerPos.y;
     for (const z of this.zombies) {
       if (!z.alive) continue;
       const dx = px - z.x, dz = pz - z.z;
       const dist = Math.sqrt(dx * dx + dz * dz) || 0.001;
-      // Chase
+      // Chase. Wall avoidance: step axis-by-axis so a zombie routes around a
+      // solid block instead of clipping through it. If the next cell on the
+      // primary axis is blocked, the zombie slides along the other axis (and
+      // if both are blocked it idles). Cells are 1-stud, so we test the cell
+      // the zombie would ENTER, not the one it stands in.
       const sp = BTS_ZOMBIE_SPEED * dt;
-      z.x += (dx / dist) * sp;
-      z.z += (dz / dist) * sp;
-      z.yaw = Math.atan2(dx, dz);
+      const stepX = (dx / dist) * sp;
+      const stepZ = (dz / dist) * sp;
+      const nx = z.x + stepX;
+      const nz = z.z + stepZ;
+      const blockedX = this.cellBlocked(gridSnap(nx), gridSnap(z.z), z.y);
+      const blockedZ = this.cellBlocked(gridSnap(z.x), gridSnap(nz), z.y);
+      if (!blockedX && !blockedZ) { z.x = nx; z.z = nz; }
+      else if (!blockedX) { z.x = nx; }
+      else if (!blockedZ) { z.z = nz; }
+      // (both blocked: hold position this frame - it'll re-route next tick)
+      z.yaw = Math.atan2(px - z.x, pz - z.z);
       // Attack cooldown + sound
       if (z.hitCd > 0) z.hitCd -= dt;
       if (z.soundCd > 0) z.soundCd -= dt;
       if (z.swingT > 0) z.swingT = Math.max(0, z.swingT - dt * 3);
-      // Touch -> damage + arm swing + sounds
-      if (dist < BTS_ZOMBIE_TOUCH && z.hitCd <= 0 && this.player.alive) {
+      // Touch -> damage + arm swing + sounds. pass 13 (zombies): a zombie can
+      // only hit a player within BTS_ZOMBIE_VERTICAL on the Y axis - so a
+      // player stood high up on a tower is safe, even with a zombie directly
+      // below (the old check ignored Y entirely).
+      const dy = py - z.y;
+      if (dist < BTS_ZOMBIE_TOUCH && Math.abs(dy) < BTS_ZOMBIE_VERTICAL
+          && z.hitCd <= 0 && this.player.alive) {
         z.hitCd = BTS_ZOMBIE_HIT_CD;
         z.swingT = 1;
         this.damagePlayer(BTS_ZOMBIE_DMG);

@@ -1276,6 +1276,66 @@ export class PhysicsWorld {
     }
   }
 
+  /**
+   * pass 13 (rotate hitbox): re-create a part's cannon COLLISION SHAPE when its
+   * size changes mid-play (the resize face handles, a modify_property rule).
+   * syncFromPart updates position + quaternion + the JS mirror's size, but the
+   * cannon Body keeps its original CANNON.Shape forever - so a resized block
+   * kept colliding at its old extents. This swaps in a fresh shape matching the
+   * new size (Box for Block/Sphere/Wedge, the 8-sided ConvexPolyhedron for
+   * Cylinder) and re-applies the quaternion so a rotated+resized part stays
+   * correct. Rotation-only changes don't need this (syncFromPart's quaternion
+   * write already turns the existing shape), but it's harmless to call.
+   */
+  updateBodyShape(part: StudioPart): void {
+    const cannonBody = this.cannonBodies.get(part.id);
+    if (!cannonBody) return;
+    const hx = Math.max(part.size.x / 2, 0.005);
+    const hy = Math.max(part.size.y / 2, 0.005);
+    const hz = Math.max(part.size.z / 2, 0.005);
+    let shape: CANNON.Shape;
+    if (part.type === 'Cylinder') {
+      const sides = 8;
+      const verts: CANNON.Vec3[] = [];
+      for (let i = 0; i < sides; i++) {
+        const a = (i / sides) * Math.PI * 2;
+        const cx = Math.cos(a) * hx;
+        const cz = Math.sin(a) * hz;
+        verts.push(new CANNON.Vec3(cx, hy, cz));
+        verts.push(new CANNON.Vec3(cx, -hy, cz));
+      }
+      const faces: number[][] = [];
+      for (let i = 0; i < sides; i++) {
+        const a = i * 2;
+        const b = ((i + 1) % sides) * 2;
+        faces.push([a, b, b + 1, a + 1]);
+      }
+      const sideFaces: number[][] = [];
+      for (let i = 0; i < sides; i++) {
+        const a = i * 2;
+        const b = ((i + 1) % sides) * 2;
+        sideFaces.push([a, b, b + 1, a + 1]);
+      }
+      shape = new CANNON.ConvexPolyhedron({ vertices: verts, faces });
+    } else {
+      // Block, Sphere (AABB per the v1.1 fix), Wedge, Spawn -> Box.
+      shape = new CANNON.Box(new CANNON.Vec3(hx, hy, hz));
+    }
+    // cannon-es: drop the old shapes and add the new one in place.
+    for (const s of cannonBody.shapes) cannonBody.removeShape(s);
+    cannonBody.addShape(shape);
+    if (part.rotation.x !== 0 || part.rotation.y !== 0 || part.rotation.z !== 0) {
+      cannonBody.quaternion.setFromEuler(
+        part.rotation.x * Math.PI / 180,
+        part.rotation.y * Math.PI / 180,
+        part.rotation.z * Math.PI / 180
+      );
+    } else {
+      cannonBody.quaternion.set(0, 0, 0, 1);
+    }
+    cannonBody.wakeUp();
+  }
+
   syncToPart(part: StudioPart): StudioPart {
     const body = this.bodies.get(part.id);
     if (!body) return part;

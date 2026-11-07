@@ -28,9 +28,19 @@ export function isTouchDevice(): boolean {
  * (DPR ~3) that is a ~2.5x cut in pixels shaded per frame, which is
  * the single biggest frame-time win for the mobile build. Below 1.5
  * the world starts to look visibly soft, so we don't go lower.
+ *
+ * pass 13 (perf): the user's max_dpr setting (Settings → Graphics) caps this
+ * further on weak devices - clamped to the touch/desktop floor above.
  */
 export function maxCanvasDpr(): number {
-  return isTouchDevice() ? 1.5 : 2;
+  let cap = isTouchDevice() ? 1.5 : 2;
+  try {
+    // Loaded lazily to avoid a circular import at module init on the server.
+    const { loadMaxDpr } = require('./visual-settings');
+    const user = loadMaxDpr();
+    cap = Math.min(cap, user);
+  } catch { /* settings unavailable (SSR / tests) - keep the touch/desktop default */ }
+  return Math.max(0.5, cap);
 }
 
 /**
@@ -38,6 +48,10 @@ export function maxCanvasDpr(): number {
  * 2048 on desktop, 1024 on touch - the shadow buffer re-renders the
  * whole scene every frame it moves, and 4M texels of it is a lot to
  * ask of a phone GPU. 1024 still reads as "has shadows" at 1.5 DPR.
+ *
+ * pass 13 (perf): when the user disabled shadows (Settings → Graphics →
+ * Shadows: Off) the caller skips the light entirely, so this value is moot;
+ * when set to Near-only we still use the full map (the cull is per-caster).
  */
 export function shadowMapSize(): number {
   return isTouchDevice() ? 1024 : 2048;

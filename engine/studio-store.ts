@@ -530,6 +530,13 @@ export interface StudioStore {
    *  Position/rotation/size-only writes do NOT bump it, so the explorer tree
    *  doesn't re-render while you drag parts (v13.6 editor lag fix). */
   objectsVersion: number;
+  /** pass 13 (rotate hitbox): bumped ONLY when a part's rotation or size
+   *  changes (not position drags). The play-mode collision cache watches it so
+   *  the wrench rotate tool updates a block's collider immediately, instead of
+   *  waiting up to 1s for the count/timer rebuild. Position-only drags don't
+   *  bump it, so the per-drag-frame editor re-render the team avoided stays
+   *  avoided. */
+  partsTransformVersion: number;
   /** True between beginTransformGesture/endTransformGesture (a gizmo/resize drag). */
   _transformGesture: boolean;
   /** Push ONE undo snapshot at drag start and suppress per-frame pushes during the drag. */
@@ -957,6 +964,7 @@ export const useStudioStore = create<StudioStore>((set, get) => ({
   partRevealLimit: Infinity,
   loadProgress: { active: false, total: 0, mounted: 0 },
   objectsVersion: 1,
+  partsTransformVersion: 0,
   _transformGesture: false,
   pendingPlacement: null,
   cameraFocusRequest: null,
@@ -1186,6 +1194,16 @@ export const useStudioStore = create<StudioStore>((set, get) => ({
         newObjects.set(id, { ...obj, ...mergedUpdates } as StudioObject);
         // v1.3: the CharacterRoot <-> body-part sync block was deleted with
         // the CharacterRoot part itself (body parts are plain editable parts).
+        // pass 13 (rotate hitbox): a rotation or size change must refresh the
+        // play-mode collider cache THIS frame (the wrench rotate tool's block
+        // otherwise kept its old hitbox for up to 1s). Position-only writes are
+        // excluded so the per-drag-frame editor re-render the team avoided
+        // (see the objectsVersion comment) stays avoided.
+        const transformChanged =
+          ('rotation' in mergedUpdates) || ('size' in mergedUpdates);
+        return transformChanged
+          ? { objects: newObjects, partsTransformVersion: state.partsTransformVersion + 1 }
+          : { objects: newObjects };
       }
       return { objects: newObjects };
     });
