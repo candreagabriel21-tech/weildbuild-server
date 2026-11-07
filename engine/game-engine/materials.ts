@@ -64,44 +64,58 @@ export interface MaterialDefinition {
 }
 
 export const MATERIALS: Record<string, MaterialDefinition> = {
-  // pass 18: every material with a matching PBR set now binds it. Surface
-  // materials (everything except Wireframe and CorrodedMetal) drop the
-  // albedo in the renderer (useAlbedo=false) so the part's `color` tints
-  // the surface — green grass on a red ball reads as red grass. Two
-  // exceptions keep the albedo: Wireframe (the grid IS the point) and
-  // CorrodedMetal/rust (the owner wants the rust's own red preserved, and
-  // the albedo's transparent areas let the part colour show through).
-  Plastic:       { name: 'Plastic',       color: '#8c8c8c', roughness: 0.5,  metalness: 0.0, friction: 0.5,  elasticity: 0.2,  density: 1.0,  physicalType: 'hard', textureSet: 'plastic' },
-  SmoothPlastic: { name: 'SmoothPlastic', color: '#8c8c8c', roughness: 0.2,  metalness: 0.0, friction: 0.3,  elasticity: 0.15, density: 1.0,  physicalType: 'hard', textureSet: 'plastic' },
-  Wood:          { name: 'Wood',          color: '#8B6914', roughness: 0.8,  metalness: 0.0, friction: 0.7,  elasticity: 0.1,  density: 0.6,  physicalType: 'hard', textureSet: 'wood' },
-  WoodPlanks:    { name: 'WoodPlanks',    color: '#9B7431', roughness: 0.85, metalness: 0.0, friction: 0.7,  elasticity: 0.1,  density: 0.55, physicalType: 'hard', textureSet: 'wood_planks' },
-  Slate:         { name: 'Slate',         color: '#4A4A5A', roughness: 0.9,  metalness: 0.1, friction: 0.6,  elasticity: 0.15, density: 2.5,  physicalType: 'hard', textureSet: 'slate_roof_tiles' },
-  Concrete:      { name: 'Concrete',      color: '#8C8C8C', roughness: 0.95, metalness: 0.0, friction: 0.7,  elasticity: 0.1,  density: 2.3,  physicalType: 'hard', textureSet: 'concrete' },
-  Metal:         { name: 'Metal',         color: '#A0A0B0', roughness: 0.3,  metalness: 0.9, friction: 0.4,  elasticity: 0.3,  density: 7.8,  physicalType: 'hard', textureSet: 'metal' },
-  CorrodedMetal: { name: 'CorrodedMetal', color: '#7A6E52', roughness: 0.7,  metalness: 0.5, friction: 0.6,  elasticity: 0.15, density: 5.0,  physicalType: 'hard', textureSet: 'rust' },
-  DiamondPlate:  { name: 'DiamondPlate',  color: '#8C9CA5', roughness: 0.4,  metalness: 0.8, friction: 0.5,  elasticity: 0.25, density: 7.8,  physicalType: 'hard', textureSet: 'diamond_plate' },
-  Foil:          { name: 'Foil',          color: '#C0C0D0', roughness: 0.1,  metalness: 1.0, friction: 0.3,  elasticity: 0.1,  density: 2.7,  physicalType: 'hard', textureSet: 'foil' },
-  Grass:         { name: 'Grass',         color: '#4B8B2A', roughness: 0.9,  metalness: 0.0, friction: 0.8,  elasticity: 0.05, density: 0.3,  physicalType: 'soft', textureSet: 'grass' },
-  Ice:           { name: 'Ice',           color: '#B0D4F1', roughness: 0.1,  metalness: 0.1, opacity: 0.7, friction: 0.05, elasticity: 0.05, density: 0.9, physicalType: 'ice', textureSet: 'ice' },
-  Brick:         { name: 'Brick',         color: '#9B4A3C', roughness: 0.85, metalness: 0.0, friction: 0.7,  elasticity: 0.1,  density: 1.9,  physicalType: 'hard', textureSet: 'brick' },
-  Sand:          { name: 'Sand',          color: '#C2B280', roughness: 0.95, metalness: 0.0, friction: 0.9,  elasticity: 0.02, density: 1.6,  physicalType: 'soft', textureSet: 'sand' },
-  Fabric:        { name: 'Fabric',        color: '#9B7A5A', roughness: 0.95, metalness: 0.0, friction: 0.9,  elasticity: 0.02, density: 0.2,  physicalType: 'soft', textureSet: 'carpet' },
-  Granite:       { name: 'Granite',       color: '#6A6A7A', roughness: 0.85, metalness: 0.1, friction: 0.65, elasticity: 0.12, density: 2.7,  physicalType: 'hardsoft', textureSet: 'granite' },
-  Marble:        { name: 'Marble',        color: '#D4D0C8', roughness: 0.3,  metalness: 0.1, friction: 0.4,  elasticity: 0.15, density: 2.7,  physicalType: 'hard', textureSet: 'marble' },
-  // Neon: the glow follows the part's own colour (emissiveMatchesColor),
-  // so a blue Neon part glows blue — not the fixed #FF4444 red it used to
-  // (which made every Neon part read as red-ish pink). emissiveIntensity
-  // 2.0 keeps the bright glow.
-  Neon:          { name: 'Neon',          color: '#FF4444', roughness: 0.0,  metalness: 0.0, emissive: '#FF4444', emissiveIntensity: 2.0, emissiveMatchesColor: true, friction: 0.3, elasticity: 0.2, density: 1.0, physicalType: 'hard' },
-  Cobblestone:   { name: 'Cobblestone',   color: '#7A7A7A', roughness: 0.9,  metalness: 0.0, friction: 0.75, elasticity: 0.1,  density: 2.5,  physicalType: 'hardsoft', textureSet: 'cobblestone' },
-  Pebble:        { name: 'Pebble',        color: '#8A8A7A', roughness: 0.85, metalness: 0.0, friction: 0.7,  elasticity: 0.12, density: 2.3,  physicalType: 'hardsoft', textureSet: 'pebble' },
-  // Wireframe: the classic baseplate grid. Pass 17 baked the grid into a
-  // static texture (white surface + light-gray 1-stud minor + 10-stud
-  // major grid) tiled at a fixed 10-stud size. Pass 18 made the material
-  // colour pure white so the wireframe renders white (the pass-17 gray
-  // colour darkened the major grid lines to near-black). The grid albedo
-  // IS bound (the lines are the point); `color` tints it.
-  Wireframe:     { name: 'Wireframe',     color: '#ffffff', roughness: 0.6,  metalness: 0.0, friction: 0.5,  elasticity: 0.2,  density: 1.0,  physicalType: 'hard', textureSet: 'wireframe_grid', textureTileStuds: 10 },
+  // pass 19: every material now binds its PBR albedo (useAlbedo=true for all
+  // textured materials in shared.ts) so the texture's own colour shows.
+  // Pass 18 dropped the albedo for surface materials, which left only
+  // normal/roughness bumps and made WoodPlanks/Concrete/Ice/Granite/Marble
+  // "barely visible". The default colour is now #ffffff so the albedo renders
+  // at its natural colour (white × albedoRGB = albedoRGB); the part colour
+  // picker still tints if the user picks one. Metals (Metal/DiamondPlate/
+  // Foil/CorrodedMetal) had metalness so high the diffuse was suppressed to
+  // black with no env map; pass 19 lowers them so the albedo shows. The 14
+  // new materials (WoodBark…Magma) cover the rest of the owner's texture
+  // library. SmoothPlastic is removed (not needed).
+  Plastic:          { name: 'Plastic',          color: '#ffffff', roughness: 0.5,  metalness: 0.0, friction: 0.5,  elasticity: 0.2,  density: 1.0,  physicalType: 'hard', textureSet: 'plastic' },
+  Wood:             { name: 'Wood',             color: '#ffffff', roughness: 0.8,  metalness: 0.0, friction: 0.7,  elasticity: 0.1,  density: 0.6,  physicalType: 'hard', textureSet: 'wood' },
+  WoodPlanks:       { name: 'WoodPlanks',       color: '#ffffff', roughness: 0.85, metalness: 0.0, friction: 0.7,  elasticity: 0.1,  density: 0.55, physicalType: 'hard', textureSet: 'wood_planks' },
+  WoodBark:         { name: 'WoodBark',         color: '#ffffff', roughness: 0.9,  metalness: 0.0, friction: 0.7,  elasticity: 0.1,  density: 0.6,  physicalType: 'hard', textureSet: 'wood_bark' },
+  Slate:            { name: 'Slate',            color: '#ffffff', roughness: 0.9,  metalness: 0.1, friction: 0.6,  elasticity: 0.15, density: 2.5,  physicalType: 'hard', textureSet: 'slate_roof_tiles' },
+  Concrete:         { name: 'Concrete',         color: '#ffffff', roughness: 0.95, metalness: 0.0, friction: 0.7,  elasticity: 0.1,  density: 2.3,  physicalType: 'hard', textureSet: 'concrete' },
+  Metal:            { name: 'Metal',            color: '#ffffff', roughness: 0.3,  metalness: 0.3, friction: 0.4,  elasticity: 0.3,  density: 7.8,  physicalType: 'hard', textureSet: 'metal' },
+  CorrodedMetal:    { name: 'CorrodedMetal',    color: '#ffffff', roughness: 0.7,  metalness: 0.4, friction: 0.6,  elasticity: 0.15, density: 5.0,  physicalType: 'hard', textureSet: 'rust' },
+  DiamondPlate:     { name: 'DiamondPlate',     color: '#ffffff', roughness: 0.4,  metalness: 0.4, friction: 0.5,  elasticity: 0.25, density: 7.8,  physicalType: 'hard', textureSet: 'diamond_plate' },
+  Foil:             { name: 'Foil',             color: '#ffffff', roughness: 0.1,  metalness: 0.3, friction: 0.3,  elasticity: 0.1,  density: 2.7,  physicalType: 'hard', textureSet: 'foil' },
+  Grass:            { name: 'Grass',            color: '#ffffff', roughness: 0.9,  metalness: 0.0, friction: 0.8,  elasticity: 0.05, density: 0.3,  physicalType: 'soft', textureSet: 'grass' },
+  Ice:              { name: 'Ice',              color: '#ffffff', roughness: 0.1,  metalness: 0.1, opacity: 0.7, friction: 0.05, elasticity: 0.05, density: 0.9, physicalType: 'ice', textureSet: 'ice' },
+  Brick:            { name: 'Brick',            color: '#ffffff', roughness: 0.85, metalness: 0.0, friction: 0.7,  elasticity: 0.1,  density: 1.9,  physicalType: 'hard', textureSet: 'brick' },
+  NormalBricks:     { name: 'NormalBricks',     color: '#ffffff', roughness: 0.85, metalness: 0.0, friction: 0.7,  elasticity: 0.1,  density: 1.9,  physicalType: 'hard', textureSet: 'normal_bricks' },
+  Sand:             { name: 'Sand',             color: '#ffffff', roughness: 0.95, metalness: 0.0, friction: 0.9,  elasticity: 0.02, density: 1.6,  physicalType: 'soft', textureSet: 'sand' },
+  Fabric:           { name: 'Fabric',           color: '#ffffff', roughness: 0.95, metalness: 0.0, friction: 0.9,  elasticity: 0.02, density: 0.2,  physicalType: 'soft', textureSet: 'carpet' },
+  Granite:          { name: 'Granite',          color: '#ffffff', roughness: 0.85, metalness: 0.1, friction: 0.65, elasticity: 0.12, density: 2.7,  physicalType: 'hardsoft', textureSet: 'granite' },
+  Marble:           { name: 'Marble',           color: '#ffffff', roughness: 0.3,  metalness: 0.1, friction: 0.4,  elasticity: 0.15, density: 2.7,  physicalType: 'hard', textureSet: 'marble' },
+  Cobblestone:      { name: 'Cobblestone',      color: '#ffffff', roughness: 0.9,  metalness: 0.0, friction: 0.75, elasticity: 0.1,  density: 2.5,  physicalType: 'hardsoft', textureSet: 'cobblestone' },
+  SmallCobblestone: { name: 'SmallCobblestone', color: '#ffffff', roughness: 0.9,  metalness: 0.0, friction: 0.75, elasticity: 0.1,  density: 2.5,  physicalType: 'hardsoft', textureSet: 'small_cobblestone' },
+  Pebble:           { name: 'Pebble',           color: '#ffffff', roughness: 0.85, metalness: 0.0, friction: 0.7,  elasticity: 0.12, density: 2.3,  physicalType: 'hardsoft', textureSet: 'pebble' },
+  Stone:            { name: 'Stone',            color: '#ffffff', roughness: 0.85, metalness: 0.1, friction: 0.65, elasticity: 0.12, density: 2.7,  physicalType: 'hard', textureSet: 'stone' },
+  RoughStone:       { name: 'RoughStone',       color: '#ffffff', roughness: 0.95, metalness: 0.0, friction: 0.7,  elasticity: 0.1,  density: 2.7,  physicalType: 'hard', textureSet: 'rough_stone' },
+  RockyGround:      { name: 'RockyGround',      color: '#ffffff', roughness: 0.9,  metalness: 0.0, friction: 0.75, elasticity: 0.1,  density: 2.5,  physicalType: 'hardsoft', textureSet: 'rocky_ground' },
+  Dirt:             { name: 'Dirt',             color: '#ffffff', roughness: 0.95, metalness: 0.0, friction: 0.8,  elasticity: 0.05, density: 1.4,  physicalType: 'soft', textureSet: 'dirt' },
+  Snow:             { name: 'Snow',             color: '#ffffff', roughness: 0.6,  metalness: 0.0, friction: 0.3,  elasticity: 0.05, density: 0.9,  physicalType: 'soft', textureSet: 'snow' },
+  Tiles:            { name: 'Tiles',            color: '#ffffff', roughness: 0.3,  metalness: 0.1, friction: 0.4,  elasticity: 0.15, density: 2.3,  physicalType: 'hard', textureSet: 'tiles' },
+  GeometricTiles:   { name: 'GeometricTiles',   color: '#ffffff', roughness: 0.4,  metalness: 0.1, friction: 0.5,  elasticity: 0.15, density: 2.3,  physicalType: 'hard', textureSet: 'geometric_tiles' },
+  Cardboard:        { name: 'Cardboard',        color: '#ffffff', roughness: 0.9,  metalness: 0.0, friction: 0.6,  elasticity: 0.1,  density: 0.3,  physicalType: 'soft', textureSet: 'cardboard' },
+  Leather:          { name: 'Leather',          color: '#ffffff', roughness: 0.7,  metalness: 0.0, friction: 0.5,  elasticity: 0.1,  density: 0.9,  physicalType: 'soft', textureSet: 'leather' },
+  Lava:             { name: 'Lava',             color: '#ffffff', roughness: 0.5,  metalness: 0.0, friction: 0.7,  elasticity: 0.1,  density: 2.7,  physicalType: 'hard', textureSet: 'lava' },
+  Magma:            { name: 'Magma',            color: '#ffffff', roughness: 0.6,  metalness: 0.0, friction: 0.7,  elasticity: 0.1,  density: 2.7,  physicalType: 'hard', textureSet: 'magma' },
+  // Neon: not textured. The glow follows the part's own colour
+  // (emissiveMatchesColor), so a blue Neon part glows blue — not the fixed
+  // #FF4444 red it used to. emissiveIntensity 2.0 keeps the bright glow.
+  Neon:             { name: 'Neon',             color: '#FF4444', roughness: 0.0,  metalness: 0.0, emissive: '#FF4444', emissiveIntensity: 2.0, emissiveMatchesColor: true, friction: 0.3, elasticity: 0.2, density: 1.0, physicalType: 'hard' },
+  // Wireframe: the classic baseplate grid. Baked into a static 1024² texture
+  // (white surface + light-gray 1-stud minor + 10-stud major grid) tiled at
+  // a fixed 10-stud size. Material colour is pure white so the wireframe
+  // renders white; the grid albedo IS bound (the lines are the point).
+  Wireframe:        { name: 'Wireframe',        color: '#ffffff', roughness: 0.6,  metalness: 0.0, friction: 0.5,  elasticity: 0.2,  density: 1.0,  physicalType: 'hard', textureSet: 'wireframe_grid', textureTileStuds: 10 },
 };
 
 export function getMaterialProps(materialName: string): MaterialDefinition {

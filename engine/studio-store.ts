@@ -93,10 +93,12 @@ export interface Vector3 {
 }
 
 export type MaterialType =
-  | 'Plastic' | 'Wood' | 'Slate' | 'Concrete' | 'Metal' | 'DiamondPlate'
-  | 'Grass' | 'Ice' | 'Brick' | 'Sand' | 'Fabric' | 'Granite' | 'Marble'
-  | 'Neon' | 'SmoothPlastic' | 'CorrodedMetal' | 'Foil' | 'Cobblestone'
-  | 'Pebble' | 'WoodPlanks' | 'Wireframe';
+  | 'Plastic' | 'Wood' | 'WoodPlanks' | 'WoodBark' | 'Slate' | 'Concrete'
+  | 'Metal' | 'CorrodedMetal' | 'DiamondPlate' | 'Foil' | 'Grass' | 'Ice'
+  | 'Brick' | 'NormalBricks' | 'Sand' | 'Fabric' | 'Granite' | 'Marble'
+  | 'Cobblestone' | 'SmallCobblestone' | 'Pebble' | 'Stone' | 'RoughStone'
+  | 'RockyGround' | 'Dirt' | 'Snow' | 'Tiles' | 'GeometricTiles'
+  | 'Cardboard' | 'Leather' | 'Lava' | 'Magma' | 'Neon' | 'Wireframe';
 
 // ─── BodyMovers (WeildBuild force appliers) ───
 
