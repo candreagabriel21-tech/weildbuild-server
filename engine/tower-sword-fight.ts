@@ -926,7 +926,11 @@ export class TowerSwordFightManager {
     if (this.player.invincibleFor > 0) return;
     this.player.hp = Math.max(0, this.player.hp - amount);
     this.onPlayerHurtCb?.(this.player.hp, this.player.maxHp);
-    if (this.player.hp <= 0) {
+    // pass 15: die at hp < 1, not hp <= 0. The HUD rounds HP UP, so a player
+    // at 0.9 hp looks like they have 1 hp left and gets stuck "alive". < 1
+    // catches the sub-1 remainder from fractional-tick poison / hook damage.
+    if (this.player.hp < 1) {
+      this.player.hp = 0;
       this.player.alive = false;
       this.player.deaths++;
       // A dying player loses their hook.
@@ -943,7 +947,11 @@ export class TowerSwordFightManager {
     if (!npc || !npc.alive) return;
     if (npc.invincibleFor > 0) return;
     npc.hp = Math.max(0, npc.hp - amount);
-    if (npc.hp <= 0) this.killNpc(npc);
+    // pass 15: same < 1 rule as the player (NPC HP bars round up too).
+    if (npc.hp < 1) {
+      npc.hp = 0;
+      this.killNpc(npc);
+    }
     this.rev++;
   }
 

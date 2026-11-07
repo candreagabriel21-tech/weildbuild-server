@@ -96,9 +96,7 @@ export type MaterialType =
   | 'Plastic' | 'Wood' | 'Slate' | 'Concrete' | 'Metal' | 'DiamondPlate'
   | 'Grass' | 'Ice' | 'Brick' | 'Sand' | 'Fabric' | 'Granite' | 'Marble'
   | 'Neon' | 'SmoothPlastic' | 'CorrodedMetal' | 'Foil' | 'Cobblestone'
-  | 'Pebble' | 'WoodPlanks'
-  // pass 14: the baseplate-style stud grid as a material (all faces).
-  | 'Wireframe';
+  | 'Pebble' | 'WoodPlanks';
 
 // ─── BodyMovers (WeildBuild force appliers) ───
 
@@ -201,8 +199,8 @@ export interface StudioPart {
   bodyMovers: BodyMover[];
   effects?: PartEffect[];
   isSpawnPoint?: boolean;
-  /** @deprecated pass 14: the baseplate is a plain Block with the Wireframe
-   *  material now. This flag is only read by the save migration (it strips
+  /** @deprecated pass 14/15: the baseplate is a plain Block (Plastic
+   *  material) now. This flag is only read by the save migration (it strips
    *  it and re-tags the part) - never set it on new parts, and no runtime
    *  code special-cases it anymore. */
   isBaseplate?: boolean;
@@ -2088,16 +2086,21 @@ export const useStudioStore = create<StudioStore>((set, get) => ({
     const newObjects = new Map<string, StudioObject>();
     data.objects.forEach((obj) => {
       if (isPart(obj)) {
-        // pass 14 (baseplate -> plain Block): same migration as
+        // pass 15 (baseplate -> plain Block): same migration as
         // restoreStudioState - a legacy isBaseplate part becomes a normal
-        // Block with the Wireframe material, keeping its saved transform.
-        // (Also upgrades old default-transparent spawn points to opaque.)
+        // Block with the standard Plastic material, keeping its saved
+        // transform. (Also upgrades old default-transparent spawn points to
+        // opaque, and any pass-14 save that used the now-removed 'Wireframe'
+        // material falls back to Plastic so old projects still load.)
         if ((obj as any).isBaseplate) {
           delete (obj as any).isBaseplate;
-          (obj as any).material = 'Wireframe';
+          (obj as any).material = 'Plastic';
           if (!obj.color || obj.color.toLowerCase() === '#3d6666') {
             (obj as any).color = '#397941';
           }
+        }
+        if ((obj as any).material === 'Wireframe') {
+          (obj as any).material = 'Plastic';
         }
         if (obj.isSpawnPoint && Number(obj.transparency) === 0.6) {
           (obj as any).transparency = 0;
@@ -2463,19 +2466,21 @@ export const useStudioStore = create<StudioStore>((set, get) => ({
 
   addBaseplate: () => {
     const state = get();
-    // pass 14 (user request): the baseplate is now a PLAIN Block part - no
+    // pass 15 (user request): the baseplate is a PLAIN Block part - no
     // isBaseplate flag, no special-case render/physics/drag guards anywhere.
-    // It uses the new "Wireframe" material (the old grid look, now drawn on
-    // all faces) so visually it's the classic baseplate, but structurally
-    // it's a normal 100×1×100 block: it can be MOVED (the old gizmo guard
-    // that pinned it at 0,0,0 is gone - that was the "baseplate snaps back
-    // to the origin when the game runs" bug), rotated, recolored, even
-    // deleted. Old saves are migrated in restoreStudioState/loadProject.
+    // It uses the standard Plastic material (the pass-14 "Wireframe" material
+    // and its onBeforeCompile grid shader were REMOVED - the shader injection
+    // broke the Vercel prerender build). The classic green + the editor's
+    // ground-grid overlay (GridLines) still give the baseplate its look.
+    // Structurally it's a normal 100×1×100 block: it can be MOVED (the old
+    // gizmo guard that pinned it at 0,0,0 is gone - that was the "baseplate
+    // snaps back to the origin when the game runs" bug), rotated, recolored,
+    // even deleted. Old saves are migrated in restoreStudioState/loadProject.
     let exists = false;
     state.objects.forEach((obj) => {
       if (!isPart(obj)) return;
       if ((obj as any).isBaseplate) { exists = true; return; } // legacy flag
-      if (obj.name === 'Baseplate' && obj.material === 'Wireframe') exists = true;
+      if (obj.name === 'Baseplate') exists = true;
     });
     if (exists) return; // Don't add a duplicate baseplate
 
@@ -2491,9 +2496,9 @@ export const useStudioStore = create<StudioStore>((set, get) => ({
       position: { x: 0, y: 0, z: 0 },
       size: { x: bpSize, y: 1, z: bpSize },
       rotation: { x: 0, y: 0, z: 0 },
-      // The owner's requested classic green + the Wireframe (grid) material.
+      // The owner's requested classic green; standard Plastic material.
       color: '#397941',
-      material: 'Wireframe',
+      material: 'Plastic',
       transparency: 0,
       reflectance: 0,
       anchored: true,

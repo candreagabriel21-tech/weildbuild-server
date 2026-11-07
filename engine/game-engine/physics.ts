@@ -496,6 +496,98 @@ export class PhysicsWorld {
   }
 
   /**
+   * pass 15 (user request: "a ball should be a ball"): the Sphere part's
+   * collision now matches the visual, instead of an AABB box.
+   *
+   * The visual mesh is a UNIT SphereGeometry scaled by mesh.scale to
+   * (size.x, size.y, size.z) - so a stretched sphere renders as an
+   * ELLIPSOID. cannon-es has no ellipsoid shape, so:
+   *   - UNSTRETCHED sphere (all three half-extents within 5% of the mean):
+   *     a single CANNON.Sphere(meanR). True sphere-vs-anything contacts -
+   *     exactly what the user asked for ("make the visual object be the
+   *     actual collision").
+   *   - STRETCHED sphere (e.g. a ball scaled into a pill): a STACK of
+   *     overlapping CANNON.Sphere shapes along the longest axis, each
+   *     sphere's radius = the cross-section radius at that point (the
+   *     ellipse equation). The union hugs the visual ellipsoid far better
+   *     than an AABB box (the box's flat faces made a stretched ball
+   *     collide as a brick), and every contact is still a plain
+   *     sphere-vs-anything point - the documented no-snag guarantee holds.
+   *
+   * Returns the PRIMARY shape (set on the body's constructor); any extra
+   * spheres come back in `extras` and the caller adds them via addShape.
+   * Shared by addBody and updateBodyShape so a resize keeps the same math.
+   */
+  static makeEllipsoidShape(
+    hx: number, hy: number, hz: number,
+  ): { primary: CANNON.Sphere; extras: { shape: CANNON.Sphere; offset: CANNON.Vec3 }[] } {
+    const mean = (hx + hy + hz) / 3;
+    const unstretched = Math.max(hx, hy, hz) <= mean * 1.05
+      && Math.min(hx, hy, hz) >= mean * 0.95;
+    if (unstretched) {
+      return { primary: new CANNON.Sphere(Math.max(mean, 0.005)), extras: [] };
+    }
+    // Stretched: find the LONGEST axis (the ellipsoid's pole axis). The
+    // stack of spheres runs along it; each sphere's radius is the
+    // cross-section radius of the ellipsoid at that point.
+    const axes: Array<{ half: number; r1: number; r2: number; dir: CANNON.Vec3 }> = [
+      { half: hx, r1: hy, r2: hz, dir: new CANNON.Vec3(1, 0, 0) },
+      { half: hy, r1: hx, r2: hz, dir: new CANNON.Vec3(0, 1, 0) },
+      { half: hz, r1: hx, r2: hy, dir: new CANNON.Vec3(0, 0, 1) },
+    ];
+    axes.sort((a, b) => b.half - a.half);
+    const pole = axes[0];
+    const crossR = Math.max(0.005, Math.min(pole.r1, pole.r2));
+    // The two TIP spheres are placed so their surface reaches the visual
+    // ellipsoid's poles exactly. Solving along + r(along) = pole.half for the
+    // ellipse cross-section r(along) = crossR*sqrt(1-(along/H)^2) gives the
+    // tip sphere center at u*H where u = (H^2 - crossR^2)/(H^2 + crossR^2).
+    // (Without this the end spheres taper to a smaller radius and the union
+    // falls ~0.25 short of the visual tip - verified by test-pass15-physics.)
+    const H = pole.half;
+    const denom = H * H + crossR * crossR;
+    const uTip = denom <= 0 ? 0 : (H * H - crossR * crossR) / denom;
+    const tipAlong = H * uTip;            // end-sphere center (positive)
+    const tipR = Math.max(0.005, crossR * Math.sqrt(Math.max(0, 1 - uTip * uTip)));
+    // Interior spheres fill (-tipAlong, +tipAlong) at <= 0.75*crossR spacing
+    // so the scallops between centers stay under 2% of R (imperceptible).
+    const interior = 2 * tipAlong;
+    const spacing = Math.max(0.04, crossR * 0.75);
+    const interiorCount = interior <= 0.001
+      ? 0
+      : Math.min(14, Math.max(0, Math.ceil(interior / spacing) - 1));
+    const spheres: { shape: CANNON.Sphere; offset: CANNON.Vec3 }[] = [];
+    const pushSphere = (along: number, r: number) => {
+      const k = 1 - (along / H) * (along / H);
+      const radius = Math.max(0.005, r === 0 ? crossR * Math.sqrt(Math.max(0, k)) : r);
+      spheres.push({
+        shape: new CANNON.Sphere(radius),
+        offset: new CANNON.Vec3(pole.dir.x * along, pole.dir.y * along, pole.dir.z * along),
+      });
+    };
+    // Negative tip, then interior (smallest->largest radius toward middle),
+    // then positive tip. Ordered along the pole axis.
+    pushSphere(-tipAlong, tipR);
+    for (let i = 1; i <= interiorCount; i++) {
+      const t = interiorCount === 0 ? 0.5 : i / (interiorCount + 1);
+      const along = -tipAlong + interior * t;
+      pushSphere(along, 0); // radius from the ellipse eqn inside pushSphere
+    }
+    pushSphere(tipAlong, tipR);
+    // The body's constructor takes ONE shape; hand it the middle sphere and
+    // add the rest via addShape in the caller. (Removing the constructor
+    // shape and re-adding all of them would also work, but this keeps the
+    // common unstretched path zero-allocation extras.)
+    const extras: { shape: CANNON.Sphere; offset: CANNON.Vec3 }[] = [];
+    const midIdx = Math.floor(spheres.length / 2);
+    const primary = spheres[midIdx].shape;
+    for (let i = 0; i < spheres.length; i++) {
+      if (i !== midIdx) extras.push(spheres[i]);
+    }
+    return { primary, extras };
+  }
+
+  /**
    * v6.2.6: add a part as a STATIC PROXY (server-authoritative
    * multiplayer). The server simulates every part; the local world keeps
    * only KINEMATIC COLLIDERS at the streamed positions so the local
@@ -548,25 +640,30 @@ export class PhysicsWorld {
 
     // Create cannon shape based on part type
     let shape: CANNON.Shape;
+    // pass 15: a stretched Sphere part becomes a STACK of sphere shapes
+    // (see makeEllipsoidShape); the primary is set on the body's constructor
+    // and the extras are added via addShape right after the body exists.
+    let sphereExtras: { shape: CANNON.Sphere; offset: CANNON.Vec3 }[] = [];
     switch (part.type) {
       case 'Sphere': {
-        // v1.1 FIX (user report: "the sphere can be stretched, but its
-        // collision doesn't match what it is visually"):
-        // The visual mesh is a UNIT SphereGeometry scaled by mesh.scale to
-        // (size.x, size.y, size.z) - so a stretched sphere renders as an
-        // ellipsoid. The old collision used CANNON.Sphere(max(size.x,y,z)/2)
-        // which is a perfect sphere of the LARGEST dimension: it poked
-        // past the thin ends of the visual ellipsoid by up to half a stud.
-        //
-        // Switched to CANNON.Box matching the AABB - WYSIWYG with the
-        // face-handle resize the editor uses (the handles sit at the AABB
-        // corners). A real ellipsoid ConvexPolyhedron would be smoother,
-        // but it's overkill for the studio and the box is exactly what
-        // every other part type does for collision anyway.
+        // pass 15 (user request: "a ball should be a ball"): the collision
+        // now matches the visual instead of an AABB box. The visual mesh is
+        // a UNIT SphereGeometry scaled by mesh.scale to (size.x, size.y,
+        // size.z), so a stretched sphere renders as an ELLIPSOID.
+        //   - unstretched sphere -> a single CANNON.Sphere (true sphere
+        //     contacts, what the user asked for).
+        //   - stretched sphere (e.g. a ball scaled into a pill) -> a STACK
+        //     of overlapping spheres along the long axis whose radii follow
+        //     the ellipse cross-section. The union hugs the visual ellipsoid
+        //     far better than the old AABB box (whose flat faces made a
+        //     stretched ball collide as a brick), and every contact is still
+        //     a sphere-vs-anything point. See PhysicsWorld.makeEllipsoidShape.
         const hx = Math.max(part.size.x / 2, 0.005);
         const hy = Math.max(part.size.y / 2, 0.005);
         const hz = Math.max(part.size.z / 2, 0.005);
-        shape = new CANNON.Box(new CANNON.Vec3(hx, hy, hz));
+        const ell = PhysicsWorld.makeEllipsoidShape(hx, hy, hz);
+        shape = ell.primary;
+        sphereExtras = ell.extras;
         break;
       }
       case 'Cylinder': {
@@ -667,6 +764,13 @@ export class PhysicsWorld {
       linearDamping: 0.01,
       angularDamping: 0.1,
     });
+
+    // pass 15: add the extra sphere shapes for a stretched Sphere part (the
+    // constructor only takes one shape). All extras share the body's
+    // material + collision filter, so this is purely geometry.
+    for (const ex of sphereExtras) {
+      cannonBody.addShape(ex.shape, ex.offset);
+    }
 
     // Apply rotation if present
     if (part.rotation.x !== 0 || part.rotation.y !== 0 || part.rotation.z !== 0) {
@@ -923,15 +1027,13 @@ export class PhysicsWorld {
     //   - the bottom pole still rests exactly at -H/2, so the standing
     //     height on flat ground is unchanged from the old box+sled.
     //
-    // pass 14 FIX (collision = visuals): the stack used to be a SINGLE
-    // column, so its radius collapsed to min(halfW, halfD) = the torso
-    // DEPTH (0.24) - the character visually spans 1.4 studs with arms but
-    // collided in a 0.48-wide circle, clipping ~half a stud into walls.
-    // The stack is now REPEATED along X (centers spread across the arm
-    // span) so the union covers the full visual silhouette:
-    //   width  = 2*halfW (arm span)   depth = 2*R (torso depth)
-    //   height = exactly H, feet at -H/2 as before.
-    // Every contact is STILL a plain sphere-vs-anything point - the
+    // pass 15 (user request: "revert the character hitbox to original"):
+    // pass 14 widened the stack into X columns to cover the arm span, but
+    // that changed how the character FELT to push against walls (a wider
+    // union snags the arms on door frames the body would otherwise clear).
+    // The original single-column pill is back: one stack at x=0, radius =
+    // min(halfD, H/2, halfW) (collapses to the torso depth on the default
+    // rig). Every contact is still a plain sphere-vs-anything point, so the
     // documented no-snag guarantee is untouched.
     const pillR = Math.max(0.05, Math.min(halfD, H / 2, halfW));
     const body = new CANNON.Body({
@@ -950,7 +1052,8 @@ export class PhysicsWorld {
     //   - bottom hemisphere center: -H/2 + R (bottom pole = -H/2 exactly)
     //   - top hemisphere center:    +H/2 - R (top pole = +H/2 exactly)
     //   - overlapping spheres between at <= 0.75R spacing, capped at 12
-    //     shapes per column so huge characters stay cheap to simulate.
+    //     shapes so huge characters stay cheap to simulate.
+    // pass 15: single column at x=0 (the original pre-pass-14 shape).
     const pillBottomC = -(H / 2) + pillR;
     const pillTopC = (H / 2) - pillR;
     const pillSpan = Math.max(0, pillTopC - pillBottomC);
@@ -958,22 +1061,11 @@ export class PhysicsWorld {
     const pillCount = pillSpan <= 0.001
       ? 1
       : Math.min(12, Math.max(2, Math.ceil(pillSpan / pillSpacing) + 1));
-    // pass 14: X columns covering the arm span. Columns sit within
-    // [-(halfW-R), +(halfW-R)] spaced <= R apart (overlapping, no gaps);
-    // capped at 5 so extreme custom sizes stay cheap (a gap can only open
-    // for characters much wider than deep - the default rig is exact).
-    const xSpread = 2 * Math.max(0, halfW - pillR);
-    const xColumns = xSpread <= 0.001
-      ? 1
-      : Math.min(5, Math.max(1, Math.ceil(xSpread / pillR) + 1));
-    for (let c = 0; c < xColumns; c++) {
-      const x = xColumns === 1 ? 0 : -xSpread / 2 + (xSpread * c) / (xColumns - 1);
-      for (let i = 0; i < pillCount; i++) {
-        const y = pillCount === 1
-          ? 0
-          : pillBottomC + (pillSpan * i) / (pillCount - 1);
-        body.addShape(new CANNON.Sphere(pillR), new CANNON.Vec3(x, y, 0));
-      }
+    for (let i = 0; i < pillCount; i++) {
+      const y = pillCount === 1
+        ? 0
+        : pillBottomC + (pillSpan * i) / (pillCount - 1);
+      body.addShape(new CANNON.Sphere(pillR), new CANNON.Vec3(0, y, 0));
     }
 
     body.position.set(spawnPosition.x, spawnPosition.y + H / 2, spawnPosition.z);
@@ -1323,10 +1415,11 @@ export class PhysicsWorld {
    * syncFromPart updates position + quaternion + the JS mirror's size, but the
    * cannon Body keeps its original CANNON.Shape forever - so a resized block
    * kept colliding at its old extents. This swaps in a fresh shape matching the
-   * new size (Box for Block/Sphere/Wedge, the 8-sided ConvexPolyhedron for
-   * Cylinder) and re-applies the quaternion so a rotated+resized part stays
-   * correct. Rotation-only changes don't need this (syncFromPart's quaternion
-   * write already turns the existing shape), but it's harmless to call.
+   * new size (Box for Block/Wedge, the 8-sided ConvexPolyhedron for Cylinder,
+   * and the makeEllipsoidShape sphere/stack for Sphere) and re-applies the
+   * quaternion so a rotated+resized part stays correct. Rotation-only changes
+   * don't need this (syncFromPart's quaternion write already turns the existing
+   * shape), but it's harmless to call.
    */
   updateBodyShape(part: StudioPart): void {
     const cannonBody = this.cannonBodies.get(part.id);
@@ -1334,14 +1427,19 @@ export class PhysicsWorld {
     const hx = Math.max(part.size.x / 2, 0.005);
     const hy = Math.max(part.size.y / 2, 0.005);
     const hz = Math.max(part.size.z / 2, 0.005);
-    // pass 14: same shape math as addBody (the old copy here had the same
-    // missing-caps bug the addBody branch did).
-    const shape: CANNON.Shape = part.type === 'Cylinder'
-      ? PhysicsWorld.makeCylinderShape(hx, hy, hz)
-      : new CANNON.Box(new CANNON.Vec3(hx, hy, hz));
-    // cannon-es: drop the old shapes and add the new one in place.
+    // cannon-es: drop the old shapes and add the new one(s) in place.
     for (const s of cannonBody.shapes) cannonBody.removeShape(s);
-    cannonBody.addShape(shape);
+    if (part.type === 'Cylinder') {
+      cannonBody.addShape(PhysicsWorld.makeCylinderShape(hx, hy, hz));
+    } else if (part.type === 'Sphere') {
+      // pass 15: rebuild the ellipsoid stack (a Sphere resize can flip
+      // between the single-sphere and stretched-stack branches).
+      const ell = PhysicsWorld.makeEllipsoidShape(hx, hy, hz);
+      cannonBody.addShape(ell.primary);
+      for (const ex of ell.extras) cannonBody.addShape(ex.shape, ex.offset);
+    } else {
+      cannonBody.addShape(new CANNON.Box(new CANNON.Vec3(hx, hy, hz)));
+    }
     if (part.rotation.x !== 0 || part.rotation.y !== 0 || part.rotation.z !== 0) {
       cannonBody.quaternion.setFromEuler(
         part.rotation.x * Math.PI / 180,

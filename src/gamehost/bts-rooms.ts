@@ -529,7 +529,12 @@ class BtsRoom {
   private damage(player: BtsPlayer, amount: number): void {
     if (!player.alive || player.invincibleFor > 0) return;
     player.hp = Math.max(0, player.hp - amount);
-    if (player.hp <= 0) {
+    // pass 15: die at hp < 1, not hp <= 0. The HUD rounds HP UP (Math.ceil),
+    // so a player at 0.9 hp looks like they have 1 hp left and never dies -
+    // they get stuck "alive" with one displayed pip. < 1 catches that case
+    // and any other sub-1 remainder from fractional-tick disaster damage.
+    if (player.hp < 1) {
+      player.hp = 0;
       player.alive = false;
       player.deaths++;
       player.respawnAt = Date.now() + RESPAWN_S * 1000;

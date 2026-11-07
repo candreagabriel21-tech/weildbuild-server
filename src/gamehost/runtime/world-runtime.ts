@@ -549,7 +549,9 @@ async function main(): Promise<void> {
           pushStats(p);
           try { weildCodeEngine.handlePlayerDamaged(p.username, p.hp - before, p.hp); } catch { /* never kill the sim */ }
         }
-        if (p.hp <= 0) killPlayer(p);
+        // pass 15: die at hp < 1, not hp <= 0. The HUD rounds HP UP, so a
+        // player at 0.9 hp shows 1 pip and never dies. < 1 catches that.
+        if (p.hp < 1) { p.hp = 0; killPlayer(p); }
         break;
       }
       case 'set_health': {
@@ -559,7 +561,7 @@ async function main(): Promise<void> {
           pushStats(p);
           try { weildCodeEngine.handlePlayerDamaged(p.username, p.hp - before, p.hp); } catch { /* never kill the sim */ }
         }
-        if (p.hp <= 0) killPlayer(p);
+        if (p.hp < 1) { p.hp = 0; killPlayer(p); }
         break;
       }
       // ─── v7: new rule-driven effects ───

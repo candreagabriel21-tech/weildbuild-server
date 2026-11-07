@@ -859,7 +859,11 @@ export class BuildToSurviveManager {
     if (this.invincibleFor > 0) return;
     this.player.hp = Math.max(0, this.player.hp - amount);
     this.onPlayerHurtCb?.(this.player.hp, this.player.max);
-    if (this.player.hp <= 0) {
+    // pass 15: die at hp < 1, not hp <= 0. The HUD rounds HP UP, so a player
+    // at 0.9 hp looks like they have 1 hp left and gets stuck "alive". < 1
+    // catches the sub-1 remainder from fractional-tick disaster damage.
+    if (this.player.hp < 1) {
+      this.player.hp = 0;
       this.player.alive = false;
       this.player.deaths++;
       this.playSoundCb?.('scream', 0.5);
