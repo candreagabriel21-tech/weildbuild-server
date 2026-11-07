@@ -227,7 +227,6 @@ function makePlacedPart(def: BtsPartDef, cx: number, cy: number, cz: number, rot
     bodyMovers: [],
     effects: [],
     isSpawnPoint: false,
-    isBaseplate: false,
     children: [],
     parentId: null,
     _bts: true, // tag (non-enumerable-ish; harmless if persisted)

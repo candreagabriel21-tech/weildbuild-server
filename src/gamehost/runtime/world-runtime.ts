@@ -302,7 +302,11 @@ async function main(): Promise<void> {
   // Pill dims for touch checks / void checks (same clamps the client's
   // createCharacterPillBody applies - see physics.ts).
   const playerHeight = 2;
-  const playerHalfW = 0.4;
+  // pass 14 (collision = visuals): match the standard hitbox - the arm span
+  // (1.4) on X and the torso depth (0.48) on Z, exactly like the client's
+  // widened pill. The old 0.8x0.8 let players clip into walls they touched.
+  const playerHalfW = 0.7;   // X half-width (arm span / 2)
+  const playerHalfD = 0.24;  // Z half-depth (torso depth / 2)
 
   // Spawn spacing: joining players land on a widening ring around the
   // spawn point (like classic lobby games) so overlapping characters
@@ -355,7 +359,7 @@ async function main(): Promise<void> {
     // was no server-side player body at all.
     try {
       world.addNamedCharacterBody(socketId, slot, {
-        size: { x: playerHalfW * 2, y: playerHeight, z: playerHalfW * 2 },
+        size: { x: playerHalfW * 2, y: playerHeight, z: playerHalfD * 2 },
       });
       world.setNamedCharacterKinematic(socketId);
     } catch { /* never kill the sim over a body add */ }
@@ -780,7 +784,7 @@ async function main(): Promise<void> {
       const newlyTouched: string[] = [];
       for (const c of candidates) {
         if (Math.abs(c.x - p.x) > c.hx + playerHalfW + 0.1) continue;
-        if (Math.abs(c.z - p.z) > c.hz + playerHalfW + 0.1) continue;
+        if (Math.abs(c.z - p.z) > c.hz + playerHalfD + 0.1) continue;
         if (Math.abs(c.y - cy) > c.hy + playerHeight / 2) continue;
         stillTouched.add(c.id);
         if (!p.touched.has(c.id)) newlyTouched.push(c.id);

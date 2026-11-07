@@ -128,6 +128,30 @@ export function restoreStudioState(state: StudioProjectState): void {
     if (isPart(cloned) && cloned.isCharacterPart) {
       cloned.showInWorld = true;
     }
+    // pass 14 (baseplate -> plain Block): migrate legacy isBaseplate parts.
+    // The flag carried a pile of special-case behavior (pinned position, a
+    // grid that only drew on the top face, "never delete/move" guards) that
+    // together caused the owner's "the baseplate snaps back to 0,0,0 when
+    // the game runs" bug. The part becomes a normal Block with the Wireframe
+    // material (the same grid look, now on all faces) and keeps its saved
+    // position/size/color, so a moved 100×100 plate STAYS where the creator
+    // put it.
+    if (isPart(cloned) && (cloned as any).isBaseplate) {
+      delete (cloned as any).isBaseplate;
+      cloned.material = 'Wireframe';
+      // Only recolor when the save still has the old default teal - a
+      // creator-chosen color is preserved.
+      if (!cloned.color || (cloned.color as string).toLowerCase() === '#3d6666') {
+        cloned.color = '#397941';
+      }
+    }
+    // pass 14: old spawn points saved with transparency 0.6 (the semi-
+    // transparent marker look). The owner wants them fully opaque now; a
+    // creator who deliberately made one glassy keeps their value - only the
+    // old DEFAULT is upgraded.
+    if (isPart(cloned) && cloned.isSpawnPoint && Number(cloned.transparency) === 0.6) {
+      cloned.transparency = 0;
+    }
     // v13.5: same value repair as loadProject - a restored snapshot must never
     // resurrect zero/negative sizes or 370-degree rotations into the store.
     if (isPart(cloned)) {

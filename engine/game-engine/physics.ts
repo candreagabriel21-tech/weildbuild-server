@@ -456,6 +456,46 @@ export class PhysicsWorld {
   // ─── Body Management ───
 
   /**
+   * pass 14 (collision = visuals): an 8-sided convex hull that matches the
+   * visual cylinder (an ellipsoid-cylinder stretched by size.x/y/z). Shared
+   * by addBody and updateBodyShape so a resize keeps the same shape math.
+   *
+   * Winding (all verified by scripts/test-cylinder-collider.ts):
+   *   - vertices: top ring at even indices (2i), bottom ring at odd (2i+1),
+   *     angle order counterclockwise seen from -Y.
+   *   - top cap: the top ring in REVERSE angle order (normal +Y, outward).
+   *   - bottom cap: the bottom ring in angle order (normal -Y, outward).
+   *   - side walls: [top_i, top_i+1, bottom_i+1, bottom_i] (outward normal).
+   */
+  static makeCylinderShape(hx: number, hy: number, hz: number): CANNON.ConvexPolyhedron {
+    const sides = 8;
+    const verts: CANNON.Vec3[] = [];
+    for (let i = 0; i < sides; i++) {
+      const a = (i / sides) * Math.PI * 2;
+      const cx = Math.cos(a) * hx;
+      const cz = Math.sin(a) * hz;
+      verts.push(new CANNON.Vec3(cx, hy, cz));   // top ring    (index 2i)
+      verts.push(new CANNON.Vec3(cx, -hy, cz));  // bottom ring (index 2i+1)
+    }
+    const faces: number[][] = [];
+    // Top cap: reversed angle order faces +Y (outward).
+    const top: number[] = [];
+    for (let i = sides - 1; i >= 0; i--) top.push(i * 2);
+    faces.push(top);
+    // Bottom cap: angle order faces -Y (outward).
+    const bottom: number[] = [];
+    for (let i = 0; i < sides; i++) bottom.push(i * 2 + 1);
+    faces.push(bottom);
+    // Side walls: outward-facing quads between consecutive ring segments.
+    for (let i = 0; i < sides; i++) {
+      const a = i * 2;
+      const b = ((i + 1) % sides) * 2;
+      faces.push([a, b, b + 1, a + 1]);
+    }
+    return new CANNON.ConvexPolyhedron({ vertices: verts, faces });
+  }
+
+  /**
    * v6.2.6: add a part as a STATIC PROXY (server-authoritative
    * multiplayer). The server simulates every part; the local world keeps
    * only KINEMATIC COLLIDERS at the streamed positions so the local
@@ -531,45 +571,24 @@ export class PhysicsWorld {
       }
       case 'Cylinder': {
         // v1.1 FIX (same class of bug as Sphere): the visual mesh is a
-        // unit CylinderGeometry scaled by (size.x, size.y, size.z), but
-        // the old cannon Cylinder used max(x,z)/2 for BOTH radii - so X != Z
+        // unit CylinderGeometry scaled by (size.x, size.y, size.z), but the
+        // old cannon Cylinder used max(x,z)/2 for BOTH radii - so X != Z
         // stretching produced a visual ellipsoid-cylinder but a circular
-        // cannon cylinder that poked out. Now using an 8-segment
-        // ConvexPolyhedron that approximates the stretched cylinder
-        // (close enough for a blocky sandbox engine; matches the AABB on
-        // X and Z, leaves the round top/bottom caps approximately).
-        const hx = Math.max(part.size.x / 2, 0.005);
-        const hy = Math.max(part.size.y / 2, 0.005);
-        const hz = Math.max(part.size.z / 2, 0.005);
-        const sides = 8;
-        const verts: CANNON.Vec3[] = [];
-        for (let i = 0; i < sides; i++) {
-          const a = (i / sides) * Math.PI * 2;
-          const cx = Math.cos(a) * hx;
-          const cz = Math.sin(a) * hz;
-          verts.push(new CANNON.Vec3(cx,  hy, cz)); // top ring
-          verts.push(new CANNON.Vec3(cx, -hy, cz)); // bottom ring
-        }
-        const faces: number[][] = [];
-        // top cap (triangle fan)
-        for (let i = 0; i < sides; i++) {
-          const a = i * 2;
-          const b = ((i + 1) % sides) * 2;
-          faces.push([a, b, b + 1, a + 1]);
-        }
-        // bottom cap (reversed winding)
-        for (let i = 0; i < sides; i++) {
-          const a = i * 2 + 1;
-          const b = ((i + 1) % sides) * 2 + 1;
-          faces.push([a, a - 1, b - 1, b]);
-        }
-        // side quads
-        for (let i = 0; i < sides; i++) {
-          const a = i * 2;
-          const b = ((i + 1) % sides) * 2;
-          faces.push([a, a + 1, b + 1, b]);
-        }
-        shape = new CANNON.ConvexPolyhedron({ vertices: verts, faces });
+        // cannon cylinder that poked out.
+        //
+        // pass 14 FIX (the REAL bug - "collision shorter than the visual"):
+        // the old hand-rolled faces array emitted the side walls TWICE
+        // (once per winding) and NO top/bottom caps at all, so nothing
+        // could rest ON a cylinder and side contacts resolved against
+        // inward-facing normals. Now: an 8-sided ConvexPolyhedron with a
+        // proper top cap, bottom cap and outward side walls (verified in
+        // scripts/test-cylinder-collider.ts - a sphere rests exactly on
+        // the cap, a box rests exactly on the cap, side contacts push out).
+        shape = PhysicsWorld.makeCylinderShape(
+          Math.max(part.size.x / 2, 0.005),
+          Math.max(part.size.y / 2, 0.005),
+          Math.max(part.size.z / 2, 0.005),
+        );
         break;
       }
       case 'Wedge': {
@@ -903,7 +922,18 @@ export class PhysicsWorld {
     //     point, so there is no flat face anywhere to snag a corner,
     //   - the bottom pole still rests exactly at -H/2, so the standing
     //     height on flat ground is unchanged from the old box+sled.
-    const pillR = Math.max(0.05, Math.min(halfW, halfD, H / 2));
+    //
+    // pass 14 FIX (collision = visuals): the stack used to be a SINGLE
+    // column, so its radius collapsed to min(halfW, halfD) = the torso
+    // DEPTH (0.24) - the character visually spans 1.4 studs with arms but
+    // collided in a 0.48-wide circle, clipping ~half a stud into walls.
+    // The stack is now REPEATED along X (centers spread across the arm
+    // span) so the union covers the full visual silhouette:
+    //   width  = 2*halfW (arm span)   depth = 2*R (torso depth)
+    //   height = exactly H, feet at -H/2 as before.
+    // Every contact is STILL a plain sphere-vs-anything point - the
+    // documented no-snag guarantee is untouched.
+    const pillR = Math.max(0.05, Math.min(halfD, H / 2, halfW));
     const body = new CANNON.Body({
       mass: 8, // heavy enough to push light parts, light enough to be pushed
       material: charMat,
@@ -920,7 +950,7 @@ export class PhysicsWorld {
     //   - bottom hemisphere center: -H/2 + R (bottom pole = -H/2 exactly)
     //   - top hemisphere center:    +H/2 - R (top pole = +H/2 exactly)
     //   - overlapping spheres between at <= 0.75R spacing, capped at 12
-    //     shapes so huge characters stay cheap to simulate.
+    //     shapes per column so huge characters stay cheap to simulate.
     const pillBottomC = -(H / 2) + pillR;
     const pillTopC = (H / 2) - pillR;
     const pillSpan = Math.max(0, pillTopC - pillBottomC);
@@ -928,11 +958,22 @@ export class PhysicsWorld {
     const pillCount = pillSpan <= 0.001
       ? 1
       : Math.min(12, Math.max(2, Math.ceil(pillSpan / pillSpacing) + 1));
-    for (let i = 0; i < pillCount; i++) {
-      const y = pillCount === 1
-        ? 0
-        : pillBottomC + (pillSpan * i) / (pillCount - 1);
-      body.addShape(new CANNON.Sphere(pillR), new CANNON.Vec3(0, y, 0));
+    // pass 14: X columns covering the arm span. Columns sit within
+    // [-(halfW-R), +(halfW-R)] spaced <= R apart (overlapping, no gaps);
+    // capped at 5 so extreme custom sizes stay cheap (a gap can only open
+    // for characters much wider than deep - the default rig is exact).
+    const xSpread = 2 * Math.max(0, halfW - pillR);
+    const xColumns = xSpread <= 0.001
+      ? 1
+      : Math.min(5, Math.max(1, Math.ceil(xSpread / pillR) + 1));
+    for (let c = 0; c < xColumns; c++) {
+      const x = xColumns === 1 ? 0 : -xSpread / 2 + (xSpread * c) / (xColumns - 1);
+      for (let i = 0; i < pillCount; i++) {
+        const y = pillCount === 1
+          ? 0
+          : pillBottomC + (pillSpan * i) / (pillCount - 1);
+        body.addShape(new CANNON.Sphere(pillR), new CANNON.Vec3(x, y, 0));
+      }
     }
 
     body.position.set(spawnPosition.x, spawnPosition.y + H / 2, spawnPosition.z);
@@ -1293,34 +1334,11 @@ export class PhysicsWorld {
     const hx = Math.max(part.size.x / 2, 0.005);
     const hy = Math.max(part.size.y / 2, 0.005);
     const hz = Math.max(part.size.z / 2, 0.005);
-    let shape: CANNON.Shape;
-    if (part.type === 'Cylinder') {
-      const sides = 8;
-      const verts: CANNON.Vec3[] = [];
-      for (let i = 0; i < sides; i++) {
-        const a = (i / sides) * Math.PI * 2;
-        const cx = Math.cos(a) * hx;
-        const cz = Math.sin(a) * hz;
-        verts.push(new CANNON.Vec3(cx, hy, cz));
-        verts.push(new CANNON.Vec3(cx, -hy, cz));
-      }
-      const faces: number[][] = [];
-      for (let i = 0; i < sides; i++) {
-        const a = i * 2;
-        const b = ((i + 1) % sides) * 2;
-        faces.push([a, b, b + 1, a + 1]);
-      }
-      const sideFaces: number[][] = [];
-      for (let i = 0; i < sides; i++) {
-        const a = i * 2;
-        const b = ((i + 1) % sides) * 2;
-        sideFaces.push([a, b, b + 1, a + 1]);
-      }
-      shape = new CANNON.ConvexPolyhedron({ vertices: verts, faces });
-    } else {
-      // Block, Sphere (AABB per the v1.1 fix), Wedge, Spawn -> Box.
-      shape = new CANNON.Box(new CANNON.Vec3(hx, hy, hz));
-    }
+    // pass 14: same shape math as addBody (the old copy here had the same
+    // missing-caps bug the addBody branch did).
+    const shape: CANNON.Shape = part.type === 'Cylinder'
+      ? PhysicsWorld.makeCylinderShape(hx, hy, hz)
+      : new CANNON.Box(new CANNON.Vec3(hx, hy, hz));
     // cannon-es: drop the old shapes and add the new one in place.
     for (const s of cannonBody.shapes) cannonBody.removeShape(s);
     cannonBody.addShape(shape);

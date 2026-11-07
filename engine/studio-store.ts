@@ -96,7 +96,9 @@ export type MaterialType =
   | 'Plastic' | 'Wood' | 'Slate' | 'Concrete' | 'Metal' | 'DiamondPlate'
   | 'Grass' | 'Ice' | 'Brick' | 'Sand' | 'Fabric' | 'Granite' | 'Marble'
   | 'Neon' | 'SmoothPlastic' | 'CorrodedMetal' | 'Foil' | 'Cobblestone'
-  | 'Pebble' | 'WoodPlanks';
+  | 'Pebble' | 'WoodPlanks'
+  // pass 14: the baseplate-style stud grid as a material (all faces).
+  | 'Wireframe';
 
 // ─── BodyMovers (WeildBuild force appliers) ───
 
@@ -199,6 +201,10 @@ export interface StudioPart {
   bodyMovers: BodyMover[];
   effects?: PartEffect[];
   isSpawnPoint?: boolean;
+  /** @deprecated pass 14: the baseplate is a plain Block with the Wireframe
+   *  material now. This flag is only read by the save migration (it strips
+   *  it and re-tags the part) - never set it on new parts, and no runtime
+   *  code special-cases it anymore. */
   isBaseplate?: boolean;
   spawnTeam?: 'Neutral' | 'Blue' | 'Red';
   /** True if this part is a character body part (head, torso, arm, leg, face). */
@@ -1591,13 +1597,19 @@ export const useStudioStore = create<StudioStore>((set, get) => ({
     // Get per-type defaults (color + size)
     const defaults = PART_DEFAULTS[type] || PART_DEFAULTS['Block'];
     const size = { ...defaults.size };
-    // v13.6: spawn the part resting ON the baseplate's actual top surface
-    // (the default baseplate now sits at 0,0,0, so its top is at +0.5 - a
-    // hardcoded y = size.y/2 would leave the part half-buried).
+    // v13.6: spawn the part resting ON the ground surface. pass 14: the
+    // baseplate is a plain Block now (no isBaseplate flag), so "the ground"
+    // is simply the highest top surface among big flat parts near the
+    // origin (the Baseplate at 0,0,0 top = +0.5 by default).
     let groundY = 0;
     state.objects.forEach((obj) => {
-      if (isPart(obj) && obj.isBaseplate) {
-        groundY = obj.position.y + obj.size.y / 2;
+      if (!isPart(obj) || obj.isCharacterPart || obj.isSpawnPoint) return;
+      const top = obj.position.y + obj.size.y / 2;
+      const withinFootprint =
+        Math.abs(obj.position.x) <= obj.size.x / 2 &&
+        Math.abs(obj.position.z) <= obj.size.z / 2;
+      if (withinFootprint && top > groundY && obj.size.x >= 4 && obj.size.z >= 4) {
+        groundY = top;
       }
     });
     const yPos = groundY + size.y / 2;
@@ -2076,6 +2088,20 @@ export const useStudioStore = create<StudioStore>((set, get) => ({
     const newObjects = new Map<string, StudioObject>();
     data.objects.forEach((obj) => {
       if (isPart(obj)) {
+        // pass 14 (baseplate -> plain Block): same migration as
+        // restoreStudioState - a legacy isBaseplate part becomes a normal
+        // Block with the Wireframe material, keeping its saved transform.
+        // (Also upgrades old default-transparent spawn points to opaque.)
+        if ((obj as any).isBaseplate) {
+          delete (obj as any).isBaseplate;
+          (obj as any).material = 'Wireframe';
+          if (!obj.color || obj.color.toLowerCase() === '#3d6666') {
+            (obj as any).color = '#397941';
+          }
+        }
+        if (obj.isSpawnPoint && Number(obj.transparency) === 0.6) {
+          (obj as any).transparency = 0;
+        }
         // v13.5: repair broken values from old files at the door. Files saved
         // by older versions (or hand-edited) can carry zero/negative/huge
         // sizes or 370-degree rotations - once inside the store, that state
@@ -2412,7 +2438,10 @@ export const useStudioStore = create<StudioStore>((set, get) => ({
       rotation: { x: 0, y: 0, z: 0 },
       color: spawnColor,
       material: 'Neon',
-      transparency: 0.6, // Semi-transparent - shows SpawnMarker circle underneath
+      // pass 14 (user request): spawn points are fully OPAQUE now (the old
+      // 0.6 semi-transparent marker default is gone). The SpawnMarker ring
+      // renders above the pad, so nothing is lost visually.
+      transparency: 0,
       reflectance: 0,
       anchored: true,
       canCollide: false, // Not a physical object - it's a visual marker only
@@ -2434,12 +2463,21 @@ export const useStudioStore = create<StudioStore>((set, get) => ({
 
   addBaseplate: () => {
     const state = get();
-    // Check if a baseplate already exists
-    let existingBaseplate: StudioPart | null = null;
+    // pass 14 (user request): the baseplate is now a PLAIN Block part - no
+    // isBaseplate flag, no special-case render/physics/drag guards anywhere.
+    // It uses the new "Wireframe" material (the old grid look, now drawn on
+    // all faces) so visually it's the classic baseplate, but structurally
+    // it's a normal 100×1×100 block: it can be MOVED (the old gizmo guard
+    // that pinned it at 0,0,0 is gone - that was the "baseplate snaps back
+    // to the origin when the game runs" bug), rotated, recolored, even
+    // deleted. Old saves are migrated in restoreStudioState/loadProject.
+    let exists = false;
     state.objects.forEach((obj) => {
-      if (isPart(obj) && obj.isBaseplate) existingBaseplate = obj;
+      if (!isPart(obj)) return;
+      if ((obj as any).isBaseplate) { exists = true; return; } // legacy flag
+      if (obj.name === 'Baseplate' && obj.material === 'Wireframe') exists = true;
     });
-    if (existingBaseplate) return; // Don't add duplicate baseplate
+    if (exists) return; // Don't add a duplicate baseplate
 
     _pushUndo(get, set);
     const currentState = get();
@@ -2450,12 +2488,12 @@ export const useStudioStore = create<StudioStore>((set, get) => ({
       id,
       name: 'Baseplate',
       type: 'Block',
-      // v13.6: baseplate spawns exactly at 0, 0, 0 (user request)
       position: { x: 0, y: 0, z: 0 },
       size: { x: bpSize, y: 1, z: bpSize },
       rotation: { x: 0, y: 0, z: 0 },
-      color: '#3d6666',
-      material: 'Plastic',
+      // The owner's requested classic green + the Wireframe (grid) material.
+      color: '#397941',
+      material: 'Wireframe',
       transparency: 0,
       reflectance: 0,
       anchored: true,
@@ -2467,7 +2505,6 @@ export const useStudioStore = create<StudioStore>((set, get) => ({
       parentId: null,
       bodyMovers: [],
       effects: [],
-      isBaseplate: true,
     };
     const newObjects = new Map(currentState.objects);
     newObjects.set(id, baseplatePart);

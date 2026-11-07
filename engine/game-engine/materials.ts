@@ -6,6 +6,10 @@ export interface MaterialDefinition {
   emissive?: string;
   emissiveIntensity?: number;
   opacity?: number;
+  // pass 14 (user request): renders the baseplate-style stud grid on ALL
+  // faces of the part (the classic sandbox "wireframe" look). Purely visual -
+  // PartMesh injects the shader, physics ignores it.
+  grid?: boolean;
   // Physical properties (WeildBuild-inspired)
   friction: number;      // 0.0 - 1.0
   elasticity: number;    // 0.0 - 1.0 (bounciness)
@@ -34,6 +38,11 @@ export const MATERIALS: Record<string, MaterialDefinition> = {
   Neon:          { name: 'Neon',          color: '#FF4444', roughness: 0.0,  metalness: 0.0, emissive: '#FF4444', emissiveIntensity: 2.0, friction: 0.3, elasticity: 0.2, density: 1.0, physicalType: 'hard' },
   Cobblestone:   { name: 'Cobblestone',   color: '#7A7A7A', roughness: 0.9,  metalness: 0.0, friction: 0.75, elasticity: 0.1,  density: 2.5,  physicalType: 'hardsoft' },
   Pebble:        { name: 'Pebble',        color: '#8A8A7A', roughness: 0.85, metalness: 0.0, friction: 0.7,  elasticity: 0.12, density: 2.3,  physicalType: 'hardsoft' },
+  // pass 14 (user request): the baseplate's checker/stud look as a material.
+  // The grid is drawn on every face of the part by PartMesh's shader
+  // injection (see the Wireframe branch there). The default Baseplate block
+  // uses it, and any part can switch to it from the Properties panel.
+  Wireframe:     { name: 'Wireframe',     color: '#397941', roughness: 0.8,  metalness: 0.0, grid: true, friction: 0.5, elasticity: 0.2, density: 1.0, physicalType: 'hard' },
 };
 
 export function getMaterialProps(materialName: string): MaterialDefinition {
