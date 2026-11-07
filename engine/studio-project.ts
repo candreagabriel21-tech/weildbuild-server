@@ -134,8 +134,9 @@ export function restoreStudioState(state: StudioProjectState): void {
     // together caused the owner's "the baseplate snaps back to 0,0,0 when
     // the game runs" bug. The part becomes a normal Block with the standard
     // Plastic material and keeps its saved position/size/color, so a moved
-    // 100×100 plate STAYS where the creator put it. (Pass-14 saves that
-    // used the now-removed 'Wireframe' material also fall back to Plastic.)
+    // 100×100 plate STAYS where the creator put it. (Pass 16 re-introduced a
+    // build-safe Wireframe material, so pass-14 saves that used it are now
+    // PRESERVED instead of falling back to Plastic - mirrors the client.)
     if (isPart(cloned) && (cloned as any).isBaseplate) {
       delete (cloned as any).isBaseplate;
       cloned.material = 'Plastic';
@@ -144,9 +145,6 @@ export function restoreStudioState(state: StudioProjectState): void {
       if (!cloned.color || (cloned.color as string).toLowerCase() === '#3d6666') {
         cloned.color = '#397941';
       }
-    }
-    if (isPart(cloned) && (cloned.material as string) === 'Wireframe') {
-      cloned.material = 'Plastic';
     }
     // pass 14: old spawn points saved with transparency 0.6 (the semi-
     // transparent marker look). The owner wants them fully opaque now; a

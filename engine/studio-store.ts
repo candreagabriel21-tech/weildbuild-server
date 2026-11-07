@@ -96,7 +96,7 @@ export type MaterialType =
   | 'Plastic' | 'Wood' | 'Slate' | 'Concrete' | 'Metal' | 'DiamondPlate'
   | 'Grass' | 'Ice' | 'Brick' | 'Sand' | 'Fabric' | 'Granite' | 'Marble'
   | 'Neon' | 'SmoothPlastic' | 'CorrodedMetal' | 'Foil' | 'Cobblestone'
-  | 'Pebble' | 'WoodPlanks';
+  | 'Pebble' | 'WoodPlanks' | 'Wireframe';
 
 // ─── BodyMovers (WeildBuild force appliers) ───
 
@@ -2090,17 +2090,16 @@ export const useStudioStore = create<StudioStore>((set, get) => ({
         // restoreStudioState - a legacy isBaseplate part becomes a normal
         // Block with the standard Plastic material, keeping its saved
         // transform. (Also upgrades old default-transparent spawn points to
-        // opaque, and any pass-14 save that used the now-removed 'Wireframe'
-        // material falls back to Plastic so old projects still load.)
+        // opaque.) NOTE: pass 16 re-introduced the build-safe Wireframe
+        // material, so legacy pass-14 saves carrying material: 'Wireframe'
+        // are now PRESERVED (the new Wireframe uses the standard material's
+        // built-in wireframe flag, no shader injection, prerender-safe).
         if ((obj as any).isBaseplate) {
           delete (obj as any).isBaseplate;
           (obj as any).material = 'Plastic';
           if (!obj.color || obj.color.toLowerCase() === '#3d6666') {
             (obj as any).color = '#397941';
           }
-        }
-        if ((obj as any).material === 'Wireframe') {
-          (obj as any).material = 'Plastic';
         }
         if (obj.isSpawnPoint && Number(obj.transparency) === 0.6) {
           (obj as any).transparency = 0;
@@ -2468,14 +2467,16 @@ export const useStudioStore = create<StudioStore>((set, get) => ({
     const state = get();
     // pass 15 (user request): the baseplate is a PLAIN Block part - no
     // isBaseplate flag, no special-case render/physics/drag guards anywhere.
-    // It uses the standard Plastic material (the pass-14 "Wireframe" material
-    // and its onBeforeCompile grid shader were REMOVED - the shader injection
-    // broke the Vercel prerender build). The classic green + the editor's
-    // ground-grid overlay (GridLines) still give the baseplate its look.
+    // It uses the standard Plastic material. (pass 16 re-introduced a
+    // build-safe Wireframe material using the standard material's built-in
+    // `wireframe` flag - no onBeforeCompile / shader injection - but the
+    // baseplate stays Plastic by default; the classic green + the editor's
+    // ground-grid overlay (GridLines) give it its look. The pass-14
+    // GLSL-grid Wireframe that broke the Vercel prerender is gone for good.)
     // Structurally it's a normal 100×1×100 block: it can be MOVED (the old
     // gizmo guard that pinned it at 0,0,0 is gone - that was the "baseplate
     // snaps back to the origin when the game runs" bug), rotated, recolored,
-    // even deleted. Old saves are migrated in restoreStudioState/loadProject.
+    // even deleted. Old saves are migrated in loadProject.
     let exists = false;
     state.objects.forEach((obj) => {
       if (!isPart(obj)) return;
