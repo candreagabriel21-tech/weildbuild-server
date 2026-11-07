@@ -127,6 +127,9 @@ export function restoreStudioState(state: StudioProjectState): void {
     // should always be visible in both editor and play mode.
     if (isPart(cloned) && cloned.isCharacterPart) {
       cloned.showInWorld = true;
+      // pass 21 (camera rebuild): default restored character parts to
+      // camera-see-through (the camera orbits its own character).
+      if (cloned.cameraCanLookThrough === undefined) cloned.cameraCanLookThrough = true;
     }
     // pass 15 (baseplate -> plain Block): migrate legacy isBaseplate parts.
     // The flag carried a pile of special-case behavior (pinned position, a
@@ -184,6 +187,12 @@ export function restoreStudioState(state: StudioProjectState): void {
   if (migratedWorld.gravity === -9.81 || migratedWorld.gravity === -9.8) {
     migratedWorld.gravity = -35;
   }
+  // pass 21 (camera rebuild): default the new camera flags on old saves
+  // (classic behaviour) - mirrors the client's restoreStudioState.
+  if (migratedWorld.cameraFollowCharacter === undefined) migratedWorld.cameraFollowCharacter = true;
+  if (migratedWorld.cameraCharacterLookLock === undefined) migratedWorld.cameraCharacterLookLock = true;
+  if (migratedWorld.cameraCanOrbit === undefined) migratedWorld.cameraCanOrbit = true;
+  if (migratedWorld.cameraCanLookThroughObjects === undefined) migratedWorld.cameraCanLookThroughObjects = true;
 
   // Single atomic setState so we don't trigger intermediate re-renders
   useStudioStore.setState({

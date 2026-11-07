@@ -99,6 +99,15 @@ export const ACTION_CATEGORY: Record<ActionType, string> = {
   set_variable: 'variables',
   change_variable: 'variables',
   add_rule: 'variables',
+
+  // pass 21: camera placeholder actions (mirrors the client's palette map).
+  camera_follow_character: 'looks',
+  camera_characterlook_lock: 'looks',
+  camera_can_orbit: 'looks',
+  camera_can_look_through: 'looks',
+  camera_position: 'looks',
+  camera_yaw: 'looks',
+  camera_pitch: 'looks',
 };
 
 /** Palette entry for one action type. */

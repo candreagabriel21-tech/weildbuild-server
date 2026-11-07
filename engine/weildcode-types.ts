@@ -468,7 +468,17 @@ export type ActionType =
   | 'modify_property'     // Change a property (anchored, can collide, ...)
   | 'set_player_speed'    // Set the player's walk speed
   | 'set_spawn_point'     // Change where (a) player(s) respawn
-  | 'respawn_player';     // Teleport player(s) to spawn at full health
+  | 'respawn_player'      // Teleport player(s) to spawn at full health
+  // ─── pass 21: camera actions (PLACEHOLDERS - declared, editable and
+  // saveable but NOT wired to behaviour yet; the owner will wire them.
+  // Mirrors the client's ActionType union 1:1.)
+  | 'camera_follow_character'      // true/false: camera always follows character
+  | 'camera_characterlook_lock'    // true/false: camera always points at character
+  | 'camera_can_orbit'             // true/false: player can orbit the camera
+  | 'camera_can_look_through'      // true/false: camera retracts for solid objects
+  | 'camera_position'              // set the camera point's world x,y,z
+  | 'camera_yaw'                   // set the camera's yaw (point of looking, degrees)
+  | 'camera_pitch';                // set the camera's pitch (degrees)
 
 export interface ActionParam {
   key: string;
@@ -1165,6 +1175,72 @@ export const ACTION_DEFINITIONS: ActionDefinition[] = [
     params: [
       PLAYER_TARGET_PARAM,
       PLAYER_TARGET_NAME_PARAM,
+    ],
+  },
+  // ─── pass 21: CAMERA actions (PLACEHOLDERS - unwired, mirrors the
+  // client's ACTION_DEFINITIONS 1:1 so rules authored on either side
+  // serialize identically). ───
+  {
+    type: 'camera_follow_character',
+    label: 'Camera follow character',
+    description: 'Placeholder (not wired yet): true = camera always follows the character, false = stays put',
+    icon: 'Move',
+    params: [
+      { key: 'enabled', label: 'Follow character', type: 'boolean', default: true },
+    ],
+  },
+  {
+    type: 'camera_characterlook_lock',
+    label: 'Camera look lock',
+    description: 'Placeholder (not wired yet): true = camera always points at the character, false = keeps its aim',
+    icon: 'Eye',
+    params: [
+      { key: 'enabled', label: 'Lock look at character', type: 'boolean', default: true },
+    ],
+  },
+  {
+    type: 'camera_can_orbit',
+    label: 'Camera can orbit',
+    description: 'Placeholder (not wired yet): true = the player can orbit the camera, false = it stays in one place',
+    icon: 'RotateCcw',
+    params: [
+      { key: 'enabled', label: 'Allow orbiting', type: 'boolean', default: true },
+    ],
+  },
+  {
+    type: 'camera_can_look_through',
+    label: 'Camera can look through',
+    description: 'Placeholder (not wired yet): true = camera retracts out of solid objects, false = ignores occluders',
+    icon: 'Eye',
+    params: [
+      { key: 'enabled', label: 'Retract for solid objects', type: 'boolean', default: true },
+    ],
+  },
+  {
+    type: 'camera_position',
+    label: 'Camera position',
+    description: 'Placeholder (not wired yet): set the camera point\'s world position (cutscene shots)',
+    icon: 'MapPin',
+    params: [
+      { key: 'position', label: 'Position (x,y,z)', type: 'vector3', default: { x: 0, y: 8, z: 14 } },
+    ],
+  },
+  {
+    type: 'camera_yaw',
+    label: 'Camera yaw',
+    description: 'Placeholder (not wired yet): set the camera\'s yaw (its point of looking), in degrees',
+    icon: 'RotateCcw',
+    params: [
+      { key: 'yaw', label: 'Yaw (degrees)', type: 'number', default: 0 },
+    ],
+  },
+  {
+    type: 'camera_pitch',
+    label: 'Camera pitch',
+    description: 'Placeholder (not wired yet): set the camera\'s pitch, in degrees (-85..85)',
+    icon: 'RotateCcw',
+    params: [
+      { key: 'pitch', label: 'Pitch (degrees)', type: 'number', default: 15 },
     ],
   },
 ];

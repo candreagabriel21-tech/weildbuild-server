@@ -1109,6 +1109,20 @@ class WeildCodeEngine {
         }
         break;
       }
+      // ─── pass 21: CAMERA placeholders (unwired - mirrors the client) ───
+      case 'camera_follow_character':
+      case 'camera_characterlook_lock':
+      case 'camera_can_orbit':
+      case 'camera_can_look_through':
+      case 'camera_position':
+      case 'camera_yaw':
+      case 'camera_pitch': {
+        useStudioStore.getState().addConsoleMessage(
+          'info',
+          `[WeildCode] Camera action "${action.type}" is a placeholder (pass 21) - not wired to the camera yet.`,
+        );
+        break;
+      }
       default: {
         // Part-targeting actions have no object to act on inside a GAME
         // rule - say so once instead of failing silently.
@@ -1678,6 +1692,21 @@ class WeildCodeEngine {
         if (!part.bodyMovers || part.bodyMovers.length === 0) break;
         useStudioStore.getState().updateObject(partId, { bodyMovers: [] } as any);
         useStudioStore.getState().addConsoleMessage('info', `[WeildCode] Removed all body movers from "${part.name}"`);
+        break;
+      }
+      // ─── pass 21: CAMERA placeholders (unwired - mirrors the client's
+      // part-rule switch). ───
+      case 'camera_follow_character':
+      case 'camera_characterlook_lock':
+      case 'camera_can_orbit':
+      case 'camera_can_look_through':
+      case 'camera_position':
+      case 'camera_yaw':
+      case 'camera_pitch': {
+        useStudioStore.getState().addConsoleMessage(
+          'info',
+          `[WeildCode] Camera action "${action.type}" is a placeholder (pass 21) - not wired to the camera yet.`,
+        );
         break;
       }
       case 'modify_player_health': {

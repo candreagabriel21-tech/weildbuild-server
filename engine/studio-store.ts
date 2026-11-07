@@ -193,6 +193,10 @@ export interface StudioPart {
   reflectance: number;
   anchored: boolean;
   canCollide: boolean;
+  /** pass 21 (camera rebuild): camera occlusion ignores this part even
+   *  when solid (arena glass, cutscene walls). Character parts default to
+   *  true; auto-forced off when canCollide is off. Mirrors the client. */
+  cameraCanLookThrough?: boolean;
   friction: number;
   elasticity: number;
   density: number;
@@ -380,6 +384,13 @@ export interface WorldSettings {
   dayLength: number;         // real-time seconds for a full day/night cycle
   weatherType: 'clear' | 'cloudy' | 'rain' | 'snow';
   weatherIntensity: number;  // 0-1
+  // ─── pass 21 (camera rebuild): play-camera behaviour flags ───
+  // Mirrors the client's WorldSettings - the defaults keep the classic
+  // behaviour (follow + look-lock + orbit + occlusion).
+  cameraFollowCharacter: boolean;
+  cameraCharacterLookLock: boolean;
+  cameraCanOrbit: boolean;
+  cameraCanLookThroughObjects: boolean;
 }
 
 // ─── Universes (multiple scenes within a project) ───
@@ -1051,6 +1062,11 @@ export const useStudioStore = create<StudioStore>((set, get) => ({
     dayLength: 120,
     weatherType: 'clear',
     weatherIntensity: 0.5,
+    // pass 21 (camera rebuild): classic camera behaviour by default.
+    cameraFollowCharacter: true,
+    cameraCharacterLookLock: true,
+    cameraCanOrbit: true,
+    cameraCanLookThroughObjects: true,
   },
   groupModeIds: [],
   unionModeIds: [],
@@ -1167,6 +1183,12 @@ export const useStudioStore = create<StudioStore>((set, get) => ({
           }
           if (typeof mergedUpdates.reflectance === 'number') {
             mergedUpdates.reflectance = clampUnitValue(mergedUpdates.reflectance);
+          }
+          // pass 21 (camera rebuild): cameraCanLookThrough auto-off when
+          // canCollide goes off (a non-solid part occludes nothing).
+          // Mirrors the client's updateObject.
+          if (mergedUpdates.canCollide === false) {
+            mergedUpdates.cameraCanLookThrough = false;
           }
           // v13.6: NaN position guard. A NaN coordinate (e.g. a broken grid
           // size from an old save making Math.round(x/NaN)) would teleport the
@@ -2499,9 +2521,11 @@ export const useStudioStore = create<StudioStore>((set, get) => ({
       position: { x: 0, y: 0, z: 0 },
       size: { x: bpSize, y: 1, z: bpSize },
       rotation: { x: 0, y: 0, z: 0 },
-      // The owner's requested classic green; standard Plastic material.
+      // pass 21: classic green + Wireframe grid (mirrors the client's
+      // addBaseplate - the grid albedo is white/gray and the colour
+      // multiplies through, so green = green plate, darker-green lines).
       color: '#397941',
-      material: 'Plastic',
+      material: 'Wireframe',
       transparency: 0,
       reflectance: 0,
       anchored: true,
@@ -2575,6 +2599,8 @@ export const useStudioStore = create<StudioStore>((set, get) => ({
       isCharacterPart: true,
       characterPartType: partType,
       showInWorld: true, // visible in editor and during gameplay
+      // pass 21 (camera rebuild): character parts never occlude the camera.
+      cameraCanLookThrough: true,
       // ─── Avatar Modification defaults ───
       // Enable "Modify Color to Player's Avatar" by default for all body parts
       // so the joining player's equipped skin/shirt/pants override the part's
@@ -2854,6 +2880,11 @@ export const useStudioStore = create<StudioStore>((set, get) => ({
         dayLength: 120,
         weatherType: 'clear',
         weatherIntensity: 0.5,
+        // pass 21 (camera rebuild): classic camera behaviour by default.
+        cameraFollowCharacter: true,
+        cameraCharacterLookLock: true,
+        cameraCanOrbit: true,
+        cameraCanLookThroughObjects: true,
       },
       avatar: {
         skin: '#f8ff6d',
