@@ -93,7 +93,7 @@ export interface Vector3 {
 }
 
 export type MaterialType =
-  | 'Plastic' | 'Wood' | 'WoodPlanks' | 'WoodBark' | 'Slate' | 'Concrete'
+  | 'Plastic' | 'RoughPlastic' | 'Wood' | 'WoodPlanks' | 'WoodBark' | 'Slate' | 'Concrete'
   | 'Metal' | 'CorrodedMetal' | 'DiamondPlate' | 'Foil' | 'Grass' | 'Ice'
   | 'Brick' | 'NormalBricks' | 'Sand' | 'Fabric' | 'Granite' | 'Marble'
   | 'Cobblestone' | 'SmallCobblestone' | 'Pebble' | 'Stone' | 'RoughStone'

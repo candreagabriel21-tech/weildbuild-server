@@ -603,6 +603,7 @@ export const ACTION_DEFINITIONS: ActionDefinition[] = [
     params: [
       { key: 'material', label: 'Material', type: 'select', default: 'Plastic', options: [
         { label: 'Plastic', value: 'Plastic' },
+        { label: 'RoughPlastic', value: 'RoughPlastic' },
         { label: 'Wood', value: 'Wood' },
         { label: 'WoodPlanks', value: 'WoodPlanks' },
         { label: 'WoodBark', value: 'WoodBark' },

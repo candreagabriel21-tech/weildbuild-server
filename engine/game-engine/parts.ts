@@ -134,6 +134,7 @@ interface MaterialVisualProps {
 function getMaterialVisualProps(materialType: string): MaterialVisualProps {
   const props: Record<string, MaterialVisualProps> = {
     Plastic: { roughness: 0.5, metalness: 0 },
+    RoughPlastic: { roughness: 0.7, metalness: 0 },
     Wood: { roughness: 0.8, metalness: 0 },
     WoodPlanks: { roughness: 0.85, metalness: 0 },
     WoodBark: { roughness: 0.9, metalness: 0 },

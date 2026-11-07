@@ -75,7 +75,12 @@ export const MATERIALS: Record<string, MaterialDefinition> = {
   // black with no env map; pass 19 lowers them so the albedo shows. The 14
   // new materials (WoodBark…Magma) cover the rest of the owner's texture
   // library. SmoothPlastic is removed (not needed).
-  Plastic:          { name: 'Plastic',          color: '#ffffff', roughness: 0.5,  metalness: 0.0, friction: 0.5,  elasticity: 0.2,  density: 1.0,  physicalType: 'hard', textureSet: 'plastic' },
+  // pass 20: Plastic is now TEXTURE-LESS (flat colour) — the classic smooth
+  // plastic for parts. The textured plastic PBR set moved to a new
+  // RoughPlastic material. So a plain Plastic part is a flat colour, and
+  // RoughPlastic shows the plastic surface texture.
+  Plastic:          { name: 'Plastic',          color: '#ffffff', roughness: 0.5,  metalness: 0.0, friction: 0.5,  elasticity: 0.2,  density: 1.0,  physicalType: 'hard' },
+  RoughPlastic:     { name: 'RoughPlastic',     color: '#ffffff', roughness: 0.7,  metalness: 0.0, friction: 0.55, elasticity: 0.2,  density: 1.0,  physicalType: 'hard', textureSet: 'plastic' },
   Wood:             { name: 'Wood',             color: '#ffffff', roughness: 0.8,  metalness: 0.0, friction: 0.7,  elasticity: 0.1,  density: 0.6,  physicalType: 'hard', textureSet: 'wood' },
   WoodPlanks:       { name: 'WoodPlanks',       color: '#ffffff', roughness: 0.85, metalness: 0.0, friction: 0.7,  elasticity: 0.1,  density: 0.55, physicalType: 'hard', textureSet: 'wood_planks' },
   WoodBark:         { name: 'WoodBark',         color: '#ffffff', roughness: 0.9,  metalness: 0.0, friction: 0.7,  elasticity: 0.1,  density: 0.6,  physicalType: 'hard', textureSet: 'wood_bark' },
