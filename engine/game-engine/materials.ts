@@ -18,50 +18,73 @@ export interface MaterialDefinition {
    * (useLoader, so three.js dedupes + caches across parts). Omitted for
    * flat-colour materials. The maps are served from Vercel's edge CDN as
    * static public/ assets, so they never touch the build/prerender pass.
+   *
+   * pass 17: for the Wireframe material, textureSet is 'wireframe_grid'
+   * (a 10×10 stud baseplate grid baked into one tile). For the surface
+   * materials (Cobblestone, Brick, Grass, …) the albedo map is NOT bound
+   * to the mesh — only the normal + roughness maps are — so the part's
+   * `color` tints the surface instead of being multiplied with a coloured
+   * albedo (green grass on a red ball reads as red grass, not black). The
+   * wireframe_grid albedo IS bound because the grid lines are the whole
+   * point of the material.
    */
   textureSet?: string;
   /**
-   * True for the build-safe Wireframe material. Renders the part as a
-   * wireframe by setting `wireframe: true` on the standard material - a
-   * built-in three.js flag, NO onBeforeCompile / shader injection (that
-   * was the pass-14 approach that crashed the Vercel prerender).
+   * True for materials that should render with the built-in three.js
+   * `wireframe` flag (triangle outlines). Kept on the type for legacy
+   * saves; pass 17 no longer sets it on any material — the Wireframe
+   * material now renders via the wireframe_grid texture instead.
    */
   wireframe?: boolean;
   /**
    * How many times the albedo/normal/roughness maps tile across one stud
    * of part surface. Defaults to 1 (one tile per stud). Lower = larger
-   * feature size, higher = finer tiling.
+   * feature size, higher = finer tiling. (Legacy field — the pass-17
+   * renderer derives tile size from part size with a 2:1 growth cap, and
+   * uses textureTileStuds for fixed-size tiles like the wireframe grid.)
    */
   textureRepeat?: number;
+  /**
+   * Fixed world-space tile size in studs. When set, the texture tiles at
+   * exactly this size on every face regardless of part dimensions (e.g.
+   * the wireframe grid always shows a 1-stud minor grid + 10-stud major
+   * grid because one tile = 10 studs). When unset, the renderer derives
+   * tile size from the part's longest axis (1 stud for small parts,
+   * growing up to 2 studs for big walls — the "max 2:1 stretch" cap).
+   */
+  textureTileStuds?: number;
 }
 
 export const MATERIALS: Record<string, MaterialDefinition> = {
-  Plastic:       { name: 'Plastic',       color: '#8c8c8c', roughness: 0.5,  metalness: 0.0, friction: 0.5,  elasticity: 0.2,  density: 1.0,  physicalType: 'hard', textureSet: 'plastic', textureRepeat: 1 },
+  Plastic:       { name: 'Plastic',       color: '#8c8c8c', roughness: 0.5,  metalness: 0.0, friction: 0.5,  elasticity: 0.2,  density: 1.0,  physicalType: 'hard' },
   SmoothPlastic: { name: 'SmoothPlastic', color: '#8c8c8c', roughness: 0.2,  metalness: 0.0, friction: 0.3,  elasticity: 0.15, density: 1.0,  physicalType: 'hard' },
-  Wood:          { name: 'Wood',          color: '#8B6914', roughness: 0.8,  metalness: 0.0, friction: 0.7,  elasticity: 0.1,  density: 0.6,  physicalType: 'hard', textureSet: 'wood', textureRepeat: 1 },
+  Wood:          { name: 'Wood',          color: '#8B6914', roughness: 0.8,  metalness: 0.0, friction: 0.7,  elasticity: 0.1,  density: 0.6,  physicalType: 'hard' },
   WoodPlanks:    { name: 'WoodPlanks',    color: '#9B7431', roughness: 0.85, metalness: 0.0, friction: 0.7,  elasticity: 0.1,  density: 0.55, physicalType: 'hard', textureSet: 'wood_planks', textureRepeat: 1 },
-  Slate:         { name: 'Slate',         color: '#4A4A5A', roughness: 0.9,  metalness: 0.1, friction: 0.6,  elasticity: 0.15, density: 2.5,  physicalType: 'hard', textureSet: 'slate_roof_tiles', textureRepeat: 1 },
-  Concrete:      { name: 'Concrete',      color: '#8C8C8C', roughness: 0.95, metalness: 0.0, friction: 0.7,  elasticity: 0.1,  density: 2.3,  physicalType: 'hard', textureSet: 'concrete', textureRepeat: 1 },
-  Metal:         { name: 'Metal',         color: '#A0A0B0', roughness: 0.3,  metalness: 0.9, friction: 0.4,  elasticity: 0.3,  density: 7.8,  physicalType: 'hard', textureSet: 'metal', textureRepeat: 1 },
-  CorrodedMetal: { name: 'CorrodedMetal', color: '#7A6E52', roughness: 0.7,  metalness: 0.5, friction: 0.6,  elasticity: 0.15, density: 5.0,  physicalType: 'hard', textureSet: 'coroded_metal', textureRepeat: 1 },
-  DiamondPlate:  { name: 'DiamondPlate',  color: '#8C9CA5', roughness: 0.4,  metalness: 0.8, friction: 0.5,  elasticity: 0.25, density: 7.8,  physicalType: 'hard', textureSet: 'diamond_plate', textureRepeat: 1 },
-  Foil:          { name: 'Foil',          color: '#C0C0D0', roughness: 0.1,  metalness: 1.0, friction: 0.3,  elasticity: 0.1,  density: 2.7,  physicalType: 'hard', textureSet: 'foil', textureRepeat: 1 },
+  Slate:         { name: 'Slate',         color: '#4A4A5A', roughness: 0.9,  metalness: 0.1, friction: 0.6,  elasticity: 0.15, density: 2.5,  physicalType: 'hard' },
+  Concrete:      { name: 'Concrete',      color: '#8C8C8C', roughness: 0.95, metalness: 0.0, friction: 0.7,  elasticity: 0.1,  density: 2.3,  physicalType: 'hard' },
+  Metal:         { name: 'Metal',         color: '#A0A0B0', roughness: 0.3,  metalness: 0.9, friction: 0.4,  elasticity: 0.3,  density: 7.8,  physicalType: 'hard' },
+  CorrodedMetal: { name: 'CorrodedMetal', color: '#7A6E52', roughness: 0.7,  metalness: 0.5, friction: 0.6,  elasticity: 0.15, density: 5.0,  physicalType: 'hard', textureSet: 'corroded_metal', textureRepeat: 1 },
+  DiamondPlate:  { name: 'DiamondPlate',  color: '#8C9CA5', roughness: 0.4,  metalness: 0.8, friction: 0.5,  elasticity: 0.25, density: 7.8,  physicalType: 'hard' },
+  Foil:          { name: 'Foil',          color: '#C0C0D0', roughness: 0.1,  metalness: 1.0, friction: 0.3,  elasticity: 0.1,  density: 2.7,  physicalType: 'hard' },
   Grass:         { name: 'Grass',         color: '#4B8B2A', roughness: 0.9,  metalness: 0.0, friction: 0.8,  elasticity: 0.05, density: 0.3,  physicalType: 'soft', textureSet: 'grass', textureRepeat: 1 },
-  Ice:           { name: 'Ice',           color: '#B0D4F1', roughness: 0.1,  metalness: 0.1, opacity: 0.7, friction: 0.05, elasticity: 0.05, density: 0.9, physicalType: 'ice', textureSet: 'ice', textureRepeat: 1 },
-  Brick:         { name: 'Brick',         color: '#9B4A3C', roughness: 0.85, metalness: 0.0, friction: 0.7,  elasticity: 0.1,  density: 1.9,  physicalType: 'hard', textureSet: 'normal_bricks', textureRepeat: 1 },
+  Ice:           { name: 'Ice',           color: '#B0D4F1', roughness: 0.1,  metalness: 0.1, opacity: 0.7, friction: 0.05, elasticity: 0.05, density: 0.9, physicalType: 'ice' },
+  Brick:         { name: 'Brick',         color: '#9B4A3C', roughness: 0.85, metalness: 0.0, friction: 0.7,  elasticity: 0.1,  density: 1.9,  physicalType: 'hard', textureSet: 'brick', textureRepeat: 1 },
   Sand:          { name: 'Sand',          color: '#C2B280', roughness: 0.95, metalness: 0.0, friction: 0.9,  elasticity: 0.02, density: 1.6,  physicalType: 'soft', textureSet: 'sand', textureRepeat: 1 },
   Fabric:        { name: 'Fabric',        color: '#9B7A5A', roughness: 0.95, metalness: 0.0, friction: 0.9,  elasticity: 0.02, density: 0.2,  physicalType: 'soft' },
-  Granite:       { name: 'Granite',       color: '#6A6A7A', roughness: 0.85, metalness: 0.1, friction: 0.65, elasticity: 0.12, density: 2.7,  physicalType: 'hardsoft', textureSet: 'granite', textureRepeat: 1 },
-  Marble:        { name: 'Marble',        color: '#D4D0C8', roughness: 0.3,  metalness: 0.1, friction: 0.4,  elasticity: 0.15, density: 2.7,  physicalType: 'hard', textureSet: 'marble', textureRepeat: 1 },
+  Granite:       { name: 'Granite',       color: '#6A6A7A', roughness: 0.85, metalness: 0.1, friction: 0.65, elasticity: 0.12, density: 2.7,  physicalType: 'hardsoft' },
+  Marble:        { name: 'Marble',        color: '#D4D0C8', roughness: 0.3,  metalness: 0.1, friction: 0.4,  elasticity: 0.15, density: 2.7,  physicalType: 'hard' },
   Neon:          { name: 'Neon',          color: '#FF4444', roughness: 0.0,  metalness: 0.0, emissive: '#FF4444', emissiveIntensity: 2.0, friction: 0.3, elasticity: 0.2, density: 1.0, physicalType: 'hard' },
   Cobblestone:   { name: 'Cobblestone',   color: '#7A7A7A', roughness: 0.9,  metalness: 0.0, friction: 0.75, elasticity: 0.1,  density: 2.5,  physicalType: 'hardsoft', textureSet: 'cobblestone', textureRepeat: 1 },
-  Pebble:        { name: 'Pebble',        color: '#8A8A7A', roughness: 0.85, metalness: 0.0, friction: 0.7,  elasticity: 0.12, density: 2.3,  physicalType: 'hardsoft', textureSet: 'pebble', textureRepeat: 1 },
-  // Wireframe: build-safe re-introduction of the pass-14 stud-grid look.
-  // Renders as a true wireframe via the standard material's built-in
-  // `wireframe` flag - NO onBeforeCompile / GLSL injection (the pass-14
-  // approach that crashed the Vercel prerender build). Kept as its own
-  // entry so users can apply it to any part from the material picker.
-  Wireframe:     { name: 'Wireframe',     color: '#cfcfd6', roughness: 0.6,  metalness: 0.0, friction: 0.5,  elasticity: 0.2,  density: 1.0,  physicalType: 'hard', wireframe: true },
+  Pebble:        { name: 'Pebble',        color: '#8A8A7A', roughness: 0.85, metalness: 0.0, friction: 0.7,  elasticity: 0.12, density: 2.3,  physicalType: 'hardsoft' },
+  // Wireframe: the classic baseplate grid look. Pass 14 injected a custom
+  // GLSL stud-grid shader via onBeforeCompile (crashed the Vercel prerender);
+  // pass 16 swapped to the built-in `wireframe` flag (safe, but it drew
+  // triangle outlines, not a grid). Pass 17 bakes the grid into a static
+  // texture (wireframe_grid/albedo.png = white surface + minor 1-stud grid
+  // + major 10-stud grid) and tiles it at a fixed 10-stud tile size, so
+  // every Wireframe part shows the same 1-stud grid as the old baseplate.
+  // The grid albedo IS bound (the lines are the point); `color` tints it.
+  Wireframe:     { name: 'Wireframe',     color: '#cfcfd6', roughness: 0.6,  metalness: 0.0, friction: 0.5,  elasticity: 0.2,  density: 1.0,  physicalType: 'hard', textureSet: 'wireframe_grid', textureTileStuds: 10 },
 };
 
 export function getMaterialProps(materialName: string): MaterialDefinition {
