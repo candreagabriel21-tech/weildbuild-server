@@ -197,7 +197,10 @@ export async function loadLocalDraft(id: string): Promise<DraftMeta> {
     throw new Error('That draft has no loadable world data.');
   }
   restoreStudioState(studioState as StudioProjectState);
-  setCurrentDraftId(record.id);
+  // pass 26: opening an Auto-Save does NOT make it the current draft — the
+  // next manual Save must create a fresh "My Save", never overwrite the
+  // rotating AutoSave-N slot it came from.
+  setCurrentDraftId(isAutoDraftId(id) ? null : record.id);
   const { studioState: _p, world_b64: _b, ...meta } = record;
   return meta;
 }
@@ -216,6 +219,62 @@ export async function renameLocalDraft(id: string, name: string): Promise<DraftM
   const updated: DraftRecord = { ...record, name: name.trim() || record.name, updatedAt: Date.now() };
   await tx('readwrite', (s) => s.put(updated));
   const { studioState: _p, world_b64: _b, ...meta } = updated;
+  return meta;
+}
+
+// ─── Auto-Saves (pass 26: 5 rotating device slots) ───
+//
+// The user's spec: "Auto-Saves are saves that happen every 5 minutes.
+// Maximum is 5 auto-saves before they start to over-write each other.
+// Autosaves get different names (AutoSave-1/AutoSave-2 etc.)" — the slots
+// use FIXED ids (wb-autosave-1..5) so rotation is id-stable, and the next
+// auto-save always lands in the first empty slot or the OLDEST one.
+
+export const AUTO_SAVE_SLOT_COUNT = 5;
+export const AUTO_SAVE_NAME_PREFIX = 'AutoSave-';
+
+export function autoDraftId(slot: number): string {
+  return `wb-autosave-${slot}`;
+}
+
+export function isAutoDraftId(id: string): boolean {
+  return /^wb-autosave-[1-5]$/.test(id);
+}
+
+/** Pure slot picker: the first EMPTY slot (1..5), else the slot whose
+ *  record is the OLDEST (that's the one that "starts to over-write").
+ *  Pure so the verifier can drive it without IndexedDB. */
+export function pickAutoSlot(metas: DraftMeta[], now: number): number {
+  const bySlot = new Map<number, DraftMeta>();
+  for (const m of metas) {
+    const match = /^wb-autosave-([1-5])$/.exec(m.id);
+    if (match) bySlot.set(parseInt(match[1], 10), m);
+  }
+  for (let slot = 1; slot <= AUTO_SAVE_SLOT_COUNT; slot++) {
+    if (!bySlot.has(slot)) return slot;
+  }
+  let best = 1;
+  let bestAt = Infinity;
+  bySlot.forEach((meta, slot) => {
+    if (meta.updatedAt < bestAt) { bestAt = meta.updatedAt; best = slot; }
+  });
+  return best;
+}
+
+/** Snapshot the live studio store into the next rotating Auto-Save slot.
+ *  Returns null when auto-saving doesn't apply (play/simulation running,
+ *  or an empty world — the same guards the old 30s autosave had). */
+export async function saveAutoDraft(): Promise<DraftMeta | null> {
+  const store = useStudioStore.getState();
+  if (store.playState.isPlaying || store.simulationState.isSimulating) return null;
+  if (store.objects.size === 0) return null;
+  const metas = await listLocalDrafts();
+  const slot = pickAutoSlot(metas, Date.now());
+  const meta = await saveLocalDraft({
+    id: autoDraftId(slot),
+    name: `${AUTO_SAVE_NAME_PREFIX}${slot}`,
+    description: 'Auto-save',
+  });
   return meta;
 }
 

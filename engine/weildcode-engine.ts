@@ -1109,7 +1109,12 @@ class WeildCodeEngine {
         }
         break;
       }
-      // ─── pass 21: CAMERA placeholders (unwired - mirrors the client) ───
+      // ─── pass 21: CAMERA placeholders (the owner will wire these) ───
+      // Deliberately log-only: the actions exist, serialize and run without
+      // erroring, but nothing reads them yet. Wiring = replace the console
+      // line with a write (e.g. setWorldSettings({ cameraFollowCharacter })
+      // for the flags, or driving the play camera's refs for position /
+      // yaw / pitch).
       case 'camera_follow_character':
       case 'camera_characterlook_lock':
       case 'camera_can_orbit':
@@ -1694,8 +1699,9 @@ class WeildCodeEngine {
         useStudioStore.getState().addConsoleMessage('info', `[WeildCode] Removed all body movers from "${part.name}"`);
         break;
       }
-      // ─── pass 21: CAMERA placeholders (unwired - mirrors the client's
-      // part-rule switch). ───
+      // ─── pass 21: CAMERA placeholders (the owner will wire these) ───
+      // Same log-only cases as the game-rule switch: the actions run
+      // without erroring but do not touch the camera yet.
       case 'camera_follow_character':
       case 'camera_characterlook_lock':
       case 'camera_can_orbit':

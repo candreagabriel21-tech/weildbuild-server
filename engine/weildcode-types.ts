@@ -471,7 +471,8 @@ export type ActionType =
   | 'respawn_player'      // Teleport player(s) to spawn at full health
   // ─── pass 21: camera actions (PLACEHOLDERS - declared, editable and
   // saveable but NOT wired to behaviour yet; the owner will wire them.
-  // Mirrors the client's ActionType union 1:1.)
+  // They map 1:1 to the worldSettings camera flags + the camera point's
+  // position/yaw/pitch, so cutscenes can later be authored in WeildCode.)
   | 'camera_follow_character'      // true/false: camera always follows character
   | 'camera_characterlook_lock'    // true/false: camera always points at character
   | 'camera_can_orbit'             // true/false: player can orbit the camera
@@ -1177,9 +1178,13 @@ export const ACTION_DEFINITIONS: ActionDefinition[] = [
       PLAYER_TARGET_NAME_PARAM,
     ],
   },
-  // ─── pass 21: CAMERA actions (PLACEHOLDERS - unwired, mirrors the
-  // client's ACTION_DEFINITIONS 1:1 so rules authored on either side
-  // serialize identically). ───
+  // ─── pass 21: CAMERA actions (PLACEHOLDERS) ───
+  // The owner asked for these to EXIST in WeildCode but stay unwired ("I'll
+  // do that myself"): they are fully authored here (params, defaults,
+  // labels), serialize with the rule, and the engine's case for each only
+  // logs that it is a placeholder. Wiring them later is a one-case change
+  // in weildcode-engine.ts per action - the flags they drive already
+  // exist in worldSettings / the camera point.
   {
     type: 'camera_follow_character',
     label: 'Camera follow character',

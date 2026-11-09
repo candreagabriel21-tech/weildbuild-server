@@ -229,6 +229,22 @@ async function main(): Promise<void> {
   studioState.globalTimers ??= [];
   studioState.globalVariables ??= {};
   studioState.avatar ??= {};
+  // pass 28: hand-built / minimal payloads can lack the settings objects
+  // entirely (real .wbworld exports always carry them). restoreStudioState
+  // spreads whatever is here over the store, so a missing object would
+  // leave gravity undefined and the physics world FROZEN - merge the
+  // store defaults field-by-field instead of letting fields vanish.
+  const defaults = useStudioStore.getState();
+  if (!studioState.physicsSettings) {
+    studioState.physicsSettings = { ...defaults.physicsSettings };
+  } else {
+    studioState.physicsSettings = { ...defaults.physicsSettings, ...studioState.physicsSettings };
+  }
+  if (!studioState.worldSettings) {
+    studioState.worldSettings = { ...defaults.worldSettings };
+  } else {
+    studioState.worldSettings = { ...defaults.worldSettings, ...studioState.worldSettings };
+  }
   restoreStudioState(studioState);
   // v1.3 (CharacterRoot removed): spawn precedence is the explicit
   // studioState.spawnPoint (the .wbworld export's spawn_point) > the first
@@ -1004,8 +1020,8 @@ async function main(): Promise<void> {
       for (const id of activeIds) {
         const pb = world.bodies.get(id);
         if (!pb || pb.anchored) continue;
-        const cb = world.getCannonBody(id);
-        if (cb && cb.sleepState === 2) continue;
+        // pass 28: neutral sleep accessor (was the raw cannon body).
+        if (world.isBodySleeping(id)) continue;
         syncUpdates.push({
           id,
           position: { x: pb.position.x, y: pb.position.y, z: pb.position.z },
@@ -1092,8 +1108,8 @@ async function main(): Promise<void> {
       if (players.size > 0) {
         for (const id of activeIds) {
           const pb = world.bodies.get(id);
-          const cb = world.getCannonBody(id);
-          if (!pb || !cb || pb.anchored || cb.mass === 0) continue;
+          // pass 28: neutral dynamic accessor (was the raw cannon body).
+          if (!pb || pb.anchored || !world.isBodyDynamic(id)) continue;
           let inRange = false;
           for (const p of players.values()) {
             const dx = pb.position.x - p.x;
@@ -1101,10 +1117,11 @@ async function main(): Promise<void> {
             const dz = pb.position.z - p.z;
             if (dx * dx + dy * dy + dz * dz <= INTEREST_RADIUS_SQ) { inRange = true; break; }
           }
+          // pass 28: neutral sleep accessors (was the raw cannon body).
           if (!inRange) {
-            if (cb.sleepState !== 2) { cb.sleep(); pb.isAwake = false; }
-          } else if (cb.sleepState === 2) {
-            cb.wakeUp(); pb.isAwake = true;
+            if (!world.isBodySleeping(id)) { world.setBodySleeping(id, true); pb.isAwake = false; }
+          } else if (world.isBodySleeping(id)) {
+            world.setBodySleeping(id, false); pb.isAwake = true;
           }
         }
       }

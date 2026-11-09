@@ -1,6 +1,7 @@
 import { create } from 'zustand';
 import * as THREE from 'three';
 import { WeildCodeRule } from './weildcode-types';
+import { getDupeOffset, loadEditorSettings, saveEditorSettings } from './editor-settings';
 // v13.4: the store fires WeildCode events (when_destroyed, on_property_change).
 // Circular import is safe: both modules only touch each other INSIDE functions
 // at runtime, never during module initialization.
@@ -193,9 +194,15 @@ export interface StudioPart {
   reflectance: number;
   anchored: boolean;
   canCollide: boolean;
-  /** pass 21 (camera rebuild): camera occlusion ignores this part even
-   *  when solid (arena glass, cutscene walls). Character parts default to
-   *  true; auto-forced off when canCollide is off. Mirrors the client. */
+  /**
+   * pass 21 (camera rebuild): the camera's "can't look through solid
+   * objects" occlusion ignores parts with this flag - even solid ones -
+   * so walls you're meant to see through (arena glass, cutscene walls)
+   * never retract the camera. Character parts default to TRUE (the camera
+   * orbits its own character, the character must never occlude it) and
+   * the flag switches itself OFF automatically the moment canCollide is
+   * turned off (a non-solid part occluding nothing).
+   */
   cameraCanLookThrough?: boolean;
   friction: number;
   elasticity: number;
@@ -385,11 +392,23 @@ export interface WorldSettings {
   weatherType: 'clear' | 'cloudy' | 'rain' | 'snow';
   weatherIntensity: number;  // 0-1
   // ─── pass 21 (camera rebuild): play-camera behaviour flags ───
-  // Mirrors the client's WorldSettings - the defaults keep the classic
-  // behaviour (follow + look-lock + orbit + occlusion).
+  // The owner's cutscene-ready camera controls. All four default to the
+  // classic behaviour (follow + look at character + orbit enabled +
+  // occlusion on), so existing worlds are unchanged until a creator
+  // (or a WeildCode rule - see the placeholder actions) flips one.
+  /** Camera ALWAYS follows the character. When false the camera stays put
+   *  no matter where the character walks (fixed-shot / cutscene camera). */
   cameraFollowCharacter: boolean;
+  /** Camera ALWAYS points at the character. When false it keeps whatever
+   *  orientation it had (free-look / custom aim, e.g. a weildcode rule
+   *  drives camera_yaw for a cutscene pan). */
   cameraCharacterLookLock: boolean;
+  /** Camera can orbit the character (drag / touch). When false it stays in
+   *  one place no matter how much the player tries to move it. */
   cameraCanOrbit: boolean;
+  /** Global "can't look through solid objects" toggle. When false the
+   *  camera never retracts for occluders (per-part "Camera Can Look
+   *  Through" checkboxes are the fine-grained version of this). */
   cameraCanLookThroughObjects: boolean;
 }
 
@@ -525,6 +544,11 @@ export interface StudioStore {
 
   // Play mode snapshot (internal - not exposed to consumers)
   _playSnapshot: string | null;
+  /** pass 26: the editor's timeOfDay when play started — stopPlayMode
+   *  restores it, so a day/night cycle running during Test Play can never
+   *  bleed back into the saved project ("test play until noon, exit, and
+   *  the project is still midnight"). */
+  _timeOfDayAtPlayStart: number | null;
 
   // ─── Atomic Play/Simulate Mode Functions ───
   // These handle the complete start/stop lifecycle, including snapshot save/restore.
@@ -547,6 +571,10 @@ export interface StudioStore {
    *  Position/rotation/size-only writes do NOT bump it, so the explorer tree
    *  doesn't re-render while you drag parts (v13.6 editor lag fix). */
   objectsVersion: number;
+  /** pass 26.1: bumped whenever a whole world is (re)loaded — the
+   *  explorer uses it to remount its nodes so every folder comes back
+   * COLLAPSED (user request). */
+  worldLoadNonce: number;
   /** pass 13 (rotate hitbox): bumped ONLY when a part's rotation or size
    *  changes (not position drags). The play-mode collision cache watches it so
    *  the wrench rotate tool updates a block's collider immediately, instead of
@@ -588,6 +616,15 @@ export interface StudioStore {
   setActiveTool: (tool: ToolMode) => void;
   setActiveTab: (tab: StudioTab) => void;
   duplicateSelected: () => void;
+  /** pass 26: normalize parent/child links — orphaned parts (parent gone)
+   *  become visible top-level objects, models drop dead/stale child ids. */
+  repairObjectTree: () => void;
+  /** pass 26.1: move objects into a group (parentId) or to the top level
+   *  (null), optionally at a child index. Powers explorer drag-and-drop. */
+  reparentObjects: (ids: string[], parentId: string | null, index?: number) => void;
+  /** pass 26.1: move the (single) selected object up (-1) / down (+1)
+   *  among its siblings. Powers the explorer's arrow-key reordering. */
+  moveSelectionInTree: (direction: -1 | 1) => void;
   deleteSelected: () => void;
   groupSelected: () => void;
   ungroupSelected: () => void;
@@ -779,6 +816,131 @@ export function collectLeafPartIds(objects: Map<string, StudioObject>, id: strin
   return leaves;
 }
 
+/** pass 26 (ghost-objects fix): the selected ids that are NOT a descendant
+ *  of another selected id. Copy/cut/dupe used to process EVERY selected id,
+ *  so selecting a group together with one of its own children cloned the
+ *  child twice — once inside the cloned group, once loose. The loose copy
+ *  was the "ghost / suddenly ungrouped object" report. Every clone path now
+ *  operates on the top-most selection only. */
+export function topMostSelectedIds(objects: Map<string, StudioObject>, selectedIds: string[]): string[] {
+  const selected = new Set(selectedIds);
+  const keep: string[] = [];
+  for (const id of selectedIds) {
+    let parentId = objects.get(id)?.parentId ?? null;
+    let nested = false;
+    while (parentId) {
+      if (selected.has(parentId)) { nested = true; break; }
+      parentId = objects.get(parentId)?.parentId ?? null;
+    }
+    if (!nested) keep.push(id);
+  }
+  return keep;
+}
+
+/** pass 26.1 (user request — better naming): strip copy-number suffixes
+ *  from an object name: "Block (7) (8)" / "Block 7" → "Block". Repeated
+ *  suffixes from the old clone chain collapse in one go. */
+export function stripObjectNameSuffix(name: string): string {
+  let out = name.trim();
+  for (let i = 0; i < 10; i++) {
+    const next = out.replace(/\s*\(\d+\)\s*$/, '').replace(/\s+\d+$/, '').trim();
+    if (next === out || !next) break;
+    out = next;
+  }
+  return out || name.trim();
+}
+
+/** pass 26.1 (user request — better naming): the next free copy name for
+ *  `base` among `objects` — "Block" → "Block 2", "Block 3", … instead of
+ *  the old ever-growing "Block6 (7) (8) … (89)" pile. Old-style names
+ *  ("Block (7)", "Block 7") still count as occupied numbers for their
+ *  base, so renumbering never collides. */
+export function nextObjectName(base: string, objects: Map<string, StudioObject>): string {
+  const clean = stripObjectNameSuffix(base);
+  // Which FAMILY SLOTS are taken? Every object whose name reduces to the
+  // same base occupies its number slot ("Wall" = 1, "Wall 2" = 2,
+  // "Wall (4)" = 4 — old-style names count too, so renumbering never
+  // collides). The first free slot wins: a fresh family starts at the
+  // plain base name, otherwise the first free "base N" from 2 up.
+  const taken = new Set<number>();
+  objects.forEach((o) => {
+    if (stripObjectNameSuffix(o.name) !== clean) return;
+    if (o.name === clean) { taken.add(1); return; }
+    const spaced = /^(.*)\s+(\d+)$/.exec(o.name.trim());
+    if (spaced) { taken.add(parseInt(spaced[2], 10)); return; }
+    const parens = /^(.*)\s*\((\d+)\)$/.exec(o.name.trim());
+    if (parens) taken.add(parseInt(parens[2], 10));
+  });
+  if (!taken.has(1)) return clean;
+  let n = 2;
+  while (taken.has(n)) n++;
+  return `${clean} ${n}`;
+}
+
+/** pass 26.1: rebuild the objects map so ROOT objects iterate in the given
+ *  order (the explorer renders roots in map order). Children keep their
+ *  entries; only the root sequence changes. */
+function reorderRootsInMap(
+  objects: Map<string, StudioObject>,
+  rootOrder: string[],
+): Map<string, StudioObject> {
+  const next = new Map<string, StudioObject>();
+  for (const id of rootOrder) {
+    const o = objects.get(id);
+    if (o) next.set(id, o);
+  }
+  objects.forEach((o, id) => {
+    if (!next.has(id)) next.set(id, o);
+  });
+  return next;
+}
+
+/** pass 26.1: the ids of the root-level objects, in map (= display) order. */
+export function rootOrderOf(objects: Map<string, StudioObject>): string[] {
+  const ids: string[] = [];
+  objects.forEach((o, id) => {
+    if (o.parentId === null) ids.push(id);
+  });
+  return ids;
+}
+
+/** pass 26 (ghost-objects fix): normalizes the parent/child tree both ways.
+ *  - A model's children list drops ids that don't exist, or that point at
+ *    a different parent (stale listings rendered + dragged objects twice).
+ *  - A part whose parent is gone (or never listed it) becomes top-level:
+ *    it used to stay in the map invisible to the Explorer while the game
+ *    still rendered it — the exact "ghost objects aren't there but the
+ *    game treats them as real" report. Re-parenting to root keeps the
+ *    user's data instead of deleting it. */
+export function repairObjectTreeData(objects: Map<string, StudioObject>): Map<string, StudioObject> {
+  const next = new Map(objects);
+  // Pass A: clean every model's children list.
+  next.forEach((obj, id) => {
+    if ('children' in obj && !isPart(obj)) {
+      const model = obj as StudioModel;
+      const alive = model.children.filter((cid) => {
+        const child = next.get(cid);
+        return !!child && (child.parentId ?? null) === id;
+      });
+      if (alive.length !== model.children.length) {
+        next.set(id, { ...model, children: alive });
+      }
+    }
+  });
+  // Pass B: orphans and unlisted children become top-level.
+  next.forEach((obj, id) => {
+    if (obj.parentId) {
+      const parent = next.get(obj.parentId);
+      const listed = !!parent && 'children' in parent && (parent as StudioModel).children.includes(id);
+      if (!listed) {
+        next.set(id, { ...obj, parentId: null } as StudioObject);
+      }
+    }
+  });
+  return next;
+}
+
+
 /** Compute the center position of a group from its leaf parts */
 export function computeGroupCenter(objects: Map<string, StudioObject>, groupId: string): Vector3 {
   const leafIds = collectLeafPartIds(objects, groupId);
@@ -816,12 +978,13 @@ export function computePartsBoundsCenter(parts: StudioPart[]): Vector3 {
   return { x: (minX + maxX) / 2, y: (minY + maxY) / 2, z: (minZ + maxZ) / 2 };
 }
 
-function deepClonePart(part: StudioPart, idOverride?: string, nameOverride?: string, positionOffset?: Vector3): StudioPart {
+function deepClonePart(part: StudioPart, objects: Map<string, StudioObject>, idOverride?: string, nameOverride?: string, positionOffset?: Vector3): StudioPart {
   partCounter++;
   return {
     ...part,
     id: idOverride || generateId(),
-    name: nameOverride || `${part.name} (${partCounter})`,
+    // pass 26.1: the next free copy of the source's BASE name.
+    name: nameOverride || nextObjectName(part.name, objects),
     position: positionOffset
       ? { x: part.position.x + positionOffset.x, y: part.position.y + positionOffset.y, z: part.position.z + positionOffset.z }
       : { ...part.position },
@@ -1016,9 +1179,11 @@ export const useStudioStore = create<StudioStore>((set, get) => ({
   brushPaintColor: '#ff6600',
   consoleMessages: [],
   screenMessages: [],
-  showGrid: true,
+  showGrid: false,
   snapToGrid: true,
-  gridSize: 1,
+  // pass 26.1: the snap unit is a saved device setting now.
+  gridSize: loadEditorSettings().snapUnit,
+  worldLoadNonce: 0,
   snapInvert: false,
   showExplorer: true,
   showProperties: true,
@@ -1076,6 +1241,7 @@ export const useStudioStore = create<StudioStore>((set, get) => ({
   undoStack: [],
   redoStack: [],
   _playSnapshot: null,
+  _timeOfDayAtPlayStart: null,
   avatar: {
     skin: '#f8ff6d',
     face: 'FACE-1',
@@ -1184,9 +1350,10 @@ export const useStudioStore = create<StudioStore>((set, get) => ({
           if (typeof mergedUpdates.reflectance === 'number') {
             mergedUpdates.reflectance = clampUnitValue(mergedUpdates.reflectance);
           }
-          // pass 21 (camera rebuild): cameraCanLookThrough auto-off when
-          // canCollide goes off (a non-solid part occludes nothing).
-          // Mirrors the client's updateObject.
+          // pass 21 (camera rebuild): "camera_can_look_through" switches
+          // itself OFF the moment canCollide is turned off - a non-solid
+          // part occludes nothing, so the flag would be meaningless (and
+          // the checkbox UI stays truthful about what the camera does).
           if (mergedUpdates.canCollide === false) {
             mergedUpdates.cameraCanLookThrough = false;
           }
@@ -1262,59 +1429,70 @@ export const useStudioStore = create<StudioStore>((set, get) => ({
     const state = get();
     const newObjects = new Map(state.objects);
     const newIds: string[] = [];
-    const offset = { x: 2, y: 0, z: 0 };
-    state.selectedIds.forEach((id) => {
+    // pass 26: the offset is the user's Dupe Offset setting (Settings →
+    // Editor; was hardcoded +2 x).
+    const offset = { x: getDupeOffset(), y: 0, z: 0 };
+    // pass 26 (ghost fix): duplicate only the TOP-MOST selected objects.
+    // A selection containing a group plus one of its own children used to
+    // clone the child twice (loose + inside the cloned group); nested
+    // groups double-cloned their subtrees the same way.
+    const topIds = topMostSelectedIds(state.objects, state.selectedIds);
+    // ONE shared remap for the whole operation, so an object can never be
+    // cloned twice (the old code built a fresh map per top-level id).
+    const idRemap = new Map<string, string>();
+    const cloneObjectTree = (sourceId: string): string | null => {
+      const source = newObjects.get(sourceId);
+      if (!source) return null;
+      if (isPart(source)) {
+        const newPart = deepClonePart(source, newObjects, undefined, undefined, offset);
+        newObjects.set(newPart.id, newPart);
+        newIds.push(newPart.id);
+        idRemap.set(sourceId, newPart.id);
+        return newPart.id;
+      }
+      if ('children' in source) {
+        partCounter++;
+        const newModelId = generateId();
+        const clonedChildren: string[] = [];
+        source.children.forEach((childId) => {
+          const clonedChildId = cloneObjectTree(childId);
+          if (clonedChildId) clonedChildren.push(clonedChildId);
+        });
+        if (clonedChildren.length === 0) return null;
+        const newModel: StudioModel = {
+          id: newModelId,
+          name: nextObjectName(source.name, newObjects),
+          children: clonedChildren,
+          parentId: null,
+        };
+        clonedChildren.forEach((cid) => {
+          const child = newObjects.get(cid);
+          if (child) {
+            newObjects.set(cid, { ...child, parentId: newModelId } as StudioObject);
+          }
+        });
+        newObjects.set(newModelId, newModel);
+        newIds.push(newModelId);
+        idRemap.set(sourceId, newModelId);
+        return newModelId;
+      }
+      return null;
+    };
+    topIds.forEach((id) => {
       const obj = newObjects.get(id);
-      if (obj && isPart(obj)) {
-        const newObj = deepClonePart(obj, undefined, undefined, offset);
+      if (!obj) return;
+      if (isPart(obj)) {
+        const newObj = deepClonePart(obj, newObjects, undefined, undefined, offset);
         newObjects.set(newObj.id, newObj);
         newIds.push(newObj.id);
-      }
-      // Also handle models: duplicate the whole descendant tree (v1.1 FIX:
-      // nested models are now cloned recursively - the old code only copied
-      // one level of children, silently dropping nested groups).
-      if (obj && !isPart(obj) && 'children' in obj) {
-        const cloneObjectTree = (sourceId: string, idRemap: Map<string, string>): string | null => {
-          const source = newObjects.get(sourceId);
-          if (!source) return null;
-          if (isPart(source)) {
-            const newPart = deepClonePart(source, undefined, undefined, offset);
-            newObjects.set(newPart.id, newPart);
-            newIds.push(newPart.id);
-            idRemap.set(sourceId, newPart.id);
-            return newPart.id;
-          }
-          if ('children' in source) {
-            partCounter++;
-            const newModelId = generateId();
-            const clonedChildren: string[] = [];
-            source.children.forEach((childId) => {
-              const clonedChildId = cloneObjectTree(childId, idRemap);
-              if (clonedChildId) clonedChildren.push(clonedChildId);
-            });
-            if (clonedChildren.length === 0) return null;
-            const newModel: StudioModel = {
-              id: newModelId,
-              name: `${source.name} (${partCounter})`,
-              children: clonedChildren,
-              parentId: null,
-            };
-            clonedChildren.forEach((cid) => {
-              const child = newObjects.get(cid);
-              if (child) {
-                newObjects.set(cid, { ...child, parentId: newModelId } as StudioObject);
-              }
-            });
-            newObjects.set(newModelId, newModel);
-            newIds.push(newModelId);
-            return newModelId;
-          }
-          return null;
-        };
-        cloneObjectTree(id, new Map());
+      } else if ('children' in obj) {
+        cloneObjectTree(id);
       }
     });
-    set({ objects: newObjects, selectedIds: newIds });
+    // pass 26 (ghost fix): normalize the result so no loose/orphaned clone
+    // can leak through (defensive — the top-most pass already prevents them).
+    const repaired = repairObjectTreeData(newObjects);
+    set({ objects: repaired, selectedIds: newIds });
     if (newIds.length > 0) {
       state.addConsoleMessage('info', `Duplicated ${newIds.length} object(s)`);
     }
@@ -1323,22 +1501,34 @@ export const useStudioStore = create<StudioStore>((set, get) => ({
   copySelected: () => {
     const state = get();
     const clipboardObjects: StudioObject[] = [];
-    state.selectedIds.forEach((id) => {
+    // pass 26 (ghost fix): only the TOP-MOST selected objects. A selection
+    // that contains a group AND one of its children used to copy the child
+    // twice (once via the group's descendants, once standalone) — pasting
+    // then produced a loose, ungrouped extra copy.
+    const seen = new Set<string>();
+    topMostSelectedIds(state.objects, state.selectedIds).forEach((id) => {
+      if (seen.has(id)) return;
       const obj = state.objects.get(id);
       if (!obj) return;
       if (isPart(obj)) {
         // Single part - deep clone it
         clipboardObjects.push(JSON.parse(JSON.stringify(obj)));
+        seen.add(id);
       } else if ('children' in obj) {
         // Group (StudioModel) - deep clone the model AND all its descendant parts
         const model = JSON.parse(JSON.stringify(obj)) as StudioModel;
         clipboardObjects.push(model);
+        seen.add(id);
         // Also clone all descendant parts recursively
         const descendantIds = collectDescendants(state.objects, id);
         descendantIds.forEach(descId => {
           if (descId === id) return; // Skip the model itself
+          if (seen.has(descId)) return; // never copy an object twice
           const desc = state.objects.get(descId);
-          if (desc) clipboardObjects.push(JSON.parse(JSON.stringify(desc)));
+          if (desc) {
+            clipboardObjects.push(JSON.parse(JSON.stringify(desc)));
+            seen.add(descId);
+          }
         });
       }
     });
@@ -1356,8 +1546,11 @@ export const useStudioStore = create<StudioStore>((set, get) => ({
       const clipboardObjects: StudioObject[] = [];
       const cutFromIds: string[] = [];
       const allIdsToDelete = new Set<string>();
-
-      s.selectedIds.forEach(id => {
+      // pass 26 (ghost fix): cut only the TOP-MOST selected objects — the
+      // same dedupe copy/copy/paste got (a selected child of a selected
+      // group used to land in the clipboard twice).
+      const seen = new Set<string>();
+      topMostSelectedIds(s.objects, s.selectedIds).forEach(id => {
         const obj = s.objects.get(id);
         if (!obj) return;
         cutFromIds.push(id);
@@ -1365,15 +1558,21 @@ export const useStudioStore = create<StudioStore>((set, get) => ({
 
         if (isPart(obj)) {
           clipboardObjects.push(JSON.parse(JSON.stringify(obj)));
+          seen.add(id);
         } else if ('children' in obj) {
           // Group - clone model and all descendants, then delete them all
           clipboardObjects.push(JSON.parse(JSON.stringify(obj)));
+          seen.add(id);
           const descendantIds = collectDescendants(s.objects, id);
           descendantIds.forEach(descId => {
             if (descId === id) return;
             allIdsToDelete.add(descId);
+            if (seen.has(descId)) return;
             const desc = s.objects.get(descId);
-            if (desc) clipboardObjects.push(JSON.parse(JSON.stringify(desc)));
+            if (desc) {
+              clipboardObjects.push(JSON.parse(JSON.stringify(desc)));
+              seen.add(descId);
+            }
           });
         }
       });
@@ -1419,14 +1618,22 @@ export const useStudioStore = create<StudioStore>((set, get) => ({
     _pushUndo(get, set);
     const newObjects = new Map(state.objects);
     const newIds: string[] = [];
-    const offset = { x: 3, y: 0, z: 0 };
+    // pass 26: the offset is the user's Dupe Offset setting (was +3 x).
+    const offset = { x: getDupeOffset(), y: 0, z: 0 };
     // Map old IDs → new IDs for rebuilding parent/child relationships
     const idMap = new Map<string, string>();
+    // pass 26 (ghost fix): a clipboard must never contain the same object
+    // twice (old clipboards from before the top-most copy fix could) — the
+    // second clone would overwrite the idMap entry and the first clone
+    // leaked out as a loose, ungrouped "ghost" object.
+    const seen = new Set<string>();
 
     // First pass: clone all objects with new IDs
     state.clipboard.objects.forEach((obj) => {
+      if (seen.has(obj.id)) return;
+      seen.add(obj.id);
       if (isPart(obj)) {
-        const newObj = deepClonePart(obj, undefined, undefined, offset);
+        const newObj = deepClonePart(obj, newObjects, undefined, undefined, offset);
         idMap.set(obj.id, newObj.id);
         newObjects.set(newObj.id, newObj);
         newIds.push(newObj.id);
@@ -1437,7 +1644,7 @@ export const useStudioStore = create<StudioStore>((set, get) => ({
         idMap.set(obj.id, newId);
         const newModel: StudioModel = {
           id: newId,
-          name: `${obj.name} (${partCounter})`,
+          name: nextObjectName(obj.name, newObjects),
           children: [], // Will be remapped in second pass
           parentId: null,
         };
@@ -1483,8 +1690,123 @@ export const useStudioStore = create<StudioStore>((set, get) => ({
       return obj && obj.parentId === null;
     });
 
-    set({ objects: newObjects, selectedIds: topLevelIds.length > 0 ? topLevelIds : newIds });
+    // pass 26 (ghost fix): normalize the pasted tree — every pasted object
+    // ends up either properly grouped under its pasted parent or honestly
+    // top-level. No invisible-to-the-Explorer orphans.
+    const repaired = repairObjectTreeData(newObjects);
+    set({ objects: repaired, selectedIds: topLevelIds.length > 0 ? topLevelIds : newIds });
     state.addConsoleMessage('info', `Pasted ${newIds.length} object(s) from clipboard`);
+  },
+
+  reparentObjects: (ids, parentId, index) => {
+    const state = get();
+    if (ids.length === 0) return;
+    // Only groups can hold children.
+    if (parentId !== null) {
+      const target = state.objects.get(parentId);
+      if (!target || isPart(target)) {
+        state.addConsoleMessage('warn', 'Objects can only be moved into groups.');
+        return;
+      }
+      // Never allow a group to be dropped inside itself or its own subtree.
+      for (const id of ids) {
+        let walker: string | null = parentId;
+        while (walker) {
+          if (walker === id) {
+            state.addConsoleMessage('warn', "A group can't be moved inside itself.");
+            return;
+          }
+          walker = state.objects.get(walker)?.parentId ?? null;
+        }
+      }
+    }
+    // A multi-drag moves the top-most dragged objects (dragging a group
+    // drags its contents with it — a separately dragged child is skipped).
+    const moving = topMostSelectedIds(state.objects, ids);
+    if (moving.length === 0) return;
+    _pushUndo(get, set);
+
+    const newObjects = new Map(state.objects);
+    // 1) detach from the old parent's children list
+    moving.forEach((id) => {
+      const o = newObjects.get(id);
+      if (o?.parentId) {
+        const oldParent = newObjects.get(o.parentId);
+        if (oldParent && 'children' in oldParent) {
+          newObjects.set(oldParent.id, { ...oldParent, children: oldParent.children.filter((c) => c !== id) } as StudioObject);
+        }
+      }
+    });
+    // 2) attach
+    if (parentId === null) {
+      // to the top level — insert at a root position when given, else append.
+      let rootOrder = rootOrderOf(newObjects).filter((id) => !moving.includes(id));
+      if (typeof index === 'number' && index >= 0 && index <= rootOrder.length) {
+        rootOrder = [...rootOrder.slice(0, index), ...moving, ...rootOrder.slice(index)];
+      } else {
+        rootOrder = [...rootOrder, ...moving];
+      }
+      const reordered = reorderRootsInMap(newObjects, rootOrder);
+      moving.forEach((id) => {
+        const o = reordered.get(id);
+        if (o) reordered.set(id, { ...o, parentId: null } as StudioObject);
+      });
+      set({ objects: reorderRootsInMap(reordered, rootOrder), objectsVersion: get().objectsVersion + 1 });
+    } else {
+      const parent = newObjects.get(parentId);
+      if (parent && 'children' in parent) {
+        const children = [...(parent as StudioModel).children.filter((c) => !moving.includes(c))];
+        const at = typeof index === 'number' ? Math.max(0, Math.min(index, children.length)) : children.length;
+        children.splice(at, 0, ...moving);
+        newObjects.set(parentId, { ...parent, children } as StudioObject);
+        moving.forEach((id) => {
+          const o = newObjects.get(id);
+          if (o) newObjects.set(id, { ...o, parentId } as StudioObject);
+        });
+        set({ objects: repairObjectTreeData(newObjects), objectsVersion: get().objectsVersion + 1 });
+      }
+    }
+    state.addConsoleMessage('info', `Moved ${moving.length} object${moving.length > 1 ? 's' : ''} ${parentId === null ? 'to the top level' : 'into "' + (state.objects.get(parentId)?.name ?? 'group') + '"'}.`);
+  },
+
+  moveSelectionInTree: (direction) => {
+    const state = get();
+    const id = state.selectedIds[0];
+    if (!id) return;
+    const obj = state.objects.get(id);
+    if (!obj) return;
+    // Siblings: the parent's children list, or the root order.
+    const siblings = obj.parentId
+      ? ((state.objects.get(obj.parentId) as StudioModel | undefined)?.children ?? [])
+      : rootOrderOf(state.objects);
+    const i = siblings.indexOf(id);
+    const j = i + direction;
+    if (i < 0 || j < 0 || j >= siblings.length) return;
+    _pushUndo(get, set);
+    if (obj.parentId) {
+      const parent = state.objects.get(obj.parentId);
+      if (parent && 'children' in parent) {
+        const children = [...(parent as StudioModel).children];
+        [children[i], children[j]] = [children[j], children[i]];
+        const newObjects = new Map(state.objects);
+        newObjects.set(parent.id, { ...parent, children } as StudioObject);
+        set({ objects: newObjects, objectsVersion: get().objectsVersion + 1 });
+      }
+    } else {
+      // Roots render in map order — rebuild the map with the two swapped.
+      const rootOrder = rootOrderOf(state.objects);
+      [rootOrder[i], rootOrder[j]] = [rootOrder[j], rootOrder[i]];
+      set({ objects: reorderRootsInMap(state.objects, rootOrder), objectsVersion: get().objectsVersion + 1 });
+    }
+  },
+
+  repairObjectTree: () => {
+    const state = get();
+    const repaired = repairObjectTreeData(state.objects);
+    if (repaired.size !== state.objects.size || Array.from(repaired.entries()).some(([id, o]) => state.objects.get(id) !== o)) {
+      set({ objects: repaired, objectsVersion: state.objectsVersion + 1 });
+      state.addConsoleMessage('info', 'Object tree repaired: orphaned parts returned to the top level.');
+    }
   },
 
   setShowGrid: (show) => set({ showGrid: show }),
@@ -1548,7 +1870,7 @@ export const useStudioStore = create<StudioStore>((set, get) => ({
     const modelId = generateId();
     const model: StudioModel = {
       id: modelId,
-      name: 'Model',
+      name: nextObjectName('Model', state.objects),
       children: [...state.selectedIds],
       parentId: null,
     };
@@ -1637,7 +1959,8 @@ export const useStudioStore = create<StudioStore>((set, get) => ({
     const yPos = groundY + size.y / 2;
     const part: StudioPart = {
       id,
-      name: `${type}${partCounter}`,
+      // pass 26.1: number new parts against existing names ("Block 2"…)
+      name: nextObjectName(type, state.objects),
       type,
       position: { x: 0, y: yPos, z: 0 },
       size,
@@ -2083,7 +2406,13 @@ export const useStudioStore = create<StudioStore>((set, get) => ({
     set({ loadProgress: { ...lp, physicsPending: pending } });
   },
 
-  setGridSize: (size) => set({ gridSize: Number.isFinite(size) ? Math.min(Math.max(size, 0.1), 100) : 1 }),
+  setGridSize: (size) => {
+    // pass 26.1: 0 is valid (no snapping) and the value is SAVED on this
+    // device (it used to clamp to a 0.1 minimum and reset on reload).
+    const v = Number.isFinite(size) ? Math.min(Math.max(size, 0), 100) : 1;
+    set({ gridSize: v });
+    saveEditorSettings({ snapUnit: v });
+  },
 
   getObjectById: (id) => get().objects.get(id),
 
@@ -2169,6 +2498,7 @@ export const useStudioStore = create<StudioStore>((set, get) => ({
       partRevealLimit: progressive ? 0 : Infinity,
       loadProgress: { active: progressive, total: partCount, mounted: 0 },
       objectsVersion: get().objectsVersion + 1,
+      worldLoadNonce: get().worldLoadNonce + 1,
     });
   },
 
@@ -2455,7 +2785,7 @@ export const useStudioStore = create<StudioStore>((set, get) => ({
     const spawnColor = team === 'Blue' ? '#3366cc' : team === 'Red' ? '#cc3333' : '#4a90d9';
     const spawnPart: StudioPart = {
       id,
-      name: 'Spawn_Location',
+      name: nextObjectName('Spawn_Location', get().objects),
       type: 'Spawn',
       // v13.6: spawn spawns exactly at 0, 0.5, 0 - resting on the default
       // baseplate's surface (baseplate at 0,0,0 with height 1 -> top at 0.5)
@@ -2489,18 +2819,15 @@ export const useStudioStore = create<StudioStore>((set, get) => ({
 
   addBaseplate: () => {
     const state = get();
-    // pass 15 (user request): the baseplate is a PLAIN Block part - no
-    // isBaseplate flag, no special-case render/physics/drag guards anywhere.
-    // It uses the standard Plastic material. (pass 16 re-introduced a
-    // build-safe Wireframe material using the standard material's built-in
-    // `wireframe` flag - no onBeforeCompile / shader injection - but the
-    // baseplate stays Plastic by default; the classic green + the editor's
-    // ground-grid overlay (GridLines) give it its look. The pass-14
-    // GLSL-grid Wireframe that broke the Vercel prerender is gone for good.)
-    // Structurally it's a normal 100×1×100 block: it can be MOVED (the old
-    // gizmo guard that pinned it at 0,0,0 is gone - that was the "baseplate
-    // snaps back to the origin when the game runs" bug), rotated, recolored,
-    // even deleted. Old saves are migrated in loadProject.
+    // pass 20 (user request): the baseplate defaults to the Wireframe
+    // material (white) so a fresh studio shows the classic 1-stud grid
+    // baseplate. It's still a plain Block — movable, rotatable,
+    // recolorable, deletable — just with the wireframe-grid texture and a
+    // white base colour. The pass-14 GLSL-grid Wireframe that broke the
+    // Vercel prerender is gone for good (pass 16+ uses a baked static
+    // texture). Old saves keep whatever material they had. Structurally
+    // it's a normal 100×1×100 block: it can be MOVED (the old gizmo guard
+    // that pinned it at 0,0,0 is gone), rotated, recolored, even deleted.
     let exists = false;
     state.objects.forEach((obj) => {
       if (!isPart(obj)) return;
@@ -2521,9 +2848,11 @@ export const useStudioStore = create<StudioStore>((set, get) => ({
       position: { x: 0, y: 0, z: 0 },
       size: { x: bpSize, y: 1, z: bpSize },
       rotation: { x: 0, y: 0, z: 0 },
-      // pass 21: classic green + Wireframe grid (mirrors the client's
-      // addBaseplate - the grid albedo is white/gray and the colour
-      // multiplies through, so green = green plate, darker-green lines).
+      // pass 21: back to the classic GREEN baseplate (the owner asked for
+      // green again after pass 20 made it white). It keeps the Wireframe
+      // material - the grid texture's albedo is white with gray lines and
+      // the part colour multiplies through, so green shows a green plate
+      // with darker-green grid lines (the classic coloured-baseplate look).
       color: '#397941',
       material: 'Wireframe',
       transparency: 0,
@@ -2599,7 +2928,8 @@ export const useStudioStore = create<StudioStore>((set, get) => ({
       isCharacterPart: true,
       characterPartType: partType,
       showInWorld: true, // visible in editor and during gameplay
-      // pass 21 (camera rebuild): character parts never occlude the camera.
+      // pass 21 (camera rebuild): character parts never occlude the camera
+      // (it orbits its own character - the body must not retract it).
       cameraCanLookThrough: true,
       // ─── Avatar Modification defaults ───
       // Enable "Modify Color to Player's Avatar" by default for all body parts
@@ -2799,6 +3129,7 @@ export const useStudioStore = create<StudioStore>((set, get) => ({
       partRevealLimit: Infinity,
       loadProgress: { active: false, total: 0, mounted: 0 },
       objectsVersion: get().objectsVersion + 1,
+      worldLoadNonce: get().worldLoadNonce + 1,
       pendingPlacement: null,
       _transformGesture: false,
       playState: {
@@ -2996,8 +3327,12 @@ export const useStudioStore = create<StudioStore>((set, get) => ({
     const state = get();
     // Save snapshot of current state before any physics/modifications occur
     const snapshot = snapshotState(state.objects, state.joints);
+    // pass 26: remember the editor's time-of-day so a day/night cycle that
+    // runs during play can never leak back into the project.
+    const timeAtStart = state.worldSettings.timeOfDay;
     set({
       _playSnapshot: snapshot,
+      _timeOfDayAtPlayStart: timeAtStart,
       playState: {
         isPlaying: true,
         isTestPlay: false,
@@ -3044,10 +3379,18 @@ export const useStudioStore = create<StudioStore>((set, get) => ({
     // STEP 2: Now that all loops are stopped, safely restore the snapshot.
     // Nothing can overwrite this because isPlaying === false.
     const restored = restoreSnapshot(state._playSnapshot);
+    // pass 26: put the editor's clock back too — "test play it until it
+    // gets from midnight to noon, exit, and your project is still
+    // midnight" (the auto-cycle may only run inside games).
+    const timeAtStart = state._timeOfDayAtPlayStart;
     set({
       objects: restored.objects,
       joints: restored.joints,
       _playSnapshot: null,
+      _timeOfDayAtPlayStart: null,
+      worldSettings: timeAtStart !== null
+        ? { ...get().worldSettings, timeOfDay: timeAtStart }
+        : get().worldSettings,
       explosionVisuals: [],
       screenMessages: [],
       objectsVersion: get().objectsVersion + 1,
@@ -3058,8 +3401,11 @@ export const useStudioStore = create<StudioStore>((set, get) => ({
     const state = get();
     // Save snapshot of current state before any physics/modifications occur
     const snapshot = snapshotState(state.objects, state.joints);
+    // pass 26: remember the editor's time-of-day (see startPlayMode).
+    const timeAtStart = state.worldSettings.timeOfDay;
     set({
       _playSnapshot: snapshot,
+      _timeOfDayAtPlayStart: timeAtStart,
       playState: {
         isPlaying: true,
         isTestPlay: true,

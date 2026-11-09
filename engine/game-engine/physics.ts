@@ -1,21 +1,76 @@
 /**
- * WeildBuild Physics Engine - cannon-es backend
+ * WeildBuild Physics Engine - Rapier backend (pass 28)
  *
- * Replaces the custom physics with cannon-es for proper collision handling.
- * External API stays identical so Viewport3D doesn't need changes.
+ * The great engine swap: cannon-es is OUT, Rapier is IN (owner decision -
+ * "modern, better and faster"). The public API stays IDENTICAL so the
+ * studio viewports and the server's world-runtime keep working; the two
+ * cannon-leaky spots (getCannonBody / raw characterBody) became neutral
+ * accessors (see the bottom of the class + CharacterBodyView).
  *
- * Features:
- * - cannon-es World with gravity
- * - Per-part properties: Friction, Elasticity, Mass, Anchored, CanCollide
- * - BodyMovers: BodyForce, BodyVelocity, BodyGyro, BodyPosition, BodyThrust, BodyAngularVelocity
- * - Collision groups: canCollide=false bodies use separate group that doesn't interact
- * - Spawn parts (canCollide: false) don't create physics bodies
- * - CharacterController with cannon-es raycasting for ground detection
+ * Why it's safe:
+ * - scripts/rapier-spike.ts (pass 27) proved every feature this file uses
+ *   against the real @dimforge/rapier3d-compat 0.21 in plain Node: bodies,
+ *   shapes (box/ball/capsule/convex hull/heightfield), joints (fixed/
+ *   revolute+motor/rope), raycasts, determinism (bit-exact across two
+ *   identically-stepped worlds - the client/server lockstep precondition)
+ *   and perf (1,000 dynamic boxes ~5 ms/step).
+ * - A headless behavioral suite (scripts/verify-physics-rapier.ts, run by
+ *   the verifier) drives THIS class: fall/land, anchored, canCollide,
+ *   wedge slope, sphere, impulses, terrain height ordering, character
+ *   walk/jump/wall-slide, named kinematic proxies pushing parts, sleep,
+ *   determinism.
+ *
+ * Porting notes (differences that matter):
+ * - ASYNC INIT: the compat package must RAPIER.init() (wasm, ~70 ms) before
+ *   any world can be built. Init is kicked at module load; every mutating
+ *   API called before it completes queues a thunk that is flushed the
+ *   moment the wasm is ready (usually long before the user presses Play -
+ *   the import happens at app boot / worker boot). Mirrors (this.bodies)
+ *   are created immediately, so store syncs never see a missing entry.
+ * - FRICTION/RESTITUTION are per-collider in Rapier (no material pairs).
+ *   Parts carry their own coefficients with the default Average combine;
+ *   terrain/tree colliders use friction 0 + the Max rule so the PART's
+ *   coefficients win exactly (what cannon's ContactMaterial(default, mat)
+ *   did); the character pill uses friction 0 + Min (frictionless - walls
+ *   never grab, min(0, f) = 0) and swaps to friction 1.0 + Max while
+ *   standing (max(1, f) = 1 - plants on slopes, exactly cannon's standing
+ *   material). The pair rule Rapier applies is the higher-precedence rule
+ *   of the two colliders (Average < Min < Multiply < Max).
+ * - THE CHARACTER PILL IS A REAL CAPSULE now. cannon-es had no capsule, so
+ *   the pill used to be a stack of overlapping spheres (<=12, scalloped);
+ *   Rapier has ColliderDesc.capsule, which is the exact geometry the old
+ *   stack approximated (same radius, same poles at +/-H/2, no scallops).
+ * - INTERPOLATION: cannon gave us interpolatedPosition for free; Rapier's
+ *   JS bindings do not. PhysicsWorld steps a fixed timestep behind its own
+ *   accumulator (same adaptive anti-tunneling tiers as v6.2.4) and blends
+ *   prev->current with the accumulator alpha - the v13.7 "character buzz"
+ *   fix is preserved by construction.
+ * - GRAVITY/SLEEP/SOLVER: world.gravity is re-applied from settings every
+ *   step (live gravity changes keep working); sleeping bodies are skipped
+ *   in the sync loop exactly like cannon's SLEEPING state; the solver runs
+ *   8 iterations (cannon's GSSolver ran 10 - Rapier's solver is a
+ *   different, warm-started design where 4 is the default and 8 is a
+ *   stability sweet spot for stacks).
+ * - PRE-EXISTING QUIRK PRESERVED ON PURPOSE: BodyVelocity/BodyPosition/
+ *   BodyGyro/BodyAngularVelocity movers only write the JS mirror, which
+ *   the post-step sync then overwrites for collider-backed bodies (they
+ *   were equally inert under cannon). BodyForce/BodyThrust and impulses
+ *   do reach the solver. Fixing the mirror movers is a separate,
+ *   behavior-changing decision - NOT mixed into the engine swap.
+ * - RopeConstraint (the unilateral max-distance rope) is JointData.rope -
+ *   a native Rapier rope joint, so the class is gone.
  */
 
-import * as CANNON from 'cannon-es';
+import RAPIER from '@dimforge/rapier3d-compat';
+import type {
+  World as RapierWorld,
+  RigidBody as RapierRigidBody,
+  ImpulseJoint,
+  JointData as RapierJointData,
+  UnitImpulseJoint,
+} from '@dimforge/rapier3d-compat';
 import { StudioPart, BodyMover, Joint, PhysicsSettings, PartType } from '../studio-store';
-import { getMaterialProps, calculateMass, combinedFriction, combinedElasticity } from './materials';
+import { getMaterialProps, calculateMass } from './materials';
 import type { TerrainHeightmap } from '../terrain-v2';
 import type { TreeInstance, TreeBlock } from '../terrain-v2';
 import { generateTreeBlocks } from '../terrain-v2';
@@ -36,16 +91,20 @@ export const MAX_VELOCITY = 1000;
 export const SLEEP_VELOCITY_THRESHOLD = 0.1;
 export const EXPLOSION_IMPULSE_DURATION = 0.15;
 
-// ─── Collision Groups ───
-// Group 1: collidable parts (default)
-// Group 2: non-collidable parts (sensors, spawn markers) - don't interact with anything
-// Group 4 (v13.6): the character hitbox (CharacterRoot) - collides with parts,
-// but is excluded from the character's own ground raycast.
-const GROUP_COLLIDABLE = 1;
-const GROUP_NON_COLLIDABLE = 2;
-const GROUP_CHARACTER = 4;
-const MASK_COLLIDABLE = -1; // interacts with everything
-const MASK_NON_COLLIDABLE = 0; // interacts with nothing
+// ─── Collision Groups (Rapier interaction groups: memberships<<16 | filter) ───
+// Part colliders interact with everything; non-collidable parts (sensors,
+// spawn markers) interact with nothing; the character hitbox collides with
+// parts but is excluded from its own ground raycasts (via the raycast's
+// excludeRigidBody, not groups).
+const GROUP_PART = 0x0001;
+const GROUP_GHOST = 0x0002; // non-collidable parts: filter 0 = touches nothing
+const GROUP_CHAR = 0x0004;
+const GROUPS_PART = (GROUP_PART << 16) | 0xffff;
+const GROUPS_GHOST = (GROUP_GHOST << 16) | 0x0000;
+const GROUPS_CHAR = (GROUP_CHAR << 16) | 0xffff;
+/** Character pill filter WITHOUT the player-pill bit (tower-sword-fight
+ *  NPCs: their pills must not collide with the player's pill). */
+const GROUPS_CHAR_NO_PLAYERS = (GROUP_CHAR << 16) | (0xffff & ~GROUP_CHAR);
 
 // ─── Character hitbox ───
 // v1.3 (user request): the CharacterRoot part was DELETED. The character
@@ -53,6 +112,22 @@ const MASK_NON_COLLIDABLE = 0; // interacts with nothing
 // depth of the default character rig) and spawns at the Spawn part (or
 // the world's Spawn Position setting).
 export const DEFAULT_CHARACTER_HITBOX_SIZE = { x: 1.4, y: 2.0, z: 0.48 };
+
+// ─── Rapier async init ───
+// The compat package inlines the wasm as base64; init() compiles it. Kicked
+// at module load (app boot on the client, worker boot on the server) so it
+// is normally long done before the first PhysicsWorld is constructed.
+let rapierReady = false;
+let rapierInitPromise: Promise<void> | null = null;
+export function ensureRapierReady(): Promise<void> {
+  if (!rapierInitPromise) {
+    rapierInitPromise = RAPIER.init().then(() => {
+      rapierReady = true;
+    });
+  }
+  return rapierInitPromise;
+}
+ensureRapierReady();
 
 // ─── Helper Functions ───
 
@@ -65,51 +140,72 @@ function effectiveMass(mass: number): number {
   return Math.max(mass, 0.01);
 }
 
-// ─── v1.3: RopeConstraint (a REAL rope - max distance only) ───
-//
-// The old rope used CANNON.DistanceConstraint, which is a BILATERAL
-// equality: it enforces the distance BOTH ways - it pushes the parts
-// apart when they get closer than `length` (a rigid rod, not a rope).
-//
-// A real rope is a UNILATERAL (max-distance) constraint: the parts may
-// swing freely CLOSER than the length (the rope goes slack and sags),
-// but can never get FARTHER apart than the length (the rope pulls them
-// back). In cannon-es terms the DistanceConstraint's equation multiplier
-// is NEGATIVE when the bodies must be pulled together and POSITIVE when
-// they must be pushed apart - so clamping the equation's force range to
-// [-maxForce, 0] keeps the pull and removes the push. Everything else
-// (the midpoint anchor geometry in update()) is identical to
-// DistanceConstraint.
-export class RopeConstraint extends CANNON.Constraint {
-  /** The maximum distance the two bodies may reach (studs). */
-  length: number;
-  distanceEquation: CANNON.ContactEquation;
+// ─── Quaternion <-> Euler helpers ───
+// Pure math (no three.js import in the engine): the EXACT conventions the
+// parts render with (three.js Euler 'XYZ', degrees in the store) so a
+// part's collider rotation always matches its visual rotation. Verified by
+// the round-trip test in scripts/verify-physics-rapier.ts.
 
-  constructor(bodyA: CANNON.Body, bodyB: CANNON.Body, length: number, maxForce = 1e6) {
-    super(bodyA, bodyB);
-    this.length = Math.max(length, 0.05);
-    const eq = this.distanceEquation = new CANNON.ContactEquation(bodyA, bodyB);
-    this.equations.push(eq);
-    // ONE-SIDED clamp - this is the whole "rope vs rod" difference:
-    //   negative multiplier = pulls the bodies together (a taut rope)
-    //   positive multiplier = pushes the bodies apart  (a rigid rod)
-    // Allowing only the negative side makes the constraint slack when the
-    // parts are closer than `length`, and taut (max pull) when stretched.
-    eq.minForce = -maxForce;
-    eq.maxForce = 0;
-  }
+/** Intrinsic XYZ euler (radians) -> quaternion, matching three.js 'XYZ'. */
+function quatFromEulerXYZ(x: number, y: number, z: number): { x: number; y: number; z: number; w: number } {
+  const cx = Math.cos(x / 2), sx = Math.sin(x / 2);
+  const cy = Math.cos(y / 2), sy = Math.sin(y / 2);
+  const cz = Math.cos(z / 2), sz = Math.sin(z / 2);
+  // q = qX ⊗ qY ⊗ qZ (Hamilton product)
+  return {
+    x: sx * cy * cz + cx * sy * sz,
+    y: cx * sy * cz - sx * cy * sz,
+    z: cx * cy * sz + sx * sy * cz,
+    w: cx * cy * cz - sx * sy * sz,
+  };
+}
 
-  update(): void {
-    const bodyA = this.bodyA;
-    const bodyB = this.bodyB;
-    const eq = this.distanceEquation;
-    const halfLen = this.length * 0.5;
-    const normal = eq.ni;
-    bodyB.position.vsub(bodyA.position, normal);
-    normal.normalize();
-    normal.scale(halfLen, eq.ri);
-    normal.scale(-halfLen, eq.rj);
-  }
+/** Quaternion -> intrinsic XYZ euler (radians), matching three.js 'XYZ'. */
+function eulerXYZFromQuat(q: { x: number; y: number; z: number; w: number }): { x: number; y: number; z: number } {
+  const sinrCosp = 2 * (q.w * q.x + q.y * q.z);
+  const cosrCosp = 1 - 2 * (q.x * q.x + q.y * q.y);
+  const x = Math.atan2(sinrCosp, cosrCosp);
+  const sinp = 2 * (q.w * q.y - q.z * q.x);
+  const y = Math.asin(Math.max(-1, Math.min(1, sinp)));
+  const sinyCosp = 2 * (q.w * q.z + q.x * q.y);
+  const cosyCosp = 1 - 2 * (q.y * q.y + q.z * q.z);
+  const z = Math.atan2(sinyCosp, cosyCosp);
+  return { x, y, z };
+}
+
+/** Rotate vector v by quaternion q. */
+function quatRotate(
+  q: { x: number; y: number; z: number; w: number },
+  vx: number, vy: number, vz: number,
+  out: { x: number; y: number; z: number },
+): { x: number; y: number; z: number } {
+  // t = 2 * (q.xyz × v)
+  const tx = 2 * (q.y * vz - q.z * vy);
+  const ty = 2 * (q.z * vx - q.x * vz);
+  const tz = 2 * (q.x * vy - q.y * vx);
+  // v' = v + w*t + q.xyz × t
+  out.x = vx + q.w * tx + (q.y * tz - q.z * ty);
+  out.y = vy + q.w * ty + (q.z * tx - q.x * tz);
+  out.z = vz + q.w * tz + (q.x * ty - q.y * tx);
+  return out;
+}
+
+/** Conjugate of a unit quaternion (inverse for rotations). */
+function quatConj(q: { x: number; y: number; z: number; w: number }): { x: number; y: number; z: number; w: number } {
+  return { x: -q.x, y: -q.y, z: -q.z, w: q.w };
+}
+
+/** Hamilton product a ⊗ b. */
+function quatMul(
+  a: { x: number; y: number; z: number; w: number },
+  b: { x: number; y: number; z: number; w: number },
+): { x: number; y: number; z: number; w: number } {
+  return {
+    x: a.w * b.x + a.x * b.w + a.y * b.z - a.z * b.y,
+    y: a.w * b.y - a.x * b.z + a.y * b.w + a.z * b.x,
+    z: a.w * b.z + a.x * b.y - a.y * b.x + a.z * b.w,
+    w: a.w * b.w - a.x * b.x - a.y * b.y - a.z * b.z,
+  };
 }
 
 // ─── Physics Body (mirrors old interface) ───
@@ -138,8 +234,12 @@ export interface PhysicsBody {
   partType: PartType;
   _impulses: Array<{ force: { x: number; y: number; z: number }; timeLeft: number; applied: boolean }>;
   /** v13.4 PERF: set when the store position of an anchored part changed, so the
-   *  cannon body only re-syncs on real changes instead of every frame. */
+   *  physics body only re-syncs on real changes instead of every frame. */
   _anchoredDirty?: boolean;
+  /** pass 28: position snapshot from before the last fixed substep - the
+   *  sync loop blends prev->current with the accumulator alpha (cannon's
+   *  interpolatedPosition equivalent). Mutated in place, never reallocated. */
+  _prev?: { x: number; y: number; z: number };
 }
 
 // ─── Character State ───
@@ -366,174 +466,266 @@ export class CharacterController {
   }
 }
 
-// ─── Physics World (cannon-es backend) ───
+// ─── CharacterBodyView (pass 28: the neutral character-body handle) ───
+//
+// cannon-es leaked CANNON.Body to the consumers (characterBody property,
+// getNamedCharacterBody). The view keeps the EXACT member surface the call
+// sites use - position / velocity (with .set() and per-axis +=) /
+// interpolatedPosition / quaternion / wakeUp() - but wired to the Rapier
+// body through a resolver, so nothing outside physics.ts knows the engine.
+// A view whose body was removed resolves to null: reads give 0, writes
+// no-op (safer than cannon's stale-body reads).
+
+/** Live vector-ish read/write accessor for a body's linear velocity.
+ *  Supports `v.x += a` (get+set on the same stable instance) and the
+ *  cannon-style `v.set(x, y, z)`. */
+class LiveVelocity {
+  constructor(private resolve: () => RapierRigidBody | null) {}
+
+  get x(): number { return this.resolve()?.linvel().x ?? 0; }
+  get y(): number { return this.resolve()?.linvel().y ?? 0; }
+  get z(): number { return this.resolve()?.linvel().z ?? 0; }
+  set x(v: number) { const rb = this.resolve(); if (rb) { const l = rb.linvel(); rb.setLinvel({ x: v, y: l.y, z: l.z }, true); } }
+  set y(v: number) { const rb = this.resolve(); if (rb) { const l = rb.linvel(); rb.setLinvel({ x: l.x, y: v, z: l.z }, true); } }
+  set z(v: number) { const rb = this.resolve(); if (rb) { const l = rb.linvel(); rb.setLinvel({ x: l.x, y: l.y, z: v }, true); } }
+  set(x: number, y: number, z: number): void { const rb = this.resolve(); if (rb) rb.setLinvel({ x, y, z }, true); }
+}
+
+/** Live read-only position/rotation accessors. */
+class LivePosition {
+  constructor(private resolve: () => RapierRigidBody | null) {}
+  get x(): number { return this.resolve()?.translation().x ?? 0; }
+  get y(): number { return this.resolve()?.translation().y ?? 0; }
+  get z(): number { return this.resolve()?.translation().z ?? 0; }
+}
+
+class LiveQuaternion {
+  constructor(private resolve: () => RapierRigidBody | null) {}
+  get x(): number { return this.resolve()?.rotation().x ?? 0; }
+  get y(): number { return this.resolve()?.rotation().y ?? 0; }
+  get z(): number { return this.resolve()?.rotation().z ?? 0; }
+  get w(): number { return this.resolve()?.rotation().w ?? 1; }
+}
+
+/** Live read of the interpolated position (the record the sync loop
+ *  updates each step - prev->current blended by the accumulator alpha). */
+class LiveInterpolatedPosition {
+  constructor(private read: () => { x: number; y: number; z: number }) {}
+  get x(): number { return this.read().x; }
+  get y(): number { return this.read().y; }
+  get z(): number { return this.read().z; }
+}
+
+export class CharacterBodyView {
+  readonly position: LivePosition;
+  readonly interpolatedPosition: LiveInterpolatedPosition;
+  readonly velocity: LiveVelocity;
+  readonly quaternion: LiveQuaternion;
+  private readonly resolveBody: () => RapierRigidBody | null;
+
+  constructor(
+    resolve: () => RapierRigidBody | null,
+    readInterp: () => { x: number; y: number; z: number },
+  ) {
+    this.resolveBody = resolve;
+    this.position = new LivePosition(resolve);
+    this.interpolatedPosition = new LiveInterpolatedPosition(readInterp);
+    this.velocity = new LiveVelocity(resolve);
+    this.quaternion = new LiveQuaternion(resolve);
+  }
+
+  /** True while the underlying physics body exists. */
+  isValid(): boolean { return this.resolveBody() !== null; }
+
+  /** cannon-style wake-up (a driver body never sleeps). */
+  wakeUp(): void { this.resolveBody()?.wakeUp(); }
+
+  /** Explicit orientation write (the hitbox yaw follow - locked rotations
+   *  only block PHYSICS torque, an explicitly set rotation stays put).
+   *  Degrees, the same euler the store uses. There are no interpolation
+   *  buffers to keep in sync in Rapier - the rotation is written straight
+   *  onto the body. */
+  setRotationFromEuler(xDeg: number, yDeg: number, zDeg: number): void {
+    const rb = this.resolveBody();
+    if (!rb) return;
+    rb.setRotation(quatFromEulerXYZ(
+      xDeg * Math.PI / 180,
+      yDeg * Math.PI / 180,
+      zDeg * Math.PI / 180,
+    ), true);
+  }
+
+  /** NPC pills (tower-sword-fight): stop colliding with PLAYER pills.
+   *  Replaces the old `body.collisionFilterMask = ~CHARACTER_GROUP`. */
+  setCollidesWithPlayers(on: boolean): void {
+    const rb = this.resolveBody();
+    if (!rb) return;
+    const groups = on ? GROUPS_CHAR : GROUPS_CHAR_NO_PLAYERS;
+    for (let i = 0; i < rb.numColliders(); i++) rb.collider(i).setCollisionGroups(groups);
+  }
+}
+
+// ─── Physics World (Rapier backend) ───
 
 export class PhysicsWorld {
   bodies: Map<string, PhysicsBody> = new Map();
   joints: Joint[] = [];
   settings: PhysicsSettings;
 
-  // cannon-es internals
-  private world: CANNON.World;
-  private cannonBodies: Map<string, CANNON.Body> = new Map();
-  private cannonMaterials: Map<string, CANNON.Material> = new Map();
+  // Rapier internals (world is null until the wasm finished init-ing; the
+  // pre-init queue replays every mutation in order once it is ready).
+  private world: RapierWorld | null = null;
+  private rapierBodies: Map<string, RapierRigidBody> = new Map();
+  private preInitQueue: Array<() => void> = [];
 
   // ─── v13.8: REAL joint constraints ───
-  // Joints used to be stored on the world but never turned into cannon-es
-  // constraints - the Weld tool created a Weld joint entry and NOTHING
-  // happened ("objects don't stick to each other!"). Now every joint is
-  // realized as a real constraint:
-  //   Weld  -> LockConstraint  (rigid: parts stick exactly)
-  //   Motor -> HingeConstraint with the motor enabled (spins)
-  //   Rope  -> DistanceConstraint (keeps the two parts `length` apart)
-  private jointConstraints: Map<string, { constraint: CANNON.Constraint; aId: string; bId: string }> = new Map();
+  // Every studio joint is realized as a real Rapier joint:
+  //   Weld  -> JointData.fixed (freezes the CURRENT relative transform)
+  //   Motor -> JointData.revolute + a velocity motor (spins)
+  //   Rope  -> JointData.rope (max-distance only - a REAL rope; parts swing
+  //            closer together but never farther apart than the length)
+  private jointConstraints: Map<string, { joint: ImpulseJoint; aId: string; bId: string }> = new Map();
   /** Last joints array reference we synced from (syncs assign a NEW array). */
   private _jointsSyncRef: Joint[] | null = null;
   /** Joint ids whose bodies didn't exist yet (staged loading) - retried each step. */
   private _pendingJointIds: Set<string> = new Set();
 
-  // v13.6: the CharacterRoot hitbox body. NOT in `bodies` (it's not a part -
+  // v13.6: the character hitbox body. NOT in `bodies` (it's not a part -
   // the sync loops must never write it back to the store).
-  characterBody: CANNON.Body | null = null;
+  /** Neutral live handle (pass 28): position / velocity / quaternion /
+   *  interpolatedPosition / wakeUp - same member surface the old raw
+   *  cannon body had, so consumers are unchanged. Null when removed. */
+  characterBody: CharacterBodyView | null = null;
+  private characterRB: RapierRigidBody | null = null;
   /** v13.7: current hitbox height (the CharacterRoot part's size.y) - used
    *  by teleport/ground-check so a resized character keeps working. */
   characterHeight = DEFAULT_CHARACTER_HITBOX_SIZE.y;
   /** v13.7: current hitbox size (mirrors the CharacterRoot part). */
   characterSize: { x: number; y: number; z: number } = { ...DEFAULT_CHARACTER_HITBOX_SIZE };
-  private characterMaterial: CANNON.Material | null = null;
-  /** v13.7: high-friction variant - the character body switches to this
-   *  while standing still (planted on slopes, classic-style) and back to the
-   *  frictionless one while moving (slides along walls/ramps freely). */
-  private characterStandingMaterial: CANNON.Material | null = null;
+  /** Interpolation records for the local character pill (prev snapshot +
+   *  the blended result the view exposes as interpolatedPosition). */
+  private charPrev: { x: number; y: number; z: number } = { x: 0, y: 0, z: 0 };
+  private charInterp: { x: number; y: number; z: number } = { x: 0, y: 0, z: 0 };
+  /** Bumped by removeCharacterBody()/createCharacterPill() so a queued
+   *  pill build can detect it is stale (removed or superseded). */
+  private _charGen = 0;
 
   // ─── v6.2.4: adaptive substepping (anti-tunneling) ───
   // User report: "characters sometimes pass through unanchored parts".
-  // cannon-es has no CCD, and a fast body (a brick flung by an explosion at
-  // the 120 u/s part speed cap = 2 studs per 60 Hz step, a character at
-  // terminal fall = 0.83) can skip a thin part's whole overlap band in ONE
-  // integration step (the character pill's spheres are ~0.4 radius, so a
-  // 0.2-thick brick is passed through whenever a step moves ~1 stud).
-  // FIX: keep the per-step displacement budgeted at ~0.5 studs by raising
-  // the fixed-step frequency while anything dynamic is fast. The speeds are
+  // A fast body (a brick flung by an explosion at the 120 u/s part speed
+  // cap = 2 studs per 60 Hz step, a character at terminal fall = 0.83) can
+  // skip a thin part's whole overlap band in ONE integration step. FIX:
+  // keep the per-step displacement budgeted at ~0.5 studs by raising the
+  // fixed-step frequency while anything dynamic is fast. The speeds are
   // read from the PREVIOUS step (capVelocities already computes them for
   // free) plus an impulse kick estimate, so the check costs nothing extra.
   private _lastPartSpeed = 0;
   private _impulseSpeedKick = 0;
+  /** Fixed-step accumulator (cannon's world.step(fixed, dt, max) ran this
+   *  internally; Rapier's JS bindings don't, so we own it - and the
+   *  prev->current blend that replaces interpolatedPosition). */
+  private _accumulator = 0;
+  /** Blend factor for prev->current positions (accumulator / fixedStep). */
+  private _alpha = 0;
 
   /** v13.6: the void line - unanchored parts that fall below it are deleted
-   * (classic building game behavior). Computed at play start by PhysicsSimulation. */
+   *  (classic building game behavior). Computed at play start by PhysicsSimulation. */
   voidY: number = -50;
 
   constructor(settings: PhysicsSettings) {
     this.settings = settings;
 
-    // Create cannon-es world
-    this.world = new CANNON.World({
-      gravity: new CANNON.Vec3(0, settings.gravity, 0),
-    });
-    // v13.4 PERF: SAPBroadphase (sweep-and-prune) instead of NaiveBroadphase.
-    // NaiveBroadphase compares EVERY body against EVERY other body - with the
-    // 5,801-part city map that is ~16.8 million pair checks per physics step,
-    // which alone dropped play mode to single-digit FPS. SAP sorts bodies along
-    // one axis and only tests overlapping neighbors - roughly O(N log N).
-    this.world.broadphase = new CANNON.SAPBroadphase(this.world);
-    (this.world.solver as CANNON.GSSolver).iterations = 10;
-    this.world.allowSleep = true;
+    if (rapierReady) {
+      this.buildWorld();
+    } else {
+      // First world of the session can beat the wasm init (~70 ms from
+      // module load). Queue everything; mirrors are still created
+      // immediately so the store syncs see live entries.
+      ensureRapierReady().then(() => {
+        this.buildWorld();
+        const queue = this.preInitQueue;
+        this.preInitQueue = [];
+        for (const fn of queue) fn();
+      });
+    }
+  }
 
-    // Default contact material
-    const defaultMaterial = new CANNON.Material('default');
-    this.cannonMaterials.set('default', defaultMaterial);
-    this.world.defaultContactMaterial = new CANNON.ContactMaterial(
-      defaultMaterial, defaultMaterial,
-      { friction: 0.5, restitution: 0.2 }
-    );
-
+  private buildWorld(): void {
+    this.world = new RAPIER.World({ x: 0, y: this.effectiveGravity(), z: 0 });
+    // cannon's GSSolver ran 10 iterations; Rapier's warm-started solver
+    // defaults to 4 - 8 is the stability sweet spot for block stacks.
+    this.world.numSolverIterations = 8;
     // NOTE: No ground plane at y=0 - the ground is defined by the baseplate part
     // (added via addBody when isBaseplate=true) and/or terrain. If there is no
     // baseplate, objects fall into the void, which is the correct behavior.
+  }
+
+  /** Gravity with a guard: a payload missing physicsSettings must never
+   *  produce a NaN/undefined-gravity world (bodies freeze at spawn) - fall
+   *  back to the game's standard gravity instead. */
+  private effectiveGravity(): number {
+    return Number.isFinite(this.settings.gravity) ? this.settings.gravity : GRAVITY;
+  }
+
+  /** Run `fn` now when the world is live, or queue it for the init flush.
+   *  Returns true if the world is live (caller may proceed inline). */
+  private whenReady(fn: () => void): boolean {
+    if (this.world) return true;
+    this.preInitQueue.push(fn);
+    return false;
   }
 
   // ─── Body Management ───
 
   /**
    * pass 14 (collision = visuals): an 8-sided convex hull that matches the
-   * visual cylinder (an ellipsoid-cylinder stretched by size.x/y/z). Shared
-   * by addBody and updateBodyShape so a resize keeps the same shape math.
-   *
-   * Winding (all verified by scripts/test-cylinder-collider.ts):
-   *   - vertices: top ring at even indices (2i), bottom ring at odd (2i+1),
-   *     angle order counterclockwise seen from -Y.
-   *   - top cap: the top ring in REVERSE angle order (normal +Y, outward).
-   *   - bottom cap: the bottom ring in angle order (normal -Y, outward).
-   *   - side walls: [top_i, top_i+1, bottom_i+1, bottom_i] (outward normal).
+   * visual cylinder (an ellipsoid-cylinder stretched by size.x/y/z). The
+   * point cloud is shared by addBody and updateBodyShape so a resize keeps
+   * the same shape math. Rapier's convexHull computes its own faces from
+   * the point cloud (no winding needed, unlike the cannon hull).
    */
-  static makeCylinderShape(hx: number, hy: number, hz: number): CANNON.ConvexPolyhedron {
+  static cylinderHullPoints(hx: number, hy: number, hz: number): Float32Array {
     const sides = 8;
-    const verts: CANNON.Vec3[] = [];
+    const pts = new Float32Array(sides * 2 * 3);
     for (let i = 0; i < sides; i++) {
       const a = (i / sides) * Math.PI * 2;
       const cx = Math.cos(a) * hx;
       const cz = Math.sin(a) * hz;
-      verts.push(new CANNON.Vec3(cx, hy, cz));   // top ring    (index 2i)
-      verts.push(new CANNON.Vec3(cx, -hy, cz));  // bottom ring (index 2i+1)
+      pts[i * 6 + 0] = cx; pts[i * 6 + 1] = hy; pts[i * 6 + 2] = cz;      // top ring
+      pts[i * 6 + 3] = cx; pts[i * 6 + 4] = -hy; pts[i * 6 + 5] = cz;     // bottom ring
     }
-    const faces: number[][] = [];
-    // Top cap: reversed angle order faces +Y (outward).
-    const top: number[] = [];
-    for (let i = sides - 1; i >= 0; i--) top.push(i * 2);
-    faces.push(top);
-    // Bottom cap: angle order faces -Y (outward).
-    const bottom: number[] = [];
-    for (let i = 0; i < sides; i++) bottom.push(i * 2 + 1);
-    faces.push(bottom);
-    // Side walls: outward-facing quads between consecutive ring segments.
-    for (let i = 0; i < sides; i++) {
-      const a = i * 2;
-      const b = ((i + 1) % sides) * 2;
-      faces.push([a, b, b + 1, a + 1]);
-    }
-    return new CANNON.ConvexPolyhedron({ vertices: verts, faces });
+    return pts;
   }
 
   /**
    * pass 15 (user request: "a ball should be a ball"): the Sphere part's
-   * collision now matches the visual, instead of an AABB box.
-   *
-   * The visual mesh is a UNIT SphereGeometry scaled by mesh.scale to
-   * (size.x, size.y, size.z) - so a stretched sphere renders as an
-   * ELLIPSOID. cannon-es has no ellipsoid shape, so:
+   * collision matches the visual ELLIPSOID (a unit sphere scaled by
+   * size.x/y/z), not an AABB box.
    *   - UNSTRETCHED sphere (all three half-extents within 5% of the mean):
-   *     a single CANNON.Sphere(meanR). True sphere-vs-anything contacts -
-   *     exactly what the user asked for ("make the visual object be the
-   *     actual collision").
+   *     a single ball collider. True sphere-vs-anything contacts.
    *   - STRETCHED sphere (e.g. a ball scaled into a pill): a STACK of
-   *     overlapping CANNON.Sphere shapes along the longest axis, each
-   *     sphere's radius = the cross-section radius at that point (the
-   *     ellipse equation). The union hugs the visual ellipsoid far better
-   *     than an AABB box (the box's flat faces made a stretched ball
-   *     collide as a brick), and every contact is still a plain
-   *     sphere-vs-anything point - the documented no-snag guarantee holds.
+   *     overlapping ball colliders along the longest axis, each sphere's
+   *     radius = the cross-section radius at that point (the ellipse
+   *     equation). The union hugs the visual ellipsoid far better than an
+   *     AABB box, and every contact is still a plain sphere-vs-anything
+   *     point - the documented no-snag guarantee holds.
    *
-   * Returns the PRIMARY shape (set on the body's constructor); any extra
-   * spheres come back in `extras` and the caller adds them via addShape.
    * Shared by addBody and updateBodyShape so a resize keeps the same math.
    */
-  static makeEllipsoidShape(
-    hx: number, hy: number, hz: number,
-  ): { primary: CANNON.Sphere; extras: { shape: CANNON.Sphere; offset: CANNON.Vec3 }[] } {
+  static ellipsoidStack(hx: number, hy: number, hz: number): Array<{ r: number; ox: number; oy: number; oz: number }> {
     const mean = (hx + hy + hz) / 3;
     const unstretched = Math.max(hx, hy, hz) <= mean * 1.05
       && Math.min(hx, hy, hz) >= mean * 0.95;
     if (unstretched) {
-      return { primary: new CANNON.Sphere(Math.max(mean, 0.005)), extras: [] };
+      return [{ r: Math.max(mean, 0.005), ox: 0, oy: 0, oz: 0 }];
     }
     // Stretched: find the LONGEST axis (the ellipsoid's pole axis). The
     // stack of spheres runs along it; each sphere's radius is the
     // cross-section radius of the ellipsoid at that point.
-    const axes: Array<{ half: number; r1: number; r2: number; dir: CANNON.Vec3 }> = [
-      { half: hx, r1: hy, r2: hz, dir: new CANNON.Vec3(1, 0, 0) },
-      { half: hy, r1: hx, r2: hz, dir: new CANNON.Vec3(0, 1, 0) },
-      { half: hz, r1: hx, r2: hy, dir: new CANNON.Vec3(0, 0, 1) },
+    const axes: Array<{ half: number; r1: number; r2: number; dx: number; dy: number; dz: number }> = [
+      { half: hx, r1: hy, r2: hz, dx: 1, dy: 0, dz: 0 },
+      { half: hy, r1: hx, r2: hz, dx: 0, dy: 1, dz: 0 },
+      { half: hz, r1: hx, r2: hy, dx: 0, dy: 0, dz: 1 },
     ];
     axes.sort((a, b) => b.half - a.half);
     const pole = axes[0];
@@ -543,7 +735,8 @@ export class PhysicsWorld {
     // ellipse cross-section r(along) = crossR*sqrt(1-(along/H)^2) gives the
     // tip sphere center at u*H where u = (H^2 - crossR^2)/(H^2 + crossR^2).
     // (Without this the end spheres taper to a smaller radius and the union
-    // falls ~0.25 short of the visual tip - verified by test-pass15-physics.)
+    // falls ~0.25 short of the visual tip - the rest-height check in
+    // scripts/verify-physics-rapier.ts pins it.)
     const H = pole.half;
     const denom = H * H + crossR * crossR;
     const uTip = denom <= 0 ? 0 : (H * H - crossR * crossR) / denom;
@@ -556,14 +749,11 @@ export class PhysicsWorld {
     const interiorCount = interior <= 0.001
       ? 0
       : Math.min(14, Math.max(0, Math.ceil(interior / spacing) - 1));
-    const spheres: { shape: CANNON.Sphere; offset: CANNON.Vec3 }[] = [];
+    const spheres: Array<{ r: number; ox: number; oy: number; oz: number }> = [];
     const pushSphere = (along: number, r: number) => {
       const k = 1 - (along / H) * (along / H);
       const radius = Math.max(0.005, r === 0 ? crossR * Math.sqrt(Math.max(0, k)) : r);
-      spheres.push({
-        shape: new CANNON.Sphere(radius),
-        offset: new CANNON.Vec3(pole.dir.x * along, pole.dir.y * along, pole.dir.z * along),
-      });
+      spheres.push({ r: radius, ox: pole.dx * along, oy: pole.dy * along, oz: pole.dz * along });
     };
     // Negative tip, then interior (smallest->largest radius toward middle),
     // then positive tip. Ordered along the pole axis.
@@ -574,223 +764,27 @@ export class PhysicsWorld {
       pushSphere(along, 0); // radius from the ellipse eqn inside pushSphere
     }
     pushSphere(tipAlong, tipR);
-    // The body's constructor takes ONE shape; hand it the middle sphere and
-    // add the rest via addShape in the caller. (Removing the constructor
-    // shape and re-adding all of them would also work, but this keeps the
-    // common unstretched path zero-allocation extras.)
-    const extras: { shape: CANNON.Sphere; offset: CANNON.Vec3 }[] = [];
-    const midIdx = Math.floor(spheres.length / 2);
-    const primary = spheres[midIdx].shape;
-    for (let i = 0; i < spheres.length; i++) {
-      if (i !== midIdx) extras.push(spheres[i]);
-    }
-    return { primary, extras };
+    return spheres;
   }
 
   /**
    * v6.2.6: add a part as a STATIC PROXY (server-authoritative
    * multiplayer). The server simulates every part; the local world keeps
-   * only KINEMATIC COLLIDERS at the streamed positions so the local
-   * character (this client owns it) collides with the world exactly as it
-   * is rendered. No local part dynamics = no local-vs-server sim fight
-   * (the "buzzing" objects bug is gone by construction: nothing local
-   * ever pushes back).
+   * only FIXED COLLIDERS at the streamed positions so the local character
+   * (this client owns it) collides with the world exactly as it is
+   * rendered. No local part dynamics = no local-vs-server sim fight.
    */
   addProxyBody(part: StudioPart): PhysicsBody {
     return this.addBody(part, { asStaticProxy: true });
   }
 
   addBody(part: StudioPart, opts?: { asStaticProxy?: boolean }): PhysicsBody {
-    // Skip parts that can't collide - but spawn points ARE collidable now
-    // (they're real parts, not visual-only markers).
-    if (!part.canCollide) {
-      // Still create a PhysicsBody entry for tracking, but no cannon body
-      const mass = calculateMass(part.type, part.size, part.material, part.density);
-      const material = getMaterialProps(part.material);
-      const body: PhysicsBody = {
-        id: part.id,
-        position: { ...part.position },
-        velocity: { x: 0, y: 0, z: 0 },
-        angularVelocity: { x: 0, y: 0, z: 0 },
-        size: { ...part.size },
-        rotation: { ...part.rotation },
-        mass,
-        anchored: part.anchored,
-        canCollide: part.canCollide,
-        friction: part.friction ?? material.friction,
-        elasticity: part.elasticity ?? material.elasticity,
-        isGrounded: false,
-        isAwake: true,
-        isInWater: false,
-        bodyMovers: [...(part.bodyMovers || [])],
-        partType: part.type,
-        _impulses: [],
-      };
-      this.bodies.set(part.id, body);
-      return body;
-    }
-
     const mass = calculateMass(part.type, part.size, part.material, part.density);
     const material = getMaterialProps(part.material);
+    // Skip parts that can't collide - but spawn points ARE collidable now
+    // (they're real parts, not visual-only markers). Non-collidable parts
+    // still get a PhysicsBody entry for tracking, but no physics collider.
     const isAnchored = opts?.asStaticProxy ? true : part.anchored;
-    // v6.2.6: a static proxy ALWAYS has mass 0 (cannon-es makes mass-0
-    // bodies STATIC) - even for unanchored parts, whose dynamics run on
-    // the server and arrive as streamed transforms.
-    const cannonMass = opts?.asStaticProxy ? 0 : (isAnchored ? 0 : effectiveMass(mass));
-
-    // Create cannon shape based on part type
-    let shape: CANNON.Shape;
-    // pass 15: a stretched Sphere part becomes a STACK of sphere shapes
-    // (see makeEllipsoidShape); the primary is set on the body's constructor
-    // and the extras are added via addShape right after the body exists.
-    let sphereExtras: { shape: CANNON.Sphere; offset: CANNON.Vec3 }[] = [];
-    switch (part.type) {
-      case 'Sphere': {
-        // pass 15 (user request: "a ball should be a ball"): the collision
-        // now matches the visual instead of an AABB box. The visual mesh is
-        // a UNIT SphereGeometry scaled by mesh.scale to (size.x, size.y,
-        // size.z), so a stretched sphere renders as an ELLIPSOID.
-        //   - unstretched sphere -> a single CANNON.Sphere (true sphere
-        //     contacts, what the user asked for).
-        //   - stretched sphere (e.g. a ball scaled into a pill) -> a STACK
-        //     of overlapping spheres along the long axis whose radii follow
-        //     the ellipse cross-section. The union hugs the visual ellipsoid
-        //     far better than the old AABB box (whose flat faces made a
-        //     stretched ball collide as a brick), and every contact is still
-        //     a sphere-vs-anything point. See PhysicsWorld.makeEllipsoidShape.
-        const hx = Math.max(part.size.x / 2, 0.005);
-        const hy = Math.max(part.size.y / 2, 0.005);
-        const hz = Math.max(part.size.z / 2, 0.005);
-        const ell = PhysicsWorld.makeEllipsoidShape(hx, hy, hz);
-        shape = ell.primary;
-        sphereExtras = ell.extras;
-        break;
-      }
-      case 'Cylinder': {
-        // v1.1 FIX (same class of bug as Sphere): the visual mesh is a
-        // unit CylinderGeometry scaled by (size.x, size.y, size.z), but the
-        // old cannon Cylinder used max(x,z)/2 for BOTH radii - so X != Z
-        // stretching produced a visual ellipsoid-cylinder but a circular
-        // cannon cylinder that poked out.
-        //
-        // pass 14 FIX (the REAL bug - "collision shorter than the visual"):
-        // the old hand-rolled faces array emitted the side walls TWICE
-        // (once per winding) and NO top/bottom caps at all, so nothing
-        // could rest ON a cylinder and side contacts resolved against
-        // inward-facing normals. Now: an 8-sided ConvexPolyhedron with a
-        // proper top cap, bottom cap and outward side walls (verified in
-        // scripts/test-cylinder-collider.ts - a sphere rests exactly on
-        // the cap, a box rests exactly on the cap, side contacts push out).
-        shape = PhysicsWorld.makeCylinderShape(
-          Math.max(part.size.x / 2, 0.005),
-          Math.max(part.size.y / 2, 0.005),
-          Math.max(part.size.z / 2, 0.005),
-        );
-        break;
-      }
-      case 'Wedge': {
-        // 1.0.1: wedges get their REAL triangular-prism shape (a convex
-        // polyhedron with the same 6 corners as the rendered geometry) -
-        // the old code gave every wedge a full BOX hitbox, so the slope was
-        // an invisible wall and characters couldn't walk up it.
-        // Corners match Viewport3D's createWedgeGeometry: the tall face is
-        // at +Z, the slope descends toward -Z.
-        const hw = Math.max(part.size.x / 2, 0.005);
-        const hh = Math.max(part.size.y / 2, 0.005);
-        const hd = Math.max(part.size.z / 2, 0.005);
-        shape = new CANNON.ConvexPolyhedron({
-          vertices: [
-            new CANNON.Vec3(-hw, -hh, hd),  // 0 bottom-front-left
-            new CANNON.Vec3(hw, -hh, hd),   // 1 bottom-front-right
-            new CANNON.Vec3(hw, hh, hd),    // 2 top-front-right
-            new CANNON.Vec3(-hw, hh, hd),   // 3 top-front-left
-            new CANNON.Vec3(-hw, -hh, -hd), // 4 bottom-back-left
-            new CANNON.Vec3(hw, -hh, -hd),  // 5 bottom-back-right
-          ],
-          faces: [
-            [0, 1, 2, 3], // front (the tall vertical face, +Z)
-            [0, 4, 5, 1], // bottom
-            [4, 0, 3],    // left triangle
-            [2, 1, 5],    // right triangle
-            [3, 2, 5, 4], // the slope (up-and-back normal)
-          ],
-        });
-        break;
-      }
-      default: {
-        // Block, Spawn - use Box shape
-        shape = new CANNON.Box(new CANNON.Vec3(
-          Math.max(part.size.x / 2, 0.005),
-          Math.max(part.size.y / 2, 0.005),
-          Math.max(part.size.z / 2, 0.005)
-        ));
-        break;
-      }
-    }
-
-    // Create or get cannon material for this part's friction/elasticity
-    const friction = part.friction ?? material.friction;
-    const restitution = part.elasticity ?? material.elasticity;
-    const matKey = `f${friction.toFixed(2)}_r${restitution.toFixed(2)}`;
-    let cannonMat = this.cannonMaterials.get(matKey);
-    if (!cannonMat) {
-      cannonMat = new CANNON.Material(matKey);
-      this.cannonMaterials.set(matKey, cannonMat);
-
-      // Create contact material with the default material
-      const defaultMat = this.cannonMaterials.get('default')!;
-      this.world.addContactMaterial(new CANNON.ContactMaterial(
-        defaultMat, cannonMat,
-        { friction, restitution }
-      ));
-      // Also create contact material with itself
-      this.world.addContactMaterial(new CANNON.ContactMaterial(
-        cannonMat, cannonMat,
-        { friction: combinedFriction(friction, friction), restitution: combinedElasticity(restitution, restitution) }
-      ));
-      // v13.6: pair it with the character hitbox material too (frictionless,
-      // so the character slides along walls and ramps instead of sticking).
-      this._ensureCharacterContact(cannonMat);
-    }
-
-    // Create cannon body
-    const cannonBody = new CANNON.Body({
-      mass: cannonMass,
-      shape,
-      position: new CANNON.Vec3(part.position.x, part.position.y, part.position.z),
-      material: cannonMat,
-      collisionFilterGroup: part.canCollide ? GROUP_COLLIDABLE : GROUP_NON_COLLIDABLE,
-      collisionFilterMask: part.canCollide ? MASK_COLLIDABLE : MASK_NON_COLLIDABLE,
-      linearDamping: 0.01,
-      angularDamping: 0.1,
-    });
-
-    // pass 15: add the extra sphere shapes for a stretched Sphere part (the
-    // constructor only takes one shape). All extras share the body's
-    // material + collision filter, so this is purely geometry.
-    for (const ex of sphereExtras) {
-      cannonBody.addShape(ex.shape, ex.offset);
-    }
-
-    // Apply rotation if present
-    if (part.rotation.x !== 0 || part.rotation.y !== 0 || part.rotation.z !== 0) {
-      const euler = new CANNON.Vec3(
-        part.rotation.x * Math.PI / 180,
-        part.rotation.y * Math.PI / 180,
-        part.rotation.z * Math.PI / 180
-      );
-      cannonBody.quaternion.setFromEuler(euler.x, euler.y, euler.z);
-    }
-
-    // For anchored parts with mass > 0, set to kinematic so they can be moved
-    if (isAnchored && cannonMass > 0) {
-      cannonBody.type = CANNON.Body.KINEMATIC;
-    }
-
-    this.world.addBody(cannonBody);
-    this.cannonBodies.set(part.id, cannonBody);
-
-    // Create the PhysicsBody entry for external tracking
     const body: PhysicsBody = {
       id: part.id,
       position: { ...part.position },
@@ -801,8 +795,8 @@ export class PhysicsWorld {
       mass,
       anchored: isAnchored,
       canCollide: part.canCollide,
-      friction,
-      elasticity: restitution,
+      friction: part.friction ?? material.friction,
+      elasticity: part.elasticity ?? material.elasticity,
       isGrounded: false,
       isAwake: true,
       isInWater: false,
@@ -811,34 +805,146 @@ export class PhysicsWorld {
       _impulses: [],
     };
     this.bodies.set(part.id, body);
+    if (!part.canCollide) return body;
+
+    if (this.whenReady(() => {
+      // The part may have been removed before the wasm finished init-ing.
+      if (this.bodies.has(part.id)) this.createRapierBody(part, body, opts);
+    })) {
+      this.createRapierBody(part, body, opts);
+    }
     return body;
   }
 
+  /** Build the Rapier body + collider(s) for a part (mirror already exists). */
+  private createRapierBody(part: StudioPart, body: PhysicsBody, opts?: { asStaticProxy?: boolean }): void {
+    if (!this.world) return;
+    const isAnchored = opts?.asStaticProxy ? true : part.anchored;
+    // v6.2.6: a static proxy is ALWAYS fixed - even for unanchored parts,
+    // whose dynamics run on the server and arrive as streamed transforms.
+    // Anchored parts are fixed too (mass 0 in the old cannon world).
+    const desc = isAnchored
+      ? RAPIER.RigidBodyDesc.fixed()
+      : RAPIER.RigidBodyDesc.dynamic()
+        .setLinearDamping(0.01)
+        .setAngularDamping(0.1);
+    desc.setTranslation(part.position.x, part.position.y, part.position.z);
+    if (part.rotation.x !== 0 || part.rotation.y !== 0 || part.rotation.z !== 0) {
+      desc.setRotation(quatFromEulerXYZ(
+        part.rotation.x * Math.PI / 180,
+        part.rotation.y * Math.PI / 180,
+        part.rotation.z * Math.PI / 180,
+      ));
+    }
+    const rb = this.world.createRigidBody(desc);
+
+    // Colliders: one per shape (a stretched Sphere is a stack of balls).
+    for (const cd of this.partColliderDescs(part, isAnchored)) {
+      this.world.createCollider(cd, rb);
+    }
+
+    this.rapierBodies.set(part.id, rb);
+  }
+
+  /** The collider descriptor(s) for a part: shape by type, plus the part's
+   *  friction/restitution, collision groups and (for dynamics) its mass.
+   *  Shared by createRapierBody and updateBodyShape. */
+  private partColliderDescs(part: StudioPart, isAnchored: boolean): RAPIER.ColliderDesc[] {
+    const friction = partFriction(part);
+    const restitution = partElasticity(part);
+    const out: RAPIER.ColliderDesc[] = [];
+    const finish = (cd: RAPIER.ColliderDesc) => {
+      cd.setFriction(friction).setRestitution(restitution).setCollisionGroups(GROUPS_PART);
+      if (!isAnchored) {
+        const mass = effectiveMass(calculateMass(part.type, part.size, part.material, part.density));
+        cd.setMass(mass);
+      }
+      out.push(cd);
+      return cd;
+    };
+
+    switch (part.type) {
+      case 'Sphere': {
+        // pass 15: the visual is a unit sphere scaled to (size.x, size.y,
+        // size.z) - an ELLIPSOID. Unstretched -> one ball; stretched -> a
+        // stack of balls along the long axis (see ellipsoidStack).
+        const hx = Math.max(part.size.x / 2, 0.005);
+        const hy = Math.max(part.size.y / 2, 0.005);
+        const hz = Math.max(part.size.z / 2, 0.005);
+        for (const s of PhysicsWorld.ellipsoidStack(hx, hy, hz)) {
+          finish(RAPIER.ColliderDesc.ball(s.r).setTranslation(s.ox, s.oy, s.oz));
+        }
+        break;
+      }
+      case 'Cylinder': {
+        // pass 14: an 8-sided convex hull with real caps (the old code
+        // emitted side walls twice and no caps - nothing could rest ON a
+        // cylinder). Matches the stretched visual ellipsoid-cylinder.
+        const hull = RAPIER.ColliderDesc.convexHull(PhysicsWorld.cylinderHullPoints(
+          Math.max(part.size.x / 2, 0.005),
+          Math.max(part.size.y / 2, 0.005),
+          Math.max(part.size.z / 2, 0.005),
+        ));
+        if (hull) finish(hull);
+        break;
+      }
+      case 'Wedge': {
+        // 1.0.1: the REAL triangular-prism shape (same 6 corners as the
+        // rendered geometry) - a box hitbox made the slope an invisible
+        // wall. Corners match Viewport3D's createWedgeGeometry: the tall
+        // face is at +Z, the slope descends toward -Z.
+        const hw = Math.max(part.size.x / 2, 0.005);
+        const hh = Math.max(part.size.y / 2, 0.005);
+        const hd = Math.max(part.size.z / 2, 0.005);
+        const hull = RAPIER.ColliderDesc.convexHull(new Float32Array([
+          -hw, -hh, hd,   // 0 bottom-front-left
+          hw, -hh, hd,    // 1 bottom-front-right
+          hw, hh, hd,     // 2 top-front-right
+          -hw, hh, hd,    // 3 top-front-left
+          -hw, -hh, -hd,  // 4 bottom-back-left
+          hw, -hh, -hd,   // 5 bottom-back-right
+        ]));
+        if (hull) finish(hull);
+        break;
+      }
+      default: {
+        // Block, Spawn - use a box shape
+        finish(RAPIER.ColliderDesc.cuboid(
+          Math.max(part.size.x / 2, 0.005),
+          Math.max(part.size.y / 2, 0.005),
+          Math.max(part.size.z / 2, 0.005),
+        ));
+        break;
+      }
+    }
+    return out;
+  }
+
   removeBody(id: string) {
-    const cannonBody = this.cannonBodies.get(id);
-    if (cannonBody) {
-      // v13.8: drop any constraints that reference this body first
-      // (cannon-es throws when a constraint equation references a removed body).
+    const rb = this.rapierBodies.get(id);
+    if (rb && this.world) {
+      // v13.8: drop any joints that reference this body first.
       for (const [jointId, entry] of this.jointConstraints) {
         if (entry.aId === id || entry.bId === id) {
-          this.world.removeConstraint(entry.constraint);
+          this.world.removeImpulseJoint(entry.joint, true);
           this.jointConstraints.delete(jointId);
         }
       }
-      this.world.removeBody(cannonBody);
-      this.cannonBodies.delete(id);
+      this.world.removeRigidBody(rb);
+      this.rapierBodies.delete(id);
     }
     this.bodies.delete(id);
     this.joints = this.joints.filter(j => j.partAId !== id && j.partBId !== id);
   }
 
-  // ─── v13.8: realize studio joints as cannon-es constraints ───
+  // ─── v13.8: realize studio joints as Rapier joints ───
   // Called from step(). Cheap when nothing changed: the sync sites in
   // Viewport3D assign a NEW array reference on every change, so a
-  // reference compare is enough. Joints whose parts don't have cannon
+  // reference compare is enough. Joints whose parts don't have physics
   // bodies YET (staged loading adds bodies 300/frame) are queued in
   // _pendingJointIds and retried on later steps.
   private syncJointConstraints(): void {
+    if (!this.world) return;
     const changed = this._jointsSyncRef !== this.joints;
     if (!changed && this._pendingJointIds.size === 0) return;
     this._jointsSyncRef = this.joints;
@@ -848,12 +954,12 @@ export class PhysicsWorld {
       if (!joint.enabled) continue;
       activeIds.add(joint.id);
 
-      const bodyA = this.cannonBodies.get(joint.partAId);
-      const bodyB = this.cannonBodies.get(joint.partBId);
+      const bodyA = this.rapierBodies.get(joint.partAId);
+      const bodyB = this.rapierBodies.get(joint.partBId);
       if (!bodyA || !bodyB) {
         // Bodies not created yet (staged load) or a part was deleted -
         // retry on later steps in case it's just staging order.
-        if (this.bodies.has(joint.partAId) || this.bodies.has(joint.partBId) || this.cannonBodies.size === 0) {
+        if (this.bodies.has(joint.partAId) || this.bodies.has(joint.partBId) || this.rapierBodies.size === 0) {
           this._pendingJointIds.add(joint.id);
         }
         continue;
@@ -861,46 +967,62 @@ export class PhysicsWorld {
       if (this.jointConstraints.has(joint.id)) continue;
 
       try {
-        let constraint: CANNON.Constraint;
+        let data: RapierJointData;
+        let configure: ((joint: ImpulseJoint) => void) | null = null;
         if (joint.type === 'Weld') {
-          // LockConstraint freezes the CURRENT relative transform of the
-          // two bodies - exactly "stick together where they touch now".
-          constraint = new CANNON.LockConstraint(bodyA, bodyB, { maxForce: 1e6 });
+          // Weld: freeze the CURRENT relative transform of the two bodies -
+          // exactly "stick together where they touch now". Express B's pose
+          // in A's local frame and pin it there with a fixed joint.
+          const ta = bodyA.translation(), qa = bodyA.rotation();
+          const tb = bodyB.translation(), qb = bodyB.rotation();
+          const inv = quatConj(qa);
+          const rel = { x: tb.x - ta.x, y: tb.y - ta.y, z: tb.z - ta.z };
+          const relPos = quatRotate(inv, rel.x, rel.y, rel.z, { x: 0, y: 0, z: 0 });
+          const relRot = quatMul(inv, qb);
+          data = RAPIER.JointData.fixed(
+            { x: 0, y: 0, z: 0 }, { x: 0, y: 0, z: 0, w: 1 },
+            relPos, relRot,
+          );
         } else if (joint.type === 'Motor') {
-          const hinge = new CANNON.HingeConstraint(bodyA, bodyB, {
-            pivotA: new CANNON.Vec3(joint.C0?.x ?? 0, joint.C0?.y ?? 0, joint.C0?.z ?? 0),
-            axisA: new CANNON.Vec3(0, 1, 0),
-            pivotB: new CANNON.Vec3(joint.C1?.x ?? 0, joint.C1?.y ?? 0, joint.C1?.z ?? 0),
-            axisB: new CANNON.Vec3(0, 1, 0),
-            maxForce: 1e6,
-          });
-          hinge.enableMotor();
-          hinge.setMotorSpeed(joint.motorSpeed ?? 5);
-          hinge.setMotorMaxForce(joint.motorMaxTorque ?? 10);
-          constraint = hinge;
+          // Motor: a hinge on the Y axis through the joint's C0/C1 local
+          // anchors, with a velocity motor (cannon: HingeConstraint +
+          // enableMotor). The factor is a stiffness multiplier; 1e6 makes
+          // the motor reach motorSpeed regardless of load (cannon's
+          // maxForce cap was near-inert at the default torque 10).
+          data = RAPIER.JointData.revolute(
+            { x: joint.C0?.x ?? 0, y: joint.C0?.y ?? 0, z: joint.C0?.z ?? 0 },
+            { x: joint.C1?.x ?? 0, y: joint.C1?.y ?? 0, z: joint.C1?.z ?? 0 },
+            { x: 0, y: 1, z: 0 },
+          );
+          const speed = joint.motorSpeed ?? 5;
+          configure = (j) => { (j as UnitImpulseJoint).configureMotorVelocity(speed, 1e6); };
         } else if (joint.type === 'Rope') {
-          // v1.3: ropes are REAL ropes now (max-distance only - see
-          // RopeConstraint above). Parts can swing closer together (the
-          // rope goes slack), but never farther apart than the length.
-          // `joint.length` is the v1.3 field; old saves smuggled the
-          // length into motorMaxTorque, so it stays as the fallback.
+          // v1.3: ropes are REAL ropes (max-distance only). Parts can swing
+          // closer together (the rope goes slack), but never farther apart
+          // than the length. `joint.length` is the v1.3 field; old saves
+          // smuggled the length into motorMaxTorque, so it stays as the
+          // fallback.
           const ropeLength = joint.length ?? joint.motorMaxTorque ?? 5;
-          constraint = new RopeConstraint(bodyA, bodyB, ropeLength, 1e6);
+          data = RAPIER.JointData.rope(
+            Math.max(ropeLength, 0.05),
+            { x: 0, y: 0, z: 0 }, { x: 0, y: 0, z: 0 },
+          );
         } else {
           continue;
         }
-        this.world.addConstraint(constraint);
-        this.jointConstraints.set(joint.id, { constraint, aId: joint.partAId, bId: joint.partBId });
+        const impulseJoint = this.world.createImpulseJoint(data, bodyA, bodyB, true);
+        if (configure) configure(impulseJoint);
+        this.jointConstraints.set(joint.id, { joint: impulseJoint, aId: joint.partAId, bId: joint.partBId });
         this._pendingJointIds.delete(joint.id);
       } catch {
         // Malformed joint (degenerate geometry etc.) - skip it silently.
       }
     }
 
-    // Remove constraints for joints that were deleted / disabled / unassigned.
+    // Remove joints that were deleted / disabled / unassigned.
     for (const [jointId, entry] of this.jointConstraints) {
       if (!activeIds.has(jointId)) {
-        this.world.removeConstraint(entry.constraint);
+        this.world.removeImpulseJoint(entry.joint, true);
         this.jointConstraints.delete(jointId);
       }
     }
@@ -914,23 +1036,16 @@ export class PhysicsWorld {
     for (const id of ids) this.removeBody(id);
   }
 
-  // ─── v13.6: CharacterRoot hitbox (real physics body for the player) ───
-
-  private _ensureCharacterContact(other: CANNON.Material) {
-    if (!this.characterMaterial) return;
-    this.world.addContactMaterial(new CANNON.ContactMaterial(
-      this.characterMaterial, other,
-      { friction: 0, restitution: 0 }
-    ));
-  }
+  // ─── v13.6: character hitbox (real physics body for the player) ───
 
   /**
    * Create the CharacterRoot hitbox (v13.7: fully parametric).
-   * The size comes from the CharacterRoot PART (so resizing it in the editor
-   * resizes the hitbox 1:1), and the rotation is applied to the body's
-   * quaternion (fixedRotation only blocks PHYSICS torque - an orientation
-   * that is set explicitly stays put, so a rotated CharacterRoot rotates the
-   * hitbox). `spawnPosition` is the FEET position (bottom center of the hitbox).
+   * The size comes from the standard hitbox (DEFAULT_CHARACTER_HITBOX_SIZE
+   * unless overridden), and the rotation is applied to the body's
+   * quaternion (locked rotations only block PHYSICS torque - an
+   * orientation that is set explicitly stays put, so a rotated root
+   * rotates the hitbox). `spawnPosition` is the FEET position (bottom
+   * center of the hitbox).
    */
   addCharacterBody(
     spawnPosition: { x: number; y: number; z: number },
@@ -938,63 +1053,26 @@ export class PhysicsWorld {
       size?: { x: number; y: number; z: number };
       rotationDeg?: { x: number; y: number; z: number };
     },
-  ): CANNON.Body {
+  ): CharacterBodyView | null {
     this.removeCharacterBody();
-    const body = this.createCharacterPillBody(spawnPosition, opts);
-    this.characterBody = body;
-    return body;
+    const view = this.createCharacterPill(spawnPosition, opts);
+    this.characterBody = view;
+    return view;
   }
 
   /**
    * v1.1 (server-authoritative multiplayer): build a character pill hitbox
-   * WITHOUT claiming the single-character slot. The contact materials are
-   * created once and shared by every character in the world (addBody pairs
-   * new part materials with BOTH the frictionless and the standing variant).
-   * Used by addCharacterBody (classic single player) and by the gamehost's
-   * per-player named bodies below.
+   * WITHOUT claiming the single-character slot. Used by addCharacterBody
+   * (classic single player) and by the gamehost's per-player named bodies
+   * below.
    */
-  createCharacterPillBody(
+  private createCharacterPill(
     spawnPosition: { x: number; y: number; z: number },
     opts?: {
       size?: { x: number; y: number; z: number };
       rotationDeg?: { x: number; y: number; z: number };
     },
-  ): CANNON.Body {
-    const firstCharacter = !this.characterMaterial;
-    const charMat = this.characterMaterial ?? new CANNON.Material('characterRoot');
-    this.characterMaterial = charMat;
-    // Contact materials are created ONCE and shared by every character
-    // body in this world (v1.1: the gamehost simulates one pill per player).
-    if (firstCharacter) {
-      // Frictionless contacts against the default material and every part
-      // material created so far (new part materials pair up in addBody).
-      const defaultMat = this.cannonMaterials.get('default')!;
-      this.world.addContactMaterial(new CANNON.ContactMaterial(
-        charMat, defaultMat, { friction: 0, restitution: 0 }
-      ));
-      this.cannonMaterials.forEach((mat) => {
-        if (mat !== charMat) this._ensureCharacterContact(mat);
-      });
-
-      // v13.7: the STANDING material - friction 1.0 against everything. The
-      // character body swaps to it while standing with no input, which PLANTS
-      // it on slopes (Coulomb friction holds while tan(slope) < 1.0, i.e. up
-      // to 45 degrees). While moving it swaps back to the frictionless one so
-      // walls and ramps never grab the character.
-      const standMat = new CANNON.Material('characterRootStanding');
-      this.characterStandingMaterial = standMat;
-      this.world.addContactMaterial(new CANNON.ContactMaterial(
-        standMat, defaultMat, { friction: 1.0, restitution: 0 }
-      ));
-      this.cannonMaterials.forEach((mat) => {
-        if (mat !== charMat && mat !== standMat) {
-          this.world.addContactMaterial(new CANNON.ContactMaterial(
-            standMat, mat, { friction: 1.0, restitution: 0 }
-          ));
-        }
-      });
-    }
-
+  ): CharacterBodyView {
     // Guard: a usable hitbox needs positive height and some width/depth.
     const size = opts?.size ?? { ...DEFAULT_CHARACTER_HITBOX_SIZE };
     const H = Math.max(0.4, Math.min(64, size.y));
@@ -1003,88 +1081,69 @@ export class PhysicsWorld {
     this.characterHeight = H;
     this.characterSize = { x: halfW * 2, y: H, z: halfD * 2 };
 
-    // PILL HITBOX (v1.0.1 "catches up on edges" fix, user-diagnosed): the
-    // collider used to be a BOX sitting on a sphere "sled" at the feet. The
-    // sphere slid over ramps, ledges and block edges beautifully, but the
-    // BOX's flat bottom face snagged on the very same edges mid-jump: the
-    // sphere kept moving while the box caught the corner and, both belonging
-    // to one fixed-rotation body, the whole character "caught up" and got
-    // pinned (jump animation stuck, could slide but not jump). The fix: ONE
-    // continuous PILL (capsule), the feet sphere extended upward at the
-    // SAME radius all the way to the head, exactly like the visible body.
-    //
-    // cannon-es has no capsule shape, and a CANNON.Cylinder for the middle
-    // would reintroduce the 1.0.1 wedge bug (cylinder-vs-convex-hull SAT is
-    // broken: the character would PENETRATE oblique faces like a wedge's
-    // slope with zero resistance and then jam - isolated in
-    // scripts/test-wedge-bisect.js: sphere maxPen 0.03 vs cylinder 1.00+).
-    // So the pill is a VERTICAL STACK OF OVERLAPPING SPHERES, all radius R,
-    // centers spaced <= 0.75R apart:
-    //   - the spheres' union IS the pill body (the waist scallops between
-    //     centers dip < 2% of R - imperceptible in contacts),
-    //   - every contact stays a well-tested sphere-vs-anything single
-    //     point, so there is no flat face anywhere to snag a corner,
-    //   - the bottom pole still rests exactly at -H/2, so the standing
-    //     height on flat ground is unchanged from the old box+sled.
+    // PILL HITBOX (v1.0.1 "catches up on edges" fix): ONE continuous PILL
+    // (capsule), the feet sphere extended upward at the SAME radius all
+    // the way to the head, exactly like the visible body - no flat face
+    // anywhere to snag a corner. cannon-es had no capsule, so the old pill
+    // was a stack of overlapping spheres; Rapier has a native capsule,
+    // which is the exact geometry that stack approximated (same radius,
+    // poles at exactly -H/2 and +H/2, minus the scallops).
     //
     // pass 15 (user request: "revert the character hitbox to original"):
-    // pass 14 widened the stack into X columns to cover the arm span, but
-    // that changed how the character FELT to push against walls (a wider
-    // union snags the arms on door frames the body would otherwise clear).
-    // The original single-column pill is back: one stack at x=0, radius =
-    // min(halfD, H/2, halfW) (collapses to the torso depth on the default
-    // rig). Every contact is still a plain sphere-vs-anything point, so the
-    // documented no-snag guarantee is untouched.
+    // single column, radius = min(halfD, H/2, halfW) (collapses to the
+    // torso depth on the default rig).
     const pillR = Math.max(0.05, Math.min(halfD, H / 2, halfW));
-    const body = new CANNON.Body({
-      mass: 8, // heavy enough to push light parts, light enough to be pushed
-      material: charMat,
-      fixedRotation: true, // the hitbox never tumbles; the visible body follows it
-      allowSleep: false,
-      linearDamping: 0,
-      angularDamping: 1,
-      collisionFilterGroup: GROUP_CHARACTER,
-      collisionFilterMask: MASK_COLLIDABLE, // collide with everything
-    });
 
-    // Shape offsets are CENTERED on the body (body.position = hitbox
-    // center). Total span: [-H/2, +H/2].
-    //   - bottom hemisphere center: -H/2 + R (bottom pole = -H/2 exactly)
-    //   - top hemisphere center:    +H/2 - R (top pole = +H/2 exactly)
-    //   - overlapping spheres between at <= 0.75R spacing, capped at 12
-    //     shapes so huge characters stay cheap to simulate.
-    // pass 15: single column at x=0 (the original pre-pass-14 shape).
-    const pillBottomC = -(H / 2) + pillR;
-    const pillTopC = (H / 2) - pillR;
-    const pillSpan = Math.max(0, pillTopC - pillBottomC);
-    const pillSpacing = Math.max(0.04, pillR * 0.75);
-    const pillCount = pillSpan <= 0.001
-      ? 1
-      : Math.min(12, Math.max(2, Math.ceil(pillSpan / pillSpacing) + 1));
-    for (let i = 0; i < pillCount; i++) {
-      const y = pillCount === 1
-        ? 0
-        : pillBottomC + (pillSpan * i) / (pillCount - 1);
-      body.addShape(new CANNON.Sphere(pillR), new CANNON.Vec3(0, y, 0));
-    }
+    const interp: { x: number; y: number; z: number } = { x: spawnPosition.x, y: spawnPosition.y + H / 2, z: spawnPosition.z };
+    const prev: { x: number; y: number; z: number } = { ...interp };
+    const view = new CharacterBodyView(() => this.characterRB, () => this.charInterp);
+    this.charPrev = prev;
+    this.charInterp = interp;
 
-    body.position.set(spawnPosition.x, spawnPosition.y + H / 2, spawnPosition.z);
-
-    // v13.7: apply the CharacterRoot part's rotation to the hitbox shape.
-    const rot = opts?.rotationDeg;
-    if (rot && (rot.x !== 0 || rot.y !== 0 || rot.z !== 0)) {
-      body.quaternion.setFromEuler(
-        rot.x * Math.PI / 180,
-        rot.y * Math.PI / 180,
-        rot.z * Math.PI / 180,
+    // Generation token: removeCharacterBody()/a newer pill bumps it, so a
+    // queued build that fires late (or after a remove+re-add) can detect
+    // it is stale. (Checking `characterBody !== view` here does NOT work:
+    // addCharacterBody assigns the property AFTER this returns, so the
+    // inline build would reject itself - the bug the behavioral suite
+    // caught: the pill was never created.)
+    const gen = ++this._charGen;
+    const build = () => {
+      if (!this.world || this._charGen !== gen) return; // removed/replaced
+      const desc = RAPIER.RigidBodyDesc.dynamic()
+        .setLinearDamping(0)
+        .setAngularDamping(1)
+        .lockRotations() // the hitbox never tumbles; the visible body follows it
+        .setCanSleep(false)
+        .setTranslation(spawnPosition.x, spawnPosition.y + H / 2, spawnPosition.z);
+      const rot = opts?.rotationDeg;
+      if (rot && (rot.x !== 0 || rot.y !== 0 || rot.z !== 0)) {
+        desc.setRotation(quatFromEulerXYZ(
+          rot.x * Math.PI / 180,
+          rot.y * Math.PI / 180,
+          rot.z * Math.PI / 180,
+        ));
+      }
+      const rb = this.world.createRigidBody(desc);
+      // The capsule's cylinder half-height: total span is +/-H/2 with
+      // hemispheres of pillR at both poles (bottom pole rests exactly at
+      // -H/2, so the standing height matches the old sphere-stack pill).
+      const capsuleHalf = Math.max(0, H / 2 - pillR);
+      this.world.createCollider(
+        RAPIER.ColliderDesc.capsule(capsuleHalf, pillR)
+          .setMass(8) // heavy enough to push light parts, light enough to be pushed
+          .setFriction(0)
+          .setFrictionCombineRule(RAPIER.CoefficientCombineRule.Min) // frictionless: min(0, f) = 0, walls never grab
+          .setRestitution(0)
+          .setCollisionGroups(GROUPS_CHAR),
+        rb,
       );
-      // Keep interpolation buffers aligned so it doesn't visually spin up.
-      body.previousQuaternion.copy(body.quaternion);
-      body.interpolatedQuaternion.copy(body.quaternion);
-    }
-
-    this.world.addBody(body);
-    return body;
+      this.characterRB = rb;
+      const t = rb.translation();
+      prev.x = t.x; prev.y = t.y; prev.z = t.z;
+      interp.x = t.x; interp.y = t.y; interp.z = t.z;
+    };
+    if (this.whenReady(build)) build();
+    return view;
   }
 
   // ─── v1.1: NAMED character bodies (server-authoritative multiplayer) ───
@@ -1094,9 +1153,14 @@ export class PhysicsWorld {
   // the single-character slot.
 
   private namedCharacters: Map<string, {
-    body: CANNON.Body;
+    rb: RapierRigidBody | null;
+    view: CharacterBodyView;
     height: number;
     size: { x: number; y: number; z: number };
+    prev: { x: number; y: number; z: number };
+    interp: { x: number; y: number; z: number };
+    /** NPC pills opt out of colliding with player pills (TSF). */
+    excludesPlayers: boolean;
   }> = new Map();
 
   addNamedCharacterBody(
@@ -1106,107 +1170,150 @@ export class PhysicsWorld {
       size?: { x: number; y: number; z: number };
       rotationDeg?: { x: number; y: number; z: number };
     },
-  ): CANNON.Body {
+  ): CharacterBodyView | null {
     this.removeNamedCharacterBody(id);
-    const body = this.createCharacterPillBody(spawnPosition, opts);
-    this.namedCharacters.set(id, {
-      body,
-      height: this.characterHeight,
-      size: { ...this.characterSize },
-    });
-    return body;
+
+    const size = opts?.size ?? { ...DEFAULT_CHARACTER_HITBOX_SIZE };
+    const H = Math.max(0.4, Math.min(64, size.y));
+    const halfW = Math.max(0.05, Math.min(32, size.x / 2));
+    const halfD = Math.max(0.05, Math.min(32, size.z / 2));
+    const pillR = Math.max(0.05, Math.min(halfD, H / 2, halfW));
+
+    const prev: { x: number; y: number; z: number } = { x: spawnPosition.x, y: spawnPosition.y + H / 2, z: spawnPosition.z };
+    const interp: { x: number; y: number; z: number } = { ...prev };
+    const entry = {
+      rb: null as RapierRigidBody | null,
+      view: null as unknown as CharacterBodyView,
+      height: H,
+      size: { x: halfW * 2, y: H, z: halfD * 2 },
+      prev,
+      interp,
+      excludesPlayers: false,
+    };
+    entry.view = new CharacterBodyView(() => this.namedCharacters.get(id)?.rb ?? null, () => this.namedCharacters.get(id)?.interp ?? interp);
+    this.namedCharacters.set(id, entry);
+
+    const build = () => {
+      if (!this.world || this.namedCharacters.get(id) !== entry) return; // removed before init
+      const desc = RAPIER.RigidBodyDesc.dynamic()
+        .setLinearDamping(0)
+        .setAngularDamping(1)
+        .lockRotations()
+        .setCanSleep(false)
+        .setTranslation(spawnPosition.x, spawnPosition.y + H / 2, spawnPosition.z);
+      const rot = opts?.rotationDeg;
+      if (rot && (rot.x !== 0 || rot.y !== 0 || rot.z !== 0)) {
+        desc.setRotation(quatFromEulerXYZ(
+          rot.x * Math.PI / 180,
+          rot.y * Math.PI / 180,
+          rot.z * Math.PI / 180,
+        ));
+      }
+      const rb = this.world.createRigidBody(desc);
+      const capsuleHalf = Math.max(0, H / 2 - pillR);
+      this.world.createCollider(
+        RAPIER.ColliderDesc.capsule(capsuleHalf, pillR)
+          .setMass(8)
+          .setFriction(0)
+          .setFrictionCombineRule(RAPIER.CoefficientCombineRule.Min)
+          .setRestitution(0)
+          .setCollisionGroups(entry.excludesPlayers ? GROUPS_CHAR_NO_PLAYERS : GROUPS_CHAR),
+        rb,
+      );
+      entry.rb = rb;
+      const t = rb.translation();
+      prev.x = t.x; prev.y = t.y; prev.z = t.z;
+      interp.x = t.x; interp.y = t.y; interp.z = t.z;
+    };
+    if (this.whenReady(build)) build();
+    return entry.view;
   }
 
   removeNamedCharacterBody(id: string) {
     const entry = this.namedCharacters.get(id);
     if (!entry) return;
-    this.world.removeBody(entry.body);
+    if (entry.rb && this.world) this.world.removeRigidBody(entry.rb);
     this.namedCharacters.delete(id);
   }
 
-  getNamedCharacterBody(id: string): CANNON.Body | undefined {
-    return this.namedCharacters.get(id)?.body;
+  /** Neutral live handle for a named character body (position reads,
+   *  velocity writes, wakeUp - the same members the raw cannon body had).
+   *  The tower-sword-fight NPCs and the gamehost drive bodies through it. */
+  getNamedCharacterBody(id: string): CharacterBodyView | undefined {
+    return this.namedCharacters.get(id)?.view;
   }
 
   /**
-   * v6.3.0 PLAYER COLLISIONS: convert a named character body to KINEMATIC
-   * so it can push unanchored parts without being pushed back.
+   * v6.3.0 PLAYER COLLISIONS: convert a named character body to a
+   * VELOCITY-DRIVEN KINEMATIC body so it can push unanchored parts without
+   * being pushed back.
    *
    * The owning client still drives the player's transform via its 0.25 s
-   * state report (the server worker mirrors that into body.position /
-   * body.velocity each tick). The body needs to live in the physics world
-   * so the contact solver sees "an infinite-mass body slid into this
-   * dynamic part" and pushes the part away (the user's "I walked into a
-   * ball and nothing happened" report: gravity worked, the baseplate
-   * fell, the character fell after it, but the ball the character walked
-   * into never moved - because there was no server-side player body at
-   * all). Kinematic = mass 0, no gravity, no collision forces back onto
-   * the body; the contact solver still creates contact equations against
-   * dynamic bodies, and those equations push the dynamic side only.
+   * state report (the server worker mirrors that into the body's velocity
+   * each tick). The body needs to live in the physics world so the contact
+   * solver sees "an infinite-mass body slid into this dynamic part" and
+   * pushes the part away. Kinematic = no gravity, no collision forces back
+   * onto the body; the contact solver still creates contact equations
+   * against dynamic bodies, and those equations push the dynamic side only.
+   * (cannon flipped the same switch with Body.KINEMATIC.)
    */
   setNamedCharacterKinematic(id: string): void {
     const entry = this.namedCharacters.get(id);
     if (!entry) return;
-    const body = entry.body;
-    body.type = CANNON.Body.KINEMATIC; // 4 - skips gravity + force integration
-    body.mass = 0;
-    body.invMass = 0;
-    body.updateMassProperties();
-    body.velocity.set(0, 0, 0);
-    body.angularVelocity.set(0, 0, 0);
-    body.previousPosition.copy(body.position);
-    body.interpolatedPosition.copy(body.position);
-    body.previousQuaternion.copy(body.quaternion);
-    body.interpolatedQuaternion.copy(body.quaternion);
-    body.allowSleep = false; // a kinematic driver body never sleeps
-    body.wakeUp();
-  }
-
-  /** All named character entries (id -> { body, height, size }). */
-  get namedCharacterEntries(): ReadonlyMap<string, { body: CANNON.Body; height: number; size: { x: number; y: number; z: number } }> {
-    return this.namedCharacters;
+    const go = () => {
+      const rb = entry.rb;
+      if (!rb || !this.world) return;
+      rb.setBodyType(RAPIER.RigidBodyType.KinematicVelocityBased, true);
+      rb.setLinvel({ x: 0, y: 0, z: 0 }, true);
+      rb.setAngvel({ x: 0, y: 0, z: 0 }, true);
+      rb.wakeUp(); // a kinematic driver body never sleeps
+    };
+    if (this.whenReady(go)) go();
   }
 
   /** Teleport a named character hitbox so its FEET land at `feetPosition`. */
   teleportNamedCharacterBody(id: string, feetPosition: { x: number; y: number; z: number }) {
     const entry = this.namedCharacters.get(id);
     if (!entry) return;
-    entry.body.position.set(
-      feetPosition.x,
-      feetPosition.y + entry.height / 2,
-      feetPosition.z,
-    );
-    entry.body.velocity.set(0, 0, 0);
-    entry.body.angularVelocity.set(0, 0, 0);
-    entry.body.previousPosition.copy(entry.body.position);
-    entry.body.interpolatedPosition.copy(entry.body.position);
+    const go = () => {
+      const rb = entry.rb;
+      if (!rb) return;
+      const t = { x: feetPosition.x, y: feetPosition.y + entry.height / 2, z: feetPosition.z };
+      rb.setTranslation(t, true);
+      rb.setLinvel({ x: 0, y: 0, z: 0 }, true);
+      rb.setAngvel({ x: 0, y: 0, z: 0 }, true);
+      entry.prev.x = t.x; entry.prev.y = t.y; entry.prev.z = t.z;
+      entry.interp.x = t.x; entry.interp.y = t.y; entry.interp.z = t.z;
+    };
+    if (this.whenReady(go)) go();
   }
 
-  /** Swap a named character between the frictionless/standing materials. */
+  /** Swap a named character between the frictionless/standing states.
+   *  (Frictionless = friction 0 + Min rule: min(0, f) = 0. Standing =
+   *  friction 1.0 + Max rule: max(1, f) = 1 - plants on slopes, exactly
+   *  what cannon's standing contact material did.) */
   setNamedCharacterStanding(id: string, standing: boolean) {
     const entry = this.namedCharacters.get(id);
-    if (!entry) return;
-    const target = standing ? this.characterStandingMaterial : this.characterMaterial;
-    if (target && entry.body.material !== target) entry.body.material = target;
+    if (!entry || !entry.rb) return;
+    this.applyStandingFriction(entry.rb, standing);
   }
 
   /** Ground check for a named character (same multi-probe edge logic). */
   namedCharacterGroundCheck(id: string): boolean {
     const entry = this.namedCharacters.get(id);
-    if (!entry) return false;
-    return this._characterGroundProbe(entry.body, entry.size, entry.height);
+    if (!entry || !entry.rb) return false;
+    return this.characterGroundProbe(entry.rb, entry.size, entry.height);
   }
 
   removeCharacterBody() {
-    if (!this.characterBody) return;
-    this.world.removeBody(this.characterBody);
+    this._charGen++;
+    if (this.characterRB && this.world) this.world.removeRigidBody(this.characterRB);
+    this.characterRB = null;
     this.characterBody = null;
-    this.characterMaterial = null;
-    this.characterStandingMaterial = null;
   }
 
   /**
-   * v13.7: swap the character hitbox between its two contact materials:
+   * v13.7: swap the character hitbox between its two contact states:
    *  - standing=true  -> high friction (plants on slopes, can't be shoved
    *                      around by gravity while idle)
    *  - standing=false -> frictionless (the normal moving state: slides
@@ -1214,46 +1321,50 @@ export class PhysicsWorld {
    * Called every frame by the play controller.
    */
   setCharacterStanding(standing: boolean) {
-    const body = this.characterBody;
-    if (!body) return;
-    const target = standing ? this.characterStandingMaterial : this.characterMaterial;
-    if (target && body.material !== target) body.material = target;
+    if (!this.characterRB) return;
+    this.applyStandingFriction(this.characterRB, standing);
+  }
+
+  private applyStandingFriction(rb: RapierRigidBody, standing: boolean): void {
+    for (let i = 0; i < rb.numColliders(); i++) {
+      const c = rb.collider(i);
+      c.setFriction(standing ? 1.0 : 0);
+      c.setFrictionCombineRule(standing
+        ? RAPIER.CoefficientCombineRule.Max
+        : RAPIER.CoefficientCombineRule.Min);
+    }
   }
 
   /** Teleport the character hitbox so its FEET land at `feetPosition`. */
   teleportCharacterBody(feetPosition: { x: number; y: number; z: number }) {
-    if (!this.characterBody) return;
-    this.characterBody.position.set(
-      feetPosition.x,
-      feetPosition.y + this.characterHeight / 2,
-      feetPosition.z,
-    );
-    this.characterBody.velocity.set(0, 0, 0);
-    this.characterBody.angularVelocity.set(0, 0, 0);
-    // Keep the interpolation buffers in sync so the visible body doesn't
+    if (!this.characterRB) return;
+    const t = { x: feetPosition.x, y: feetPosition.y + this.characterHeight / 2, z: feetPosition.z };
+    this.characterRB.setTranslation(t, true);
+    this.characterRB.setLinvel({ x: 0, y: 0, z: 0 }, true);
+    this.characterRB.setAngvel({ x: 0, y: 0, z: 0 }, true);
+    // Keep the interpolation records in sync so the visible body doesn't
     // streak from the old position to the new one over the next frames.
-    this.characterBody.previousPosition.copy(this.characterBody.position);
-    this.characterBody.interpolatedPosition.copy(this.characterBody.position);
+    this.charPrev.x = t.x; this.charPrev.y = t.y; this.charPrev.z = t.z;
+    this.charInterp.x = t.x; this.charInterp.y = t.y; this.charInterp.z = t.z;
   }
 
   /**
-   * Ground check for the character hitbox: a short ray straight down from the
-   * body center (the character's own hitbox is excluded from the ray).
+   * Ground check for the character hitbox: short rays straight down from
+   * the body center (the character's own hitbox is excluded from the rays).
    */
   characterGroundCheck(): boolean {
-    const body = this.characterBody;
-    if (!body) return false;
-    return this._characterGroundProbe(body, this.characterSize, this.characterHeight);
+    if (!this.characterRB) return false;
+    return this.characterGroundProbe(this.characterRB, this.characterSize, this.characterHeight);
   }
 
   /** The multi-probe downward raycast shared by both character APIs. */
-  private _characterGroundProbe(
-    body: CANNON.Body,
+  private characterGroundProbe(
+    rb: RapierRigidBody,
     charSize: { x: number; y: number; z: number },
     charHeight: number,
   ): boolean {
 
-    // v13.8 EDGE-OF-BLOCK FIX: the character hitbox (a sphere-pill from the
+    // v13.8 EDGE-OF-BLOCK FIX: the character hitbox (a capsule from the
     // feet to the head) can rest perfectly well on the EDGE/CORNER of a
     // block - the physics solver holds it up - but a single ray straight
     // down from the body CENTER misses the block whenever the center is
@@ -1277,87 +1388,123 @@ export class PhysicsWorld {
       [axis, 0], [-axis, 0], [0, axis], [0, -axis],
       [diag, diag], [-diag, diag], [diag, -diag], [-diag, -diag],
     ];
-    const from = new CANNON.Vec3();
-    const to = new CANNON.Vec3();
-    const result = new CANNON.RaycastResult();
+    const p = rb.translation();
     for (const [ox, oz] of probes) {
-      from.set(body.position.x + ox, body.position.y, body.position.z + oz);
-      to.set(body.position.x + ox, body.position.y - rayLen, body.position.z + oz);
-      result.reset();
-      this.world.raycastClosest(from, to, {
-        collisionFilterMask: ~GROUP_CHARACTER, // ignore our own hitbox
-        skipBackfaces: true,
-      }, result);
-      if (result.hasHit) return true;
+      if (this.castRayDown(p.x + ox, p.y, p.z + oz, rayLen, rb)) return true;
     }
     return false;
+  }
+
+  /** Straight-down raycast used by every ground probe. One scratch Ray for
+   *  the whole world (mutated in place - the old cannon code allocated a
+   *  Ray + RaycastResult per probe). `exclude` skips that body's own
+   *  colliders (the character's self-hit, the part's own bottom face). */
+  private _ray = new RAPIER.Ray({ x: 0, y: 0, z: 0 }, { x: 0, y: -1, z: 0 });
+  private castRayDown(x: number, y: number, z: number, len: number, exclude?: RapierRigidBody): boolean {
+    if (!this.world) return false;
+    this._ray.origin.x = x;
+    this._ray.origin.y = y;
+    this._ray.origin.z = z;
+    this._ray.dir.x = 0;
+    this._ray.dir.y = -1;
+    this._ray.dir.z = 0;
+    return !!this.world.castRay(this._ray, len, true, undefined, undefined, undefined, exclude);
   }
 
   // ─── Terrain & Tree Collision ───
 
   /**
    * Add the terrain heightmap as a collidable surface.
-   * Uses cannon-es Heightfield shape so unanchored parts fall, bounce,
-   * and rest on the terrain just like on any other part.
+   * Uses a Rapier heightfield so unanchored parts fall, bounce, and rest
+   * on the terrain just like on any other part.
    *
-   * The heightfield is positioned so its center aligns with world origin,
-   * matching how the terrain renderer positions the mesh.
+   * Our heightmap stores heights as heights[x * length + z] with the grid
+   * centered on the world origin. Rapier's heightfield spans
+   * [-scale.x, +scale.x] x [-scale.z, +scale.z] around its body origin,
+   * with scale = half-extents and (nrows+1)*(ncols+1) heights laid out in
+   * ITS OWN order (not ours - the index mapping below was pinned by the
+   * asymmetric-bump test in scripts/verify-physics-rapier.ts: a tall spike
+   * at a known (x, z) must catch a ball dropped at that same (x, z)).
+   *
+   * Friction 0 + the Max combine rule on the field: the OTHER collider's
+   * coefficients win every contact (exactly what cannon's
+   * ContactMaterial(default, mat) did - a part on terrain uses the part's
+   * own friction/restitution).
    */
   addTerrain(heightmap: TerrainHeightmap) {
-    const { width, length, cellSize, heights } = heightmap;
+    const go = () => {
+      if (!this.world) return;
+      const { width, length, cellSize, heights } = heightmap;
+      const halfW = (width * cellSize) / 2;
+      const halfL = (length * cellSize) / 2;
 
-    // cannon-es Heightfield expects data[xi][yi] = height at that cell.
-    // Our heightmap stores heights as heights[x * length + z].
-    const data: number[][] = [];
-    for (let x = 0; x < width; x++) {
-      const row: number[] = [];
-      for (let z = 0; z < length; z++) {
-        row.push(heights[x * length + z]);
+      // The visual terrain is a grid of width x length BLOCKS (see
+      // Viewport3D's buildData): cell (x, z) is centered at
+      // ((x+0.5)*c - halfW, (z+0.5)*c - halfL) with its top at
+      // heights[x * length + z]. A heightfield covering every cell needs
+      // width x length SEGMENTS - i.e. (width+1) x (length+1) points - so
+      // the outermost row/column duplicates the last real one.
+      //
+      // Rapier: nrows = Z segments, ncols = X segments, heights laid out
+      // as data[col * (nrows + 1) + row] (its own order - pinned against
+      // ours by the asymmetric-spike test in scripts/verify-physics-rapier.ts:
+      // a tall spike at a known (x, z) cell must catch the ball dropped
+      // over that cell's world center). scale = half-extents, the field
+      // spans [-halfW, halfW] x [-halfL, halfL] around the body origin.
+      const nrows = length;
+      const ncols = width;
+      const at = (x: number, z: number): number =>
+        heights[Math.min(x, width - 1) * length + Math.min(z, length - 1)];
+      const data = new Float32Array((nrows + 1) * (ncols + 1));
+      for (let x = 0; x <= ncols; x++) {
+        for (let z = 0; z <= nrows; z++) {
+          data[x * (nrows + 1) + z] = at(x, z);
+        }
       }
-      data.push(row);
-    }
 
-    const heightfieldShape = new CANNON.Heightfield(data, {
-      elementSize: cellSize,
-    });
-
-    const terrainBody = new CANNON.Body({
-      mass: 0, // static - terrain doesn't move
-      shape: heightfieldShape,
-    });
-
-    // Position: the heightfield's local origin is at the corner of the grid.
-    // We need to offset it so the terrain center is at world origin.
-    // The terrain spans from -halfW to +halfW in X, -halfL to +halfL in Z.
-    const halfW = (width * cellSize) / 2;
-    const halfL = (length * cellSize) / 2;
-    terrainBody.position.set(-halfW, 0, -halfL);
-
-    this.world.addBody(terrainBody);
+      const body = this.world.createRigidBody(
+        RAPIER.RigidBodyDesc.fixed().setTranslation(0, 0, 0),
+      );
+      this.world.createCollider(
+        RAPIER.ColliderDesc.heightfield(nrows, ncols, data, { x: halfW, y: 1, z: halfL })
+          .setFriction(0).setFrictionCombineRule(RAPIER.CoefficientCombineRule.Max)
+          .setRestitution(0).setRestitutionCombineRule(RAPIER.CoefficientCombineRule.Max)
+          .setCollisionGroups(GROUPS_PART),
+        body,
+      );
+    };
+    if (this.whenReady(go)) go();
   }
 
   /**
    * Add tree blocks as static collidable boxes.
    * Each tree is decomposed into its constituent blocks (trunk + leaves),
-   * and each block becomes a static cannon Body. This lets parts rest on
+   * and each block becomes a fixed collider. This lets parts rest on
    * tree branches, bounce off trunks, etc.
    */
   addTreeBlocks(blocks: TreeBlock[]) {
-    const defaultMat = this.cannonMaterials.get('default')!;
-    for (const block of blocks) {
-      const shape = new CANNON.Box(new CANNON.Vec3(
-        Math.max(block.size.x / 2, 0.005),
-        Math.max(block.size.y / 2, 0.005),
-        Math.max(block.size.z / 2, 0.005),
-      ));
-      const body = new CANNON.Body({
-        mass: 0, // static - trees don't move
-        shape,
-        material: defaultMat,
-      });
-      body.position.set(block.position.x, block.position.y, block.position.z);
-      this.world.addBody(body);
-    }
+    const go = () => {
+      if (!this.world) return;
+      for (const block of blocks) {
+        const body = this.world.createRigidBody(
+          RAPIER.RigidBodyDesc.fixed().setTranslation(block.position.x, block.position.y, block.position.z),
+        );
+        this.world.createCollider(
+          RAPIER.ColliderDesc.cuboid(
+            Math.max(block.size.x / 2, 0.005),
+            Math.max(block.size.y / 2, 0.005),
+            Math.max(block.size.z / 2, 0.005),
+          )
+            // Same "the other side wins" rule as terrain: parts and the
+            // character feel their own friction on tree blocks.
+            .setFriction(0).setFrictionCombineRule(RAPIER.CoefficientCombineRule.Max)
+            .setRestitution(0).setRestitutionCombineRule(RAPIER.CoefficientCombineRule.Max)
+            .setCollisionGroups(GROUPS_PART),
+          body,
+        );
+      }
+    };
+    if (this.whenReady(go)) go();
   }
 
   /**
@@ -1373,7 +1520,7 @@ export class PhysicsWorld {
 
   syncFromPart(part: StudioPart) {
     const body = this.bodies.get(part.id);
-    const cannonBody = this.cannonBodies.get(part.id);
+    const rb = this.rapierBodies.get(part.id);
     if (!body) return;
 
     const mass = calculateMass(part.type, part.size, part.material, part.density);
@@ -1389,19 +1536,21 @@ export class PhysicsWorld {
     body.mass = mass;
     body.bodyMovers = [...(part.bodyMovers || [])];
 
-    // Sync to cannon body if it exists
-    if (cannonBody) {
-      cannonBody.position.set(part.position.x, part.position.y, part.position.z);
+    // Sync to the physics body if it exists
+    if (rb) {
+      rb.setTranslation({ x: part.position.x, y: part.position.y, z: part.position.z }, true);
+      let q: { x: number; y: number; z: number; w: number };
       if (part.rotation.x !== 0 || part.rotation.y !== 0 || part.rotation.z !== 0) {
-        cannonBody.quaternion.setFromEuler(
+        q = quatFromEulerXYZ(
           part.rotation.x * Math.PI / 180,
           part.rotation.y * Math.PI / 180,
-          part.rotation.z * Math.PI / 180
+          part.rotation.z * Math.PI / 180,
         );
       } else {
-        cannonBody.quaternion.set(0, 0, 0, 1);
+        q = { x: 0, y: 0, z: 0, w: 1 };
       }
-      cannonBody.wakeUp();
+      rb.setRotation(q, true);
+      rb.wakeUp();
     }
 
     if (!body.anchored) {
@@ -1410,46 +1559,34 @@ export class PhysicsWorld {
   }
 
   /**
-   * pass 13 (rotate hitbox): re-create a part's cannon COLLISION SHAPE when its
-   * size changes mid-play (the resize face handles, a modify_property rule).
-   * syncFromPart updates position + quaternion + the JS mirror's size, but the
-   * cannon Body keeps its original CANNON.Shape forever - so a resized block
-   * kept colliding at its old extents. This swaps in a fresh shape matching the
-   * new size (Box for Block/Wedge, the 8-sided ConvexPolyhedron for Cylinder,
-   * and the makeEllipsoidShape sphere/stack for Sphere) and re-applies the
-   * quaternion so a rotated+resized part stays correct. Rotation-only changes
-   * don't need this (syncFromPart's quaternion write already turns the existing
-   * shape), but it's harmless to call.
+   * pass 13 (rotate hitbox): re-create a part's COLLIDERS when its size
+   * changes mid-play (the resize face handles, a modify_property rule).
+   * syncFromPart updates position + rotation + the JS mirror's size, but
+   * the colliders keep their original shape forever - so a resized block
+   * kept colliding at its old extents. This swaps in fresh colliders
+   * matching the new size (box for Block/Wedge, the 8-sided hull for
+   * Cylinder, the ellipsoid stack for Sphere) and re-applies the rotation.
    */
   updateBodyShape(part: StudioPart): void {
-    const cannonBody = this.cannonBodies.get(part.id);
-    if (!cannonBody) return;
-    const hx = Math.max(part.size.x / 2, 0.005);
-    const hy = Math.max(part.size.y / 2, 0.005);
-    const hz = Math.max(part.size.z / 2, 0.005);
-    // cannon-es: drop the old shapes and add the new one(s) in place.
-    for (const s of cannonBody.shapes) cannonBody.removeShape(s);
-    if (part.type === 'Cylinder') {
-      cannonBody.addShape(PhysicsWorld.makeCylinderShape(hx, hy, hz));
-    } else if (part.type === 'Sphere') {
-      // pass 15: rebuild the ellipsoid stack (a Sphere resize can flip
-      // between the single-sphere and stretched-stack branches).
-      const ell = PhysicsWorld.makeEllipsoidShape(hx, hy, hz);
-      cannonBody.addShape(ell.primary);
-      for (const ex of ell.extras) cannonBody.addShape(ex.shape, ex.offset);
-    } else {
-      cannonBody.addShape(new CANNON.Box(new CANNON.Vec3(hx, hy, hz)));
+    const rb = this.rapierBodies.get(part.id);
+    if (!rb || !this.world) return;
+    // Drop the old colliders and create the new one(s) in place.
+    while (rb.numColliders() > 0) {
+      this.world.removeCollider(rb.collider(0), true);
+    }
+    for (const cd of this.partColliderDescs(part, part.anchored)) {
+      this.world.createCollider(cd, rb);
     }
     if (part.rotation.x !== 0 || part.rotation.y !== 0 || part.rotation.z !== 0) {
-      cannonBody.quaternion.setFromEuler(
+      rb.setRotation(quatFromEulerXYZ(
         part.rotation.x * Math.PI / 180,
         part.rotation.y * Math.PI / 180,
-        part.rotation.z * Math.PI / 180
-      );
+        part.rotation.z * Math.PI / 180,
+      ), true);
     } else {
-      cannonBody.quaternion.set(0, 0, 0, 1);
+      rb.setRotation({ x: 0, y: 0, z: 0, w: 1 }, true);
     }
-    cannonBody.wakeUp();
+    rb.wakeUp();
   }
 
   syncToPart(part: StudioPart): StudioPart {
@@ -1467,10 +1604,10 @@ export class PhysicsWorld {
    * v6.2.4: a part's anchored flag flipped during play (properties panel,
    * WeildCode rules, the server's slow body sync). The PhysicsBody MIRROR
    * was already flipped by the caller; this pushes the change into the
-   * CANNON body itself (type + mass). Before, the cannon body kept its
-   * boot-time type forever: a part unanchored mid-play stayed STATIC
-   * (froze mid-air, unpushable) and a part anchored mid-play kept falling -
-   * and character contact behavior against it was wrong in both cases.
+   * physics body itself (body type). Before, the body kept its boot-time
+   * type forever: a part unanchored mid-play stayed FIXED (froze mid-air,
+   * unpushable) and a part anchored mid-play kept falling - and character
+   * contact behavior against it was wrong in both cases.
    */
   refreshBodyAnchored(part: {
     id: string;
@@ -1480,25 +1617,23 @@ export class PhysicsWorld {
     density?: number;
   }): void {
     const body = this.bodies.get(part.id);
-    const cannonBody = this.cannonBodies.get(part.id);
-    if (!body || !cannonBody) return;
+    const rb = this.rapierBodies.get(part.id);
+    if (!body || !rb) return;
     if (body.anchored) {
-      cannonBody.type = CANNON.Body.STATIC;
-      cannonBody.mass = 0;
-      cannonBody.updateMassProperties();
-      cannonBody.velocity.set(0, 0, 0);
-      cannonBody.angularVelocity.set(0, 0, 0);
+      rb.setBodyType(RAPIER.RigidBodyType.Fixed, true);
+      rb.setLinvel({ x: 0, y: 0, z: 0 }, true);
+      rb.setAngvel({ x: 0, y: 0, z: 0 }, true);
     } else {
-      const mass = calculateMass(
+      const mass = effectiveMass(calculateMass(
         part.type ?? 'Block',
         part.size,
         part.material ?? 'Plastic',
         part.density,
-      );
-      cannonBody.type = CANNON.Body.DYNAMIC;
-      cannonBody.mass = effectiveMass(mass);
-      cannonBody.updateMassProperties();
-      cannonBody.wakeUp();
+      ));
+      rb.setBodyType(RAPIER.RigidBodyType.Dynamic, true);
+      // Keep the collider mass in sync with the (possibly changed) part.
+      for (let i = 0; i < rb.numColliders(); i++) rb.collider(i).setMass(mass);
+      rb.wakeUp();
     }
   }
 
@@ -1506,29 +1641,22 @@ export class PhysicsWorld {
    * v7.1 FIX: a part's canCollide flag flipped during play (WeildCode
    * modify_property rule, the properties panel, a server sync). The
    * PhysicsBody MIRROR was already flipped by the caller (syncFromPart);
-   * this pushes the change into the CANNON body itself (collision filters
+   * this pushes the change into the physics body itself (collision groups
    * + body creation/removal).
    *
-   * Before this fix the cannon body kept its boot-time collision filters
-   * forever: a part made non-collidable mid-game kept colliding, and a
-   * part made collidable mid-game that STARTED non-collidable had no
-   * cannon body to collide with (addBody skips cannon body creation for
-   * non-collidable parts). Both directions of the rule were broken.
-   *
    * Strategy:
-   *   - false -> true:  if there is no cannon body yet, remove and re-add
-   *                      the body so addBody creates the cannon body for
-   *                      the now-collidable part. If a cannon body already
-   *                      exists (rare, only happens for parts that were
-   *                      collidable before), flip its filters back on.
-   *                      Joint constraints are dropped by removeBody but
-   *                      re-realized on the next step by
-   *                      syncJointConstraints (the joints array is
-   *                      unchanged), so no joints are lost.
-   *   - true -> false:  set the cannon body's filters to the non-collidable
-   *                      group/mask so it stops interacting with anything.
-   *                      Cheaper than removing the body, and reversible if
-   *                      canCollide flips back.
+   *   - false -> true:  if there is no physics body yet, remove and re-add
+   *                      the body so addBody creates the collider for the
+   *                      now-collidable part. If a body already exists
+   *                      (rare, only happens for parts that were
+   *                      collidable before), flip its groups back on.
+   *                      Joints are dropped by removeBody but re-realized
+   *                      on the next step by syncJointConstraints (the
+   *                      joints array is unchanged), so no joints are lost.
+   *   - true -> false:  set the body's collision groups to the ghost
+   *                      group (filter 0 = touches nothing). Cheaper than
+   *                      removing the body, and reversible if canCollide
+   *                      flips back.
    */
   refreshBodyCanCollide(part: StudioPart): void {
     const body = this.bodies.get(part.id);
@@ -1541,29 +1669,27 @@ export class PhysicsWorld {
     // (which would otherwise flip it back to the stale value) is a no-op.
     body.canCollide = nowCollidable;
 
-    const cannonBody = this.cannonBodies.get(part.id);
+    const rb = this.rapierBodies.get(part.id);
 
     if (nowCollidable) {
-      if (!cannonBody) {
-        // Part started non-collidable (no cannon body) and is now collidable.
+      if (!rb) {
+        // Part started non-collidable (no physics body) and is now collidable.
         // Remove the JS body entry and re-add the part entirely so addBody
-        // runs the cannon body creation path. Constraints referencing this
+        // runs the collider creation path. Constraints referencing this
         // body are dropped by removeBody and re-created on the next step.
         this.bodies.delete(part.id);
         this.addBody(part);
         return;
       }
-      // Existing cannon body: flip the filters back to collidable.
-      cannonBody.collisionFilterGroup = GROUP_COLLIDABLE;
-      cannonBody.collisionFilterMask = MASK_COLLIDABLE;
-      cannonBody.wakeUp();
+      // Existing body: flip the groups back to collidable.
+      for (let i = 0; i < rb.numColliders(); i++) rb.collider(i).setCollisionGroups(GROUPS_PART);
+      rb.wakeUp();
     } else {
-      // Now non-collidable: neuter the cannon body's filters so it stops
+      // Now non-collidable: neuter the body's groups so it stops
       // interacting with anything. We keep the body itself (cheaper than
       // remove+re-add if canCollide flips back).
-      if (cannonBody) {
-        cannonBody.collisionFilterGroup = GROUP_NON_COLLIDABLE;
-        cannonBody.collisionFilterMask = MASK_NON_COLLIDABLE;
+      if (rb) {
+        for (let i = 0; i < rb.numColliders(); i++) rb.collider(i).setCollisionGroups(GROUPS_GHOST);
       }
     }
   }
@@ -1575,29 +1701,41 @@ export class PhysicsWorld {
 
     const dt = Math.min(deltaTime, 1 / 30);
 
+    if (!this.world) {
+      // Wasm not ready yet: the mirror-only movers (canCollide=false
+      // parts - the mirror IS their simulation) still run.
+      this.applyBodyMoversAndImpulses(dt);
+      return;
+    }
+
     // 0. v13.8: realize/remove joint constraints (weld/motor/rope)
     this.syncJointConstraints();
 
-    // 1. Apply body movers and impulses to cannon bodies
+    // 1. Apply body movers and impulses to the physics bodies
     this.applyBodyMoversAndImpulses(dt);
 
-    // 2. Update gravity from settings (may have changed)
-    this.world.gravity.set(0, this.settings.gravity, 0);
+    // 2. Update gravity from settings (may have changed; guarded against
+    //    a missing value freezing the world - see effectiveGravity)
+    this.world.gravity = { x: 0, y: this.effectiveGravity(), z: 0 };
 
-    // 3. Step the cannon-es world. v6.2.4 ADAPTIVE SUBSTEPS: while any
-    //    dynamic body (part or character pill) is fast, the fixed-step
-    //    frequency rises so every integration step moves at most ~0.5
-    //    studs - fast parts can no longer tunnel through characters (and
-    //    fast-falling characters can no longer tunnel through thin parts).
+    // 3. Step the world. v6.2.4 ADAPTIVE SUBSTEPS: while any dynamic body
+    //    (part or character pill) is fast, the fixed-step frequency rises
+    //    so every integration step moves at most ~0.5 studs - fast parts
+    //    can no longer tunnel through characters (and fast-falling
+    //    characters can no longer tunnel through thin parts).
     //    Speeds come from the previous step's scan + this step's impulse
-    //    kicks, so the tier check itself is free.
+    //    kicks, so the tier check itself is free. The accumulator loop is
+    //    ours (cannon ran it inside world.step(fixed, dt, max)); the
+    //    per-substep prev snapshots + the alpha blend after the loop are
+    //    what replaces cannon's interpolatedPosition.
     let charSpeed = 0;
-    if (this.characterBody) {
-      const v = this.characterBody.velocity;
+    if (this.characterRB) {
+      const v = this.characterRB.linvel();
       charSpeed = Math.sqrt(v.x * v.x + v.y * v.y + v.z * v.z);
     }
     for (const entry of this.namedCharacters.values()) {
-      const v = entry.body.velocity;
+      if (!entry.rb) continue;
+      const v = entry.rb.linvel();
       const s = Math.sqrt(v.x * v.x + v.y * v.y + v.z * v.z);
       if (s > charSpeed) charSpeed = s;
     }
@@ -1609,10 +1747,20 @@ export class PhysicsWorld {
       : peakSpeed > 30 ? 1 / 120
       : 1 / 60;
     const maxSubSteps = fixedStep >= 1 / 60 ? 3 : Math.ceil(dt / fixedStep) + 2;
-    this.world.step(fixedStep, dt, maxSubSteps);
+    this.world.timestep = fixedStep;
+    this._accumulator += dt;
+    let subSteps = 0;
+    while (this._accumulator >= fixedStep && subSteps < maxSubSteps) {
+      this.snapshotPrevPositions();
+      this.world.step();
+      this._accumulator -= fixedStep;
+      subSteps++;
+    }
+    if (subSteps >= maxSubSteps) this._accumulator = 0; // never spiral
+    this._alpha = fixedStep > 0 ? this._accumulator / fixedStep : 0;
 
-    // 4. Sync cannon body positions back to PhysicsBody entries
-    this.syncCannonToPhysicsBodies();
+    // 4. Sync physics body positions back to PhysicsBody entries
+    this.syncRapierToPhysicsBodies();
 
     // 5. Check water state
     this.checkWaterState();
@@ -1625,6 +1773,33 @@ export class PhysicsWorld {
 
     // 8. Tick impulses
     this.tickImpulses(dt);
+  }
+
+  /** Snapshot every dynamic body's position BEFORE a substep (blended
+   *  back with the accumulator alpha in the sync - the interpolation
+   *  that keeps 60 fps rendering smooth over the fixed 60 Hz stepping).
+   *  Records are mutated in place: zero allocation steady-state. */
+  private snapshotPrevPositions(): void {
+    for (const [id, rb] of this.rapierBodies) {
+      const body = this.bodies.get(id);
+      if (!body || body.anchored) continue;
+      if (rb.isSleeping()) continue;
+      const t = rb.translation();
+      if (body._prev) {
+        body._prev.x = t.x; body._prev.y = t.y; body._prev.z = t.z;
+      } else {
+        body._prev = { x: t.x, y: t.y, z: t.z };
+      }
+    }
+    if (this.characterRB && !this.characterRB.isSleeping()) {
+      const t = this.characterRB.translation();
+      this.charPrev.x = t.x; this.charPrev.y = t.y; this.charPrev.z = t.z;
+    }
+    for (const entry of this.namedCharacters.values()) {
+      if (!entry.rb || entry.rb.isSleeping()) continue;
+      const t = entry.rb.translation();
+      entry.prev.x = t.x; entry.prev.y = t.y; entry.prev.z = t.z;
+    }
   }
 
   // ─── Spatial Queries (v13.4 PERF) ───
@@ -1649,9 +1824,49 @@ export class PhysicsWorld {
     return out.length;
   }
 
-  /** Get the raw cannon body for a part id (used for far-body sleeping). */
-  getCannonBody(id: string): CANNON.Body | undefined {
-    return this.cannonBodies.get(id);
+  // ─── pass 28: neutral body accessors (replaced the raw cannon-body leak) ───
+  // The old raw-body accessor handed out the cannon body directly;
+  // consumers only used mass/sleep/teleport. These four cover every call
+  // site (Viewport3D's far-body sleeping + anchored pushes + keyframe
+  // drives, the server runtime's sleep/mass checks).
+
+  /** True if the part has a DYNAMIC physics body (old check: mass !== 0). */
+  isBodyDynamic(id: string): boolean {
+    const rb = this.rapierBodies.get(id);
+    return !!rb && rb.isDynamic();
+  }
+
+  /** True if the part's body is asleep (old check: sleepState === SLEEPING). */
+  isBodySleeping(id: string): boolean {
+    const rb = this.rapierBodies.get(id);
+    return !!rb && rb.isSleeping();
+  }
+
+  /** Sleep / wake a part's body (far-body sleeping around the player). */
+  setBodySleeping(id: string, asleep: boolean): void {
+    const rb = this.rapierBodies.get(id);
+    if (!rb) return;
+    if (asleep) rb.sleep();
+    else rb.wakeUp();
+  }
+
+  /** Immediately place a part's body (anchored parts pushed from the
+   *  store, streamed proxy transforms). Degrees for the optional euler. */
+  setBodyTransformImmediate(
+    id: string,
+    position: { x: number; y: number; z: number },
+    rotationDeg?: { x: number; y: number; z: number },
+  ): void {
+    const rb = this.rapierBodies.get(id);
+    if (!rb) return;
+    rb.setTranslation({ x: position.x, y: position.y, z: position.z }, false);
+    if (rotationDeg) {
+      rb.setRotation(quatFromEulerXYZ(
+        rotationDeg.x * Math.PI / 180,
+        rotationDeg.y * Math.PI / 180,
+        rotationDeg.z * Math.PI / 180,
+      ), false);
+    }
   }
 
   // ─── Body Movers & Impulses ───
@@ -1660,22 +1875,20 @@ export class PhysicsWorld {
     for (const body of this.bodies.values()) {
       if (body.anchored) continue;
 
-      const cannonBody = this.cannonBodies.get(body.id);
+      const rb = this.rapierBodies.get(body.id);
 
       // Apply body movers
       for (const mover of body.bodyMovers) {
         if (!mover.enabled) continue;
-        this.applyBodyMover(body, mover, dt, cannonBody);
+        this.applyBodyMover(body, mover, dt, rb);
       }
 
       // Apply impulses
       const effMass = effectiveMass(body.mass);
       for (const impulse of body._impulses) {
         if (!impulse.applied) {
-          if (cannonBody) {
-            cannonBody.applyImpulse(
-              new CANNON.Vec3(impulse.force.x, impulse.force.y, impulse.force.z)
-            );
+          if (rb) {
+            rb.applyImpulse({ x: impulse.force.x, y: impulse.force.y, z: impulse.force.z }, true);
             // v6.2.4: an impulse about to launch this body - feed the
             // substep picker right away (the velocity scan only sees it
             // AFTER this step has already run).
@@ -1708,7 +1921,7 @@ export class PhysicsWorld {
     }
   }
 
-  private applyBodyMover(body: PhysicsBody, mover: BodyMover, dt: number, cannonBody: CANNON.Body | undefined): void {
+  private applyBodyMover(body: PhysicsBody, mover: BodyMover, dt: number, rb: RapierRigidBody | undefined): void {
     const effMass = effectiveMass(body.mass);
 
     switch (mover.type) {
@@ -1717,10 +1930,10 @@ export class PhysicsWorld {
           const fx = (mover.force.x / effMass) * dt;
           const fy = (mover.force.y / effMass) * dt;
           const fz = (mover.force.z / effMass) * dt;
-          if (cannonBody) {
-            cannonBody.applyForce(
-              new CANNON.Vec3(mover.force.x, mover.force.y, mover.force.z)
-            );
+          if (rb) {
+            // cannon's applyForce lasted one solver step; an impulse of
+            // force*dt is the same total velocity change.
+            rb.applyImpulse({ x: mover.force.x * dt, y: mover.force.y * dt, z: mover.force.z * dt }, true);
           } else {
             body.velocity.x += fx;
             body.velocity.y += fy;
@@ -1770,10 +1983,8 @@ export class PhysicsWorld {
 
       case 'BodyThrust':
         if (mover.force) {
-          if (cannonBody) {
-            cannonBody.applyForce(
-              new CANNON.Vec3(mover.force.x, mover.force.y, mover.force.z)
-            );
+          if (rb) {
+            rb.applyImpulse({ x: mover.force.x * dt, y: mover.force.y * dt, z: mover.force.z * dt }, true);
           } else {
             body.velocity.x += (mover.force.x / effMass) * dt;
             body.velocity.y += (mover.force.y / effMass) * dt;
@@ -1796,27 +2007,22 @@ export class PhysicsWorld {
     }
   }
 
-  // ─── Sync cannon body → PhysicsBody ───
+  // ─── Sync physics body → PhysicsBody ──
 
-  private syncCannonToPhysicsBodies(): void {
-    // v13.4 PERF: reused scratch objects - the old version allocated ~6 objects
-    // per body per frame (Vec3 x4 + RaycastResult + euler), which hammered the
-    // garbage collector with thousands of allocations per second.
-    const euler = new CANNON.Vec3();
-    const rayFrom = new CANNON.Vec3();
-    const rayTo = new CANNON.Vec3();
-    const rayResult = new CANNON.RaycastResult();
+  private syncRapierToPhysicsBodies(): void {
+    const alpha = this._alpha;
 
     for (const body of this.bodies.values()) {
-      const cannonBody = this.cannonBodies.get(body.id);
-      if (!cannonBody) continue;
+      const rb = this.rapierBodies.get(body.id);
+      if (!rb) continue;
 
       if (body.anchored) {
-        // For anchored bodies, sync FROM store position to cannon body ONLY when
-        // it actually moved (old version called .set() on all 5,801 anchored
-        // bodies every single frame). Marked dirty by updateBody/syncFromPart.
+        // For anchored bodies, sync FROM store position to the physics body
+        // ONLY when it actually moved (old version called .set() on all
+        // 5,801 anchored bodies every single frame). Marked dirty by
+        // updateBody/syncFromPart.
         if (body._anchoredDirty) {
-          cannonBody.position.set(body.position.x, body.position.y, body.position.z);
+          rb.setTranslation({ x: body.position.x, y: body.position.y, z: body.position.z }, false);
           body._anchoredDirty = false;
         }
         body.isGrounded = body.position.y <= 0.01;
@@ -1824,49 +2030,62 @@ export class PhysicsWorld {
       }
 
       // v13.4 PERF: skip sleeping dynamic bodies entirely - they haven't moved.
-      const wasSleeping = cannonBody.sleepState === CANNON.Body.SLEEPING;
+      const wasSleeping = rb.isSleeping();
       if (wasSleeping) {
         body.isAwake = false;
         continue;
       }
 
-      // Sync position from cannon. v13.7: use interpolatedPosition - the
-      // world steps at a FIXED 60 Hz (world.step(1/60, dt, 3)), so the raw
-      // `position` only updates in 1/60s quanta. On a 60+ fps render loop the
-      // accumulator phase-beats against the frame rate: some frames advance
-      // a step, others repeat the old position - that hold-then-jump pattern
-      // was the "character buzzes / stutters while walking" bug. The
-      // interpolated position blends between the last two fixed steps and is
-      // what should drive anything visual.
-      body.position.x = cannonBody.interpolatedPosition.x;
-      body.position.y = cannonBody.interpolatedPosition.y;
-      body.position.z = cannonBody.interpolatedPosition.z;
+      // Sync position, INTERPOLATED between the last two fixed substeps
+      // (v13.7 BUZZ FIX preserved: the raw translation only updates in
+      // 1/60s quanta and phase-beats against the frame rate; the blend
+      // is what drives anything visual).
+      const t = rb.translation();
+      const p = body._prev ?? (body._prev = { x: t.x, y: t.y, z: t.z });
+      body.position.x = p.x + (t.x - p.x) * alpha;
+      body.position.y = p.y + (t.y - p.y) * alpha;
+      body.position.z = p.z + (t.z - p.z) * alpha;
 
-      // Sync velocity from cannon
-      body.velocity.x = cannonBody.velocity.x;
-      body.velocity.y = cannonBody.velocity.y;
-      body.velocity.z = cannonBody.velocity.z;
+      // Sync velocity from the physics body
+      const v = rb.linvel();
+      body.velocity.x = v.x;
+      body.velocity.y = v.y;
+      body.velocity.z = v.z;
 
-      // Sync rotation from cannon
-      cannonBody.quaternion.toEuler(euler);
-      body.rotation.x = euler.x * 180 / Math.PI;
-      body.rotation.y = euler.y * 180 / Math.PI;
-      body.rotation.z = euler.z * 180 / Math.PI;
+      // Sync rotation from the physics body
+      const rot = eulerXYZFromQuat(rb.rotation());
+      body.rotation.x = rot.x * 180 / Math.PI;
+      body.rotation.y = rot.y * 180 / Math.PI;
+      body.rotation.z = rot.z * 180 / Math.PI;
 
       // Sync angular velocity
-      body.angularVelocity.x = cannonBody.angularVelocity.x;
-      body.angularVelocity.y = cannonBody.angularVelocity.y;
-      body.angularVelocity.z = cannonBody.angularVelocity.z;
+      const av = rb.angvel();
+      body.angularVelocity.x = av.x;
+      body.angularVelocity.y = av.y;
+      body.angularVelocity.z = av.z;
 
       // Check grounded: raycast downward (only for awake bodies - a sleeping
-      // body keeps its last grounded state)
-      rayFrom.set(body.position.x, body.position.y, body.position.z);
-      rayTo.set(body.position.x, body.position.y - (body.size.y / 2 + 0.1), body.position.z);
-      rayResult.reset();
-      this.world.raycastClosest(rayFrom, rayTo, {}, rayResult);
-      body.isGrounded = rayResult.hasHit;
+      // body keeps its last grounded state). The ray excludes the body's
+      // own collider (cannon's ray-from-inside was a no-hit; Rapier's
+      // solid castRay would hit the body's own bottom face).
+      body.isGrounded = this.castRayDown(body.position.x, body.position.y, body.position.z, body.size.y / 2 + 0.1, rb);
 
       body.isAwake = true;
+    }
+
+    // Character pills: keep the interpolation records fresh for the views.
+    if (this.characterRB && !this.characterRB.isSleeping()) {
+      const t = this.characterRB.translation();
+      this.charInterp.x = this.charPrev.x + (t.x - this.charPrev.x) * alpha;
+      this.charInterp.y = this.charPrev.y + (t.y - this.charPrev.y) * alpha;
+      this.charInterp.z = this.charPrev.z + (t.z - this.charPrev.z) * alpha;
+    }
+    for (const entry of this.namedCharacters.values()) {
+      if (!entry.rb || entry.rb.isSleeping()) continue;
+      const t = entry.rb.translation();
+      entry.interp.x = entry.prev.x + (t.x - entry.prev.x) * alpha;
+      entry.interp.y = entry.prev.y + (t.y - entry.prev.y) * alpha;
+      entry.interp.z = entry.prev.z + (t.z - entry.prev.z) * alpha;
     }
   }
 
@@ -1885,21 +2104,24 @@ export class PhysicsWorld {
 
     // If body just entered water, apply buoyancy
     if (body.isInWater && !body.anchored) {
-      const cannonBody = this.cannonBodies.get(bodyId);
-      const waterBuoyancy = Math.abs(this.settings.gravity) * 0.8;
-      if (cannonBody) {
-        cannonBody.applyForce(new CANNON.Vec3(0, waterBuoyancy * effectiveMass(body.mass), 0));
+      const rb = this.rapierBodies.get(bodyId);
+      const waterBuoyancy = Math.abs(this.effectiveGravity()) * 0.8;
+      if (rb) {
+        // cannon applied forces for one step; impulses of force*dt are the
+        // same total (the callers' cadence and 1/60 factors are unchanged).
+        const m = effectiveMass(body.mass);
+        rb.applyImpulse({ x: 0, y: waterBuoyancy * m * (1 / 60), z: 0 }, true);
         // Water drag
-        cannonBody.velocity.x *= (1 - WATER_DRAG * (1 / 60));
-        cannonBody.velocity.y *= (1 - WATER_DRAG * (1 / 60));
-        cannonBody.velocity.z *= (1 - WATER_DRAG * (1 / 60));
+        const drag = 1 - WATER_DRAG * (1 / 60);
+        const v = rb.linvel();
+        rb.setLinvel({ x: v.x * drag, y: v.y * drag, z: v.z * drag }, true);
         // Water current
         const forceMultiplier = [0, 0.2, 0.5, 1.0, 2.0][this.settings.waterForce] ?? 0.5;
-        cannonBody.applyForce(new CANNON.Vec3(
-          this.settings.waterDirection.x * forceMultiplier * effectiveMass(body.mass) * 10,
-          0,
-          this.settings.waterDirection.z * forceMultiplier * effectiveMass(body.mass) * 10
-        ));
+        rb.applyImpulse({
+          x: this.settings.waterDirection.x * forceMultiplier * m * 10 * (1 / 60),
+          y: 0,
+          z: this.settings.waterDirection.z * forceMultiplier * m * 10 * (1 / 60),
+        }, true);
       } else {
         body.velocity.y += waterBuoyancy * (1 / 60);
         body.velocity.x *= (1 - WATER_DRAG * (1 / 60));
@@ -1917,10 +2139,11 @@ export class PhysicsWorld {
   private applyDrag(dt: number): void {
     for (const body of this.bodies.values()) {
       if (body.anchored || !body.isInWater) {
-        // Air drag (very small)
-        const cannonBody = this.cannonBodies.get(body.id);
-        if (cannonBody) {
-          // cannon-es has linearDamping for this
+        // Air drag (very small) - collider-backed bodies use the rigid
+        // body's linear damping (0.01, same as the old cannon body).
+        const rb = this.rapierBodies.get(body.id);
+        if (rb) {
+          // linearDamping covers this
         } else {
           body.velocity.x *= (1 - AIR_DRAG * dt);
           body.velocity.z *= (1 - AIR_DRAG * dt);
@@ -1950,9 +2173,9 @@ export class PhysicsWorld {
         body.velocity.x *= scale;
         body.velocity.y *= scale;
         body.velocity.z *= scale;
-        const cannonBody = this.cannonBodies.get(body.id);
-        if (cannonBody) {
-          cannonBody.velocity.set(body.velocity.x, body.velocity.y, body.velocity.z);
+        const rb = this.rapierBodies.get(body.id);
+        if (rb) {
+          rb.setLinvel({ x: body.velocity.x, y: body.velocity.y, z: body.velocity.z }, true);
         }
       }
 
@@ -1960,10 +2183,10 @@ export class PhysicsWorld {
       if (isNaN(body.position.x) || isNaN(body.position.y) || isNaN(body.position.z)) {
         body.position = { x: 0, y: 10, z: 0 };
         body.velocity = { x: 0, y: 0, z: 0 };
-        const cannonBody = this.cannonBodies.get(body.id);
-        if (cannonBody) {
-          cannonBody.position.set(0, 10, 0);
-          cannonBody.velocity.set(0, 0, 0);
+        const rb = this.rapierBodies.get(body.id);
+        if (rb) {
+          rb.setTranslation({ x: 0, y: 10, z: 0 }, true);
+          rb.setLinvel({ x: 0, y: 0, z: 0 }, true);
         }
       }
     }
@@ -1988,9 +2211,9 @@ export class PhysicsWorld {
     if (!body) return;
     body._impulses.push({ force, timeLeft: duration, applied: false });
     body.isAwake = true;
-    const cannonBody = this.cannonBodies.get(bodyId);
-    if (cannonBody) {
-      cannonBody.wakeUp();
+    const rb = this.rapierBodies.get(bodyId);
+    if (rb) {
+      rb.wakeUp();
     }
   }
 
@@ -2004,7 +2227,7 @@ export class PhysicsWorld {
   ): CharacterState {
     const SPEED = DEFAULT_CHARACTER_SPEED;
     const JUMP_FORCE = DEFAULT_JUMP_FORCE;
-    const grav = this.settings.gravity;
+    const grav = this.effectiveGravity();
 
     // Movement input
     let moveX = 0, moveZ = 0;
@@ -2107,6 +2330,16 @@ export class PhysicsWorld {
 
     return character;
   }
+}
+
+/** A part's effective friction (its own override or its material default). */
+function partFriction(part: StudioPart): number {
+  return part.friction ?? getMaterialProps(part.material).friction;
+}
+
+/** A part's effective elasticity (its own override or its material default). */
+function partElasticity(part: StudioPart): number {
+  return part.elasticity ?? getMaterialProps(part.material).elasticity;
 }
 
 // ─── Utility Functions ───

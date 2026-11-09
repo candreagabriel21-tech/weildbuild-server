@@ -98,9 +98,9 @@ export const ACTION_CATEGORY: Record<ActionType, string> = {
 
   set_variable: 'variables',
   change_variable: 'variables',
-  add_rule: 'variables',
 
-  // pass 21: camera placeholder actions (mirrors the client's palette map).
+  // pass 21: the camera placeholder actions live in "looks" (they control
+  // how the game LOOKS once the owner wires them - camera placement).
   camera_follow_character: 'looks',
   camera_characterlook_lock: 'looks',
   camera_can_orbit: 'looks',
@@ -108,6 +108,8 @@ export const ACTION_CATEGORY: Record<ActionType, string> = {
   camera_position: 'looks',
   camera_yaw: 'looks',
   camera_pitch: 'looks',
+
+  add_rule: 'variables',
 };
 
 /** Palette entry for one action type. */

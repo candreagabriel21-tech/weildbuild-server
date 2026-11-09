@@ -25,7 +25,7 @@ import type {
   PhysicsSettings,
   GlobalTimer,
 } from './studio-store';
-import { useStudioStore, isPart, clampPartSizeValue, normalizeRotationValue, clampUnitValue } from './studio-store';
+import { useStudioStore, isPart, clampPartSizeValue, normalizeRotationValue, clampUnitValue, repairObjectTreeData } from './studio-store';
 import type { WeildCodeRule } from './weildcode-types';
 import type {
   TerrainHeightmap as TerrainHeightmapV2,
@@ -127,8 +127,9 @@ export function restoreStudioState(state: StudioProjectState): void {
     // should always be visible in both editor and play mode.
     if (isPart(cloned) && cloned.isCharacterPart) {
       cloned.showInWorld = true;
-      // pass 21 (camera rebuild): default restored character parts to
-      // camera-see-through (the camera orbits its own character).
+      // pass 21 (camera rebuild): pre-pass-21 saves have no
+      // cameraCanLookThrough flag - default character parts to true (the
+      // camera orbits its own character and the body must never occlude it).
       if (cloned.cameraCanLookThrough === undefined) cloned.cameraCanLookThrough = true;
     }
     // pass 15 (baseplate -> plain Block): migrate legacy isBaseplate parts.
@@ -137,9 +138,8 @@ export function restoreStudioState(state: StudioProjectState): void {
     // together caused the owner's "the baseplate snaps back to 0,0,0 when
     // the game runs" bug. The part becomes a normal Block with the standard
     // Plastic material and keeps its saved position/size/color, so a moved
-    // 100×100 plate STAYS where the creator put it. (Pass 16 re-introduced a
-    // build-safe Wireframe material, so pass-14 saves that used it are now
-    // PRESERVED instead of falling back to Plastic - mirrors the client.)
+    // 100×100 plate STAYS where the creator put it. (Pass-14 saves that
+    // used the now-removed 'Wireframe' material also fall back to Plastic.)
     if (isPart(cloned) && (cloned as any).isBaseplate) {
       delete (cloned as any).isBaseplate;
       cloned.material = 'Plastic';
@@ -149,6 +149,11 @@ export function restoreStudioState(state: StudioProjectState): void {
         cloned.color = '#397941';
       }
     }
+    // (pass 16+ re-introduced a build-safe Wireframe material, so saves
+    // carrying it are PRESERVED - the pass-14 fallback to Plastic that was
+    // here would have stripped the grid off the pass-20/21 Wireframe
+    // baseplate whenever a draft was restored. Mirrors the server + the
+    // loadProject path, which both preserve it.)
     // pass 14: old spawn points saved with transparency 0.6 (the semi-
     // transparent marker look). The owner wants them fully opaque now; a
     // creator who deliberately made one glassy keeps their value - only the
@@ -175,6 +180,13 @@ export function restoreStudioState(state: StudioProjectState): void {
     newObjects.set(obj.id, cloned);
   }
 
+  // pass 26 (ghost-objects fix): heal the tree on every restore. Saves made
+  // before the top-most copy/dupe fix can carry parts whose parent is gone
+  // — invisible to the Explorer but still rendered by the game (the "ghost
+  // objects" report). repairObjectTreeData brings them back as honest
+  // top-level objects and drops stale child listings.
+  const repaired = repairObjectTreeData(newObjects);
+
   // v13.7 GRAVITY MIGRATION: projects saved before v13.7 carry the old
   // -9.81 default, which felt "moon-like". If the saved value is exactly
   // the old default, upgrade it to the new snappier -35. (A value the
@@ -187,8 +199,9 @@ export function restoreStudioState(state: StudioProjectState): void {
   if (migratedWorld.gravity === -9.81 || migratedWorld.gravity === -9.8) {
     migratedWorld.gravity = -35;
   }
-  // pass 21 (camera rebuild): default the new camera flags on old saves
-  // (classic behaviour) - mirrors the client's restoreStudioState.
+  // pass 21 (camera rebuild): projects saved before pass 21 have no camera
+  // behaviour flags - default them to the classic behaviour so old worlds
+  // play exactly as they did (a missing flag must never read as false).
   if (migratedWorld.cameraFollowCharacter === undefined) migratedWorld.cameraFollowCharacter = true;
   if (migratedWorld.cameraCharacterLookLock === undefined) migratedWorld.cameraCharacterLookLock = true;
   if (migratedWorld.cameraCanOrbit === undefined) migratedWorld.cameraCanOrbit = true;
@@ -196,8 +209,10 @@ export function restoreStudioState(state: StudioProjectState): void {
 
   // Single atomic setState so we don't trigger intermediate re-renders
   useStudioStore.setState({
-    objects: newObjects,
+    objects: repaired,
     objectsVersion: (useStudioStore.getState().objectsVersion || 0) + 1,
+    // pass 26.1: a fresh world load — the explorer collapses every folder.
+    worldLoadNonce: (useStudioStore.getState().worldLoadNonce || 0) + 1,
     joints: deepClone(state.joints),
     worldSettings: migratedWorld,
     physicsSettings: migratedPhysics,

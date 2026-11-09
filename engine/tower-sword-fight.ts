@@ -273,7 +273,8 @@ export interface TSFNpc {
   targetId: string | null;
   pathIndex: number;
   pathRepaintIn: number;     // seconds until the path is recomputed
-  // Live cannon body (only while alive + physics attached).
+  // Live physics body handle (only while alive + physics attached) - a
+  // PhysicsWorld CharacterBodyView (pass 28: engine-neutral).
   body?: any;
   // NPC hook (independent of the player's, so several can fly at once).
   hook?: TSFHook | null;
@@ -570,7 +571,9 @@ export class TowerSwordFightManager {
       { size: TSF_NPC_HITBOX },
     );
     if (!body) return;
-    body.collisionFilterMask = ~CHARACTER_GROUP;
+    // NPC pills don't collide with PLAYER pills (pass 28: the neutral
+    // view call replaces the old raw collisionFilterMask write).
+    body.setCollidesWithPlayers(false);
     body.velocity.set(npc.velocity.x, 0, npc.velocity.z);
     npc.body = body;
   }
