@@ -38,6 +38,13 @@ export type PartType = 'Block' | 'Sphere' | 'Wedge' | 'Cylinder' | 'Spawn' | 'Bu
  *  players add from the Insert Part palette. They resize/rotate/colour
  *  like every other part and fire the usual click/touch rules + WeLua. */
 export const UI_PART_TYPES: readonly PartType[] = ['Button', 'Sign', 'Panel'];
+
+/** v7.6: default on-screen rects (normalized center x/y + size w/h). */
+export const UI_SCREEN_DEFAULT_RECT: Record<'Button' | 'Sign' | 'Panel', { x: number; y: number; w: number; h: number }> = {
+  Button: { x: 0.5, y: 0.5, w: 0.18, h: 0.08 },
+  Sign:   { x: 0.5, y: 0.5, w: 0.24, h: 0.06 },
+  Panel:  { x: 0.5, y: 0.5, w: 0.34, h: 0.22 },
+};
 export function isUiPartType(type: string): boolean {
   return type === 'Button' || type === 'Sign' || type === 'Panel';
 }
@@ -198,6 +205,19 @@ export interface StudioPart {
   type: PartType;
   /** v7.5: UI parts (Button/Sign/Panel) — the text shown on the part. */
   label?: string;
+  /**
+   * v7.6: TRUE = a screen-space 2D element (StarterUI), not a 3D world
+   * part. Rendered by the ScreenUiLayer overlay in the studio + play
+   * viewports; the 3D renderers, physics and the click-to-place ghost
+   * all skip these.
+   */
+  isScreenUi?: boolean;
+  /**
+   * v7.6: the 2D element's rect on the virtual UI canvas. x/y = CENTER
+   * position, w/h = size, all normalized 0..1 of the viewport, so the
+   * layout scales to any window size.
+   */
+  screenRect?: { x: number; y: number; w: number; h: number };
   position: Vector3;
   size: Vector3;
   rotation: Vector3;
@@ -1103,17 +1123,35 @@ export const PART_DEFAULTS: Record<string, { color: string; size: { x: number; y
 
 // ─── Undo/Redo helpers ───
 
-function snapshotState(objects: Map<string, StudioObject>, joints: Joint[]): string {
+function snapshotState(
+  objects: Map<string, StudioObject>,
+  joints: Joint[],
+  inventory?: InventoryItemData[],
+  hotbarItemIds?: (string | null)[],
+): string {
   const objs: StudioObject[] = [];
   objects.forEach((obj) => objs.push(JSON.parse(JSON.stringify(obj))));
-  return JSON.stringify({ objects: objs, joints });
+  // v7.6: inventory + hotbar ride along so Ctrl+Z can undo item deletions
+  // (the user-reported bug). Both optional: the play-mode snapshot passes
+  // only objects+joints, and pre-v7.6 snapshots simply have them missing.
+  return JSON.stringify({ objects: objs, joints, inventory: inventory ?? [], hotbarItemIds: hotbarItemIds ?? null });
 }
 
-function restoreSnapshot(snapshot: string): { objects: Map<string, StudioObject>; joints: Joint[] } {
+function restoreSnapshot(snapshot: string): {
+  objects: Map<string, StudioObject>;
+  joints: Joint[];
+  inventory: InventoryItemData[] | null;
+  hotbarItemIds: (string | null)[] | null;
+} {
   const parsed = JSON.parse(snapshot);
   const objects = new Map<string, StudioObject>();
   parsed.objects.forEach((obj: StudioObject) => objects.set(obj.id, obj));
-  return { objects, joints: parsed.joints || [] };
+  return {
+    objects,
+    joints: parsed.joints || [],
+    inventory: Array.isArray(parsed.inventory) ? (parsed.inventory as InventoryItemData[]) : null,
+    hotbarItemIds: Array.isArray(parsed.hotbarItemIds) ? (parsed.hotbarItemIds as (string | null)[]) : null,
+  };
 }
 
 const MAX_UNDO_STACK = 50;
@@ -1162,7 +1200,7 @@ function _pushUndo(get: () => StudioStore, set: (partial: Partial<StudioStore> |
   if (now - _lastUndoPushAt < UNDO_COALESCE_MS) return;
   _lastUndoPushAt = now;
 
-  const snapshot = snapshotState(state.objects, state.joints);
+  const snapshot = snapshotState(state.objects, state.joints, state.inventory, state.hotbarItemIds);
   const undoStack = [...state.undoStack, snapshot];
   if (undoStack.length > MAX_UNDO_STACK) undoStack.shift();
   set({ undoStack, redoStack: [] });
@@ -2019,12 +2057,23 @@ export const useStudioStore = create<StudioStore>((set, get) => ({
     // Get per-type defaults (color + size)
     const defaults = PART_DEFAULTS[type] || PART_DEFAULTS['Block'];
     const size = { ...defaults.size };
+    // v7.6: UI parts live on the SCREEN (StarterUI), not in the 3D world.
+    const isScreenUi = isUiPartType(type);
+    let screenRect: { x: number; y: number; w: number; h: number } | undefined;
+    if (isScreenUi) {
+      const base = UI_SCREEN_DEFAULT_RECT[type as 'Button' | 'Sign' | 'Panel'];
+      // cascade new elements so they don't stack exactly on top of each other
+      let n = 0;
+      state.objects.forEach((o) => { if (isPart(o) && o.isScreenUi) n++; });
+      screenRect = { ...base, x: base.x + ((n % 3) - 1) * 0.14, y: base.y - Math.floor(n / 3) * 0.14 + 0.18 };
+    }
     // v13.6: spawn the part resting ON the ground surface. pass 14: the
     // baseplate is a plain Block now (no isBaseplate flag), so "the ground"
     // is simply the highest top surface among big flat parts near the
     // origin (the Baseplate at 0,0,0 top = +0.5 by default).
+    // v7.6: screen UI elements skip all of this (they have no world spot).
     let groundY = 0;
-    state.objects.forEach((obj) => {
+    if (!isScreenUi) state.objects.forEach((obj) => {
       if (!isPart(obj) || obj.isCharacterPart || obj.isSpawnPoint) return;
       const top = obj.position.y + obj.size.y / 2;
       const withinFootprint =
@@ -2048,6 +2097,8 @@ export const useStudioStore = create<StudioStore>((set, get) => ({
       // v7.5: UI parts carry their text label (Panel starts blank — it is
       // usually a backing board for other UI parts).
       ...(isUiPartType(type) && type !== 'Panel' ? { label: type } : {}),
+      // v7.6: screen-space flag + on-screen rect (StarterUI elements).
+      ...(isScreenUi ? { isScreenUi: true, screenRect } : {}),
       children: [],
       parentId: null,
     };
@@ -3330,26 +3381,40 @@ export const useStudioStore = create<StudioStore>((set, get) => ({
   undo: () => {
     const state = get();
     if (state.undoStack.length === 0) return;
-    const currentSnapshot = snapshotState(state.objects, state.joints);
+    const currentSnapshot = snapshotState(state.objects, state.joints, state.inventory, state.hotbarItemIds);
     const undoStack = [...state.undoStack];
     const previousSnapshot = undoStack.pop()!;
     const redoStack = [...state.redoStack, currentSnapshot];
     if (redoStack.length > MAX_UNDO_STACK) redoStack.shift();
-    const { objects, joints } = restoreSnapshot(previousSnapshot);
-    set({ objects, joints, undoStack, redoStack, selectedIds: [], objectsVersion: state.objectsVersion + 1 });
+    const restored = restoreSnapshot(previousSnapshot);
+    // v7.6: inventory/hotbar restore when the snapshot carries them (pre-v7.6
+    // snapshots keep the current values instead of wiping them).
+    set({
+      objects: restored.objects,
+      joints: restored.joints,
+      ...(restored.inventory !== null ? { inventory: restored.inventory } : {}),
+      ...(restored.hotbarItemIds !== null ? { hotbarItemIds: restored.hotbarItemIds } : {}),
+      undoStack, redoStack, selectedIds: [], objectsVersion: state.objectsVersion + 1,
+    });
     state.addConsoleMessage('info', 'Undo');
   },
 
   redo: () => {
     const state = get();
     if (state.redoStack.length === 0) return;
-    const currentSnapshot = snapshotState(state.objects, state.joints);
+    const currentSnapshot = snapshotState(state.objects, state.joints, state.inventory, state.hotbarItemIds);
     const redoStack = [...state.redoStack];
     const nextSnapshot = redoStack.pop()!;
     const undoStack = [...state.undoStack, currentSnapshot];
     if (undoStack.length > MAX_UNDO_STACK) undoStack.shift();
-    const { objects, joints } = restoreSnapshot(nextSnapshot);
-    set({ objects, joints, undoStack, redoStack, selectedIds: [], objectsVersion: state.objectsVersion + 1 });
+    const restored = restoreSnapshot(nextSnapshot);
+    set({
+      objects: restored.objects,
+      joints: restored.joints,
+      ...(restored.inventory !== null ? { inventory: restored.inventory } : {}),
+      ...(restored.hotbarItemIds !== null ? { hotbarItemIds: restored.hotbarItemIds } : {}),
+      undoStack, redoStack, selectedIds: [], objectsVersion: state.objectsVersion + 1,
+    });
     state.addConsoleMessage('info', 'Redo');
   },
 
@@ -3515,6 +3580,9 @@ export const useStudioStore = create<StudioStore>((set, get) => ({
   },
 
   removeInventoryItem: (itemId) => {
+    // v7.6 BUG FIX: deleting an inventory item is undoable now (the user
+    // reported Ctrl+Z doing nothing here).
+    _pushUndo(get, set);
     set((state) => ({
       inventory: state.inventory.filter((i) => i.id !== itemId),
       hotbarItemIds: state.hotbarItemIds.map((slotItemId) => slotItemId === itemId ? null : slotItemId),
@@ -3522,6 +3590,7 @@ export const useStudioStore = create<StudioStore>((set, get) => ({
   },
 
   renameInventoryItem: (itemId, name) => {
+    _pushUndo(get, set);
     set((state) => ({
       inventory: state.inventory.map((i) => i.id === itemId ? { ...i, name } : i),
     }));
@@ -3578,6 +3647,7 @@ export const useStudioStore = create<StudioStore>((set, get) => ({
   },
 
   setHotbarItem: (slot, itemId) => {
+    _pushUndo(get, set);
     set((state) => {
       if (slot < 0 || slot >= HOTBAR_SLOT_COUNT) return {};
       const next = [...state.hotbarItemIds];
