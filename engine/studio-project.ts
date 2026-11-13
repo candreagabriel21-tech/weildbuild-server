@@ -26,6 +26,8 @@ import type {
   GlobalTimer,
 } from './studio-store';
 import { useStudioStore, isPart, clampPartSizeValue, normalizeRotationValue, clampUnitValue, repairObjectTreeData } from './studio-store';
+import type { InventoryItemData } from './studio-store';
+import type { WeluScript } from './welu/welu-types';
 import type { WeildCodeRule } from './weildcode-types';
 import type {
   TerrainHeightmap as TerrainHeightmapV2,
@@ -62,6 +64,12 @@ export interface StudioProjectState {
   globalTimers: GlobalTimer[];
   /** v1.5: rules attached to the GAME itself (player join/leave, chat). */
   gameRules?: WeildCodeRule[];
+  /** WeLua: game-level Lua scripts. */
+  gameWeluScripts?: WeluScript[];
+  /** Player inventory: serialized part/group items given to players. */
+  inventory?: InventoryItemData[];
+  /** Which project inventory item occupies each hotbar slot (1-4). */
+  hotbarItemIds?: (string | null)[];
 
   // Character
   avatar: {
@@ -106,6 +114,9 @@ export function snapshotStudioState(): StudioProjectState {
     globalVariables: { ...s.globalVariables },
     globalTimers: deepClone(s.globalTimers),
     gameRules: deepClone(s.gameRules),
+    gameWeluScripts: deepClone(s.gameWeluScripts),
+    inventory: deepClone(s.inventory),
+    hotbarItemIds: [...s.hotbarItemIds],
     avatar: { ...s.avatar },
     schemaVersion: 1,
   };
@@ -226,6 +237,9 @@ export function restoreStudioState(state: StudioProjectState): void {
     globalVariables: { ...state.globalVariables },
     globalTimers: deepClone(state.globalTimers),
     gameRules: deepClone(state.gameRules ?? []),
+    gameWeluScripts: deepClone(state.gameWeluScripts ?? []),
+    inventory: deepClone(state.inventory ?? []),
+    hotbarItemIds: [...(state.hotbarItemIds ?? [null, null, null, null])],
     avatar: { ...state.avatar },
     showTerrain: !!state.terrainHeightmap,
     selectedIds: [],

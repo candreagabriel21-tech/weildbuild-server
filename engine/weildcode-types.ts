@@ -23,8 +23,14 @@ export type TriggerType =
   | 'on_chat_message'    // A player sends a chat message (optional filters)
   // ─── v7: life-state triggers (rules react to damage + death) ───
   | 'on_player_damaged'  // A player's health decreases (rules or void)
-  | 'on_player_died';    // A player dies (health hits 0 or the void)
-
+  | 'on_player_died'     // A player dies (health hits 0 or the void)
+  // ─── WeLua pass: inventory-item + key triggers ───
+  | 'when_used'          // Inventory item: the player USES it while holding it
+  | 'when_equipped'      // Inventory item: selected in the item bar (held)
+  | 'when_unequipped'    // Inventory item: deselected (put away)
+  | 'when_grabbed'       // Object is grabbed into the player's inventory
+  | 'when_dropped'       // Inventory item is placed back into the world
+  | 'on_key_pressed';    // A key is pressed (part or game rules)
 export interface TriggerParam {
   key: string;
   label: string;
@@ -91,6 +97,50 @@ export interface TriggerDefinition {
 
 /** Full catalog of available triggers */
 export const TRIGGER_DEFINITIONS: TriggerDefinition[] = [
+  {
+    type: 'when_used',
+    label: 'When this item is used',
+    description: 'Inventory items: fires when the player uses this item while holding it (click / Use button)',
+    icon: 'MousePointerClick',
+    params: [],
+  },
+  {
+    type: 'when_equipped',
+    label: 'When this item is equipped',
+    description: 'Inventory items: fires when the player selects this item in the item bar',
+    icon: 'Hand',
+    params: [],
+  },
+  {
+    type: 'when_unequipped',
+    label: 'When this item is unequipped',
+    description: 'Inventory items: fires when the player deselects this item',
+    icon: 'Hand',
+    params: [],
+  },
+  {
+    type: 'when_grabbed',
+    label: 'When this is grabbed',
+    description: 'Fires when a player grabs this object into their inventory (E key in play mode)',
+    icon: 'Grab',
+    params: [],
+  },
+  {
+    type: 'when_dropped',
+    label: 'When this item is dropped',
+    description: 'Inventory items: fires when the item is placed back into the world (Q key / drop)',
+    icon: 'PackageOpen',
+    params: [],
+  },
+  {
+    type: 'on_key_pressed',
+    label: 'When a key is pressed',
+    description: 'Fires when the player presses a key (e.g. "e", "space"). Works on parts and on the game',
+    icon: 'Keyboard',
+    params: [
+      { key: 'key', label: 'Key (e.g. e, space, q)', type: 'string', default: 'e' },
+    ],
+  },
   {
     type: 'when_created',
     label: 'When this is created',
@@ -479,7 +529,18 @@ export type ActionType =
   | 'camera_can_look_through'      // true/false: camera retracts for solid objects
   | 'camera_position'              // set the camera point's world x,y,z
   | 'camera_yaw'                   // set the camera's yaw (point of looking, degrees)
-  | 'camera_pitch';                // set the camera's pitch (degrees)
+  | 'camera_pitch'                 // set the camera's pitch (degrees)
+  // ─── WeLua pass: inventory, physics + world actions ───
+  | 'give_item'          // Give the player an inventory item (by name)
+  | 'remove_item'        // Remove an inventory item from the player
+  | 'drop_item'          // Spawn an inventory item into the world in front of the player
+  | 'set_gravity'        // Set the world's gravity
+  | 'set_time_of_day'    // Set the world clock (0-24, 12 = noon)
+  | 'set_weather'        // Set the weather (clear/cloudy/rain/snow)
+  | 'weld_parts'         // Weld this part to a named part
+  | 'break_joints'       // Remove all joints on this part
+  | 'apply_impulse'      // Launch the part with an instant impulse
+  | 'set_visible';       // Show/hide the part (showInWorld)
 
 export interface ActionParam {
   key: string;
@@ -1242,10 +1303,105 @@ export const ACTION_DEFINITIONS: ActionDefinition[] = [
   {
     type: 'camera_pitch',
     label: 'Camera pitch',
-    description: 'Placeholder (not wired yet): set the camera\'s pitch, in degrees (-85..85)',
+    description: 'Set the camera\'s pitch, in degrees (-85..85)',
     icon: 'RotateCcw',
     params: [
       { key: 'pitch', label: 'Pitch (degrees)', type: 'number', default: 15 },
+    ],
+  },
+  // ─── WeLua pass: inventory-item + key triggers ───
+  // ─── WeLua pass: inventory + world actions ───
+  {
+    type: 'give_item',
+    label: 'Give item',
+    description: 'Give the player an inventory item by name (from the project inventory)',
+    icon: 'PackagePlus',
+    params: [
+      { key: 'itemName', label: 'Item name', type: 'string', default: '' },
+    ],
+  },
+  {
+    type: 'remove_item',
+    label: 'Remove item',
+    description: 'Remove an inventory item from the player by name',
+    icon: 'PackageMinus',
+    params: [
+      { key: 'itemName', label: 'Item name', type: 'string', default: '' },
+    ],
+  },
+  {
+    type: 'drop_item',
+    label: 'Drop item',
+    description: 'Spawn one of the player\'s inventory items back into the world, in front of them',
+    icon: 'PackageOpen',
+    params: [
+      { key: 'itemName', label: 'Item name (blank = the held item)', type: 'string', default: '' },
+    ],
+  },
+  {
+    type: 'set_gravity',
+    label: 'Set gravity',
+    description: 'Change the world\'s gravity (default -35)',
+    icon: 'ArrowDown',
+    params: [
+      { key: 'gravity', label: 'Gravity', type: 'number', default: -35 },
+    ],
+  },
+  {
+    type: 'set_time_of_day',
+    label: 'Set time of day',
+    description: 'Set the world clock (0-24 hours; 12 = noon, 0 = midnight)',
+    icon: 'Clock',
+    params: [
+      { key: 'timeOfDay', label: 'Time (0-24)', type: 'number', default: 12 },
+    ],
+  },
+  {
+    type: 'set_weather',
+    label: 'Set weather',
+    description: 'Change the weather',
+    icon: 'CloudRain',
+    params: [
+      { key: 'weatherType', label: 'Weather', type: 'select', default: 'rain', options: [
+        { label: 'Clear', value: 'clear' },
+        { label: 'Cloudy', value: 'cloudy' },
+        { label: 'Rain', value: 'rain' },
+        { label: 'Snow', value: 'snow' },
+      ]},
+    ],
+  },
+  {
+    type: 'weld_parts',
+    label: 'Weld to part',
+    description: 'Weld this part to another part (by name) so they stick together',
+    icon: 'Link',
+    params: [
+      { key: 'targetName', label: 'Other part\'s name', type: 'string', default: '' },
+    ],
+  },
+  {
+    type: 'break_joints',
+    label: 'Break joints',
+    description: 'Remove all joints (welds, ropes, ...) on this part',
+    icon: 'Unlink',
+    params: [],
+  },
+  {
+    type: 'apply_impulse',
+    label: 'Launch part (impulse)',
+    description: 'Apply an instant impulse to this part — launch it flying',
+    icon: 'Rocket',
+    params: [
+      { key: 'force', label: 'Impulse (x,y,z)', type: 'vector3', default: { x: 0, y: 50, z: 0 } },
+    ],
+  },
+  {
+    type: 'set_visible',
+    label: 'Set visible',
+    description: 'Show or hide this part (hidden parts still run code)',
+    icon: 'Eye',
+    params: [
+      { key: 'enabled', label: 'Visible', type: 'boolean', default: true },
     ],
   },
 ];

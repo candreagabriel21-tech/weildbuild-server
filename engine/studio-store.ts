@@ -1,11 +1,14 @@
 import { create } from 'zustand';
 import * as THREE from 'three';
 import { WeildCodeRule } from './weildcode-types';
+import type { WeluScript } from './welu/welu-types';
 import { getDupeOffset, loadEditorSettings, saveEditorSettings } from './editor-settings';
 // v13.4: the store fires WeildCode events (when_destroyed, on_property_change).
 // Circular import is safe: both modules only touch each other INSIDE functions
 // at runtime, never during module initialization.
 import { weildCodeEngine } from './weildcode-engine';
+// v7.4: the store also fires WeLua's onDestroy (same lifecycle as the rules).
+import { weluRuntime } from './welu/welu-runtime';
 import type {
   TerrainHeightmap as TerrainHeightmapV2,
   TerrainGeneratorConfig,
@@ -247,6 +250,8 @@ export interface StudioPart {
   /** Item key override (e.g. "FACE-1", "SHIRT-3") for face/chest/legs parts. */
   avatarItemKey?: string;
   rules?: WeildCodeRule[];
+  /** WeLua scripts (real Lua code, run by the WeLua runtime in play mode). */
+  weluScripts?: WeluScript[];
   /** True when the part has been negated (acts as a solid-modeling cutout). */
   negated?: boolean;
   /** Color the part had before being negated - used by "De-negate" to restore. */
@@ -269,6 +274,26 @@ export type StudioObject = StudioPart | StudioModel;
 export function isPart(obj: StudioObject): obj is StudioPart {
   return 'type' in obj && ['Block', 'Sphere', 'Wedge', 'Cylinder', 'Spawn'].includes(obj.type);
 }
+
+// ─── Player Inventory (project-level items) ───
+// A player-inventory item is a serialized part / group subtree ("template")
+// that lives OUTSIDE the world. Items are shown in the Explorer's Player ▸
+// Inventory folder, given to players in play mode (hotbar + backpack), and
+// can be spawned back into the world at any time.
+
+export interface InventoryItemData {
+  id: string;
+  /** Display name (defaults to the source object's name). */
+  name: string;
+  sourceType: 'part' | 'group';
+  /** The serialized subtree (parts + models, parent/child links intact). */
+  objects: StudioObject[];
+  /** Root id within `objects`. */
+  rootId: string;
+  createdAt: number;
+}
+
+export const HOTBAR_SLOT_COUNT = 4;
 
 export interface ConsoleMessage {
   id: string;
@@ -787,11 +812,40 @@ export interface StudioStore {
   removeGameRule: (ruleId: string) => void;
   updateGameRule: (ruleId: string, updates: Partial<WeildCodeRule>) => void;
 
+  // ─── WeLua (real Lua scripting; runs beside WeildCode in play mode) ───
+  /** Game-level WeLua scripts (run for the whole game, no part context). */
+  gameWeluScripts: WeluScript[];
+  addGameWeluScript: (script: WeluScript) => void;
+  updateGameWeluScript: (scriptId: string, updates: Partial<WeluScript>) => void;
+  removeGameWeluScript: (scriptId: string) => void;
+  addWeluScript: (partId: string, script: WeluScript) => void;
+  updateWeluScript: (partId: string, scriptId: string, updates: Partial<WeluScript>) => void;
+  removeWeluScript: (partId: string, scriptId: string) => void;
+
+  // ─── Player Inventory (project items given to players in play mode) ───
+  /** Items in the project's player inventory (serialized part/group templates). */
+  inventory: InventoryItemData[];
+  /** Which project inventory item occupies each hotbar slot (1-4). */
+  hotbarItemIds: (string | null)[];
+  /** Move the current selection (parts and/or groups) into the inventory. */
+  sendSelectionToInventory: () => void;
+  /** Send a single object (part or group) into the inventory. */
+  sendObjectToInventory: (id: string) => void;
+  /** Delete an inventory item (the template only - nothing is spawned). */
+  removeInventoryItem: (itemId: string) => void;
+  /** Rename an inventory item. */
+  renameInventoryItem: (itemId: string, name: string) => void;
+  /** Spawn an inventory item back into the world (and remove it from the
+   *  inventory). Returns the new root id, or null. */
+  spawnInventoryItem: (itemId: string, position?: Vector3) => string | null;
+  /** Assign (or clear with null) which item sits in a hotbar slot (0-3). */
+  setHotbarItem: (slot: number, itemId: string | null) => void;
+
 }
 
 let partCounter = 0;
 
-function collectDescendants(objects: Map<string, StudioObject>, id: string): string[] {
+export function collectDescendants(objects: Map<string, StudioObject>, id: string): string[] {
   const obj = objects.get(id);
   if (!obj || !('children' in obj)) return [id];
   let ids = [id];
@@ -1192,6 +1246,10 @@ export const useStudioStore = create<StudioStore>((set, get) => ({
   showCharacterPreview: true,
   globalVariables: {},
   globalTimers: [],
+  // WeLua + player inventory
+  gameWeluScripts: [],
+  inventory: [],
+  hotbarItemIds: [null, null, null, null],
   clipboard: null,
   physicsSettings: {
     gravity: -35,
@@ -1268,11 +1326,13 @@ export const useStudioStore = create<StudioStore>((set, get) => ({
     const doomed = get().objects.get(id);
     if (doomed && isPart(doomed)) {
       try { weildCodeEngine.handleDestroyed(id); } catch { /* never let rules break deleting */ }
+      try { weluRuntime.handleDestroyed(id); } catch { /* never let scripts break deleting */ }
       // Also fire for child parts inside a deleted group - they are destroyed too.
       collectDescendants(get().objects, id).forEach((childId) => {
         const child = get().objects.get(childId);
         if (child && isPart(child)) {
           try { weildCodeEngine.handleDestroyed(childId); } catch { /* ignore */ }
+          try { weluRuntime.handleDestroyed(childId); } catch { /* ignore */ }
         }
       });
     }
@@ -3125,6 +3185,10 @@ export const useStudioStore = create<StudioStore>((set, get) => ({
       consoleMessages: [],
       activeTool: 'Select',
       activeTab: 'Home',
+      // WeLua + player inventory reset with the world
+      gameWeluScripts: [],
+      inventory: [],
+      hotbarItemIds: [null, null, null, null],
       // v13.4: cancel any in-flight progressive load
       partRevealLimit: Infinity,
       loadProgress: { active: false, total: 0, mounted: 0 },
@@ -3315,6 +3379,196 @@ export const useStudioStore = create<StudioStore>((set, get) => ({
       rules: existingRules.map((r) => r.id === ruleId ? { ...r, ...updates } : r),
     } as StudioPart);
     set({ objects: newObjects, objectsVersion: state.objectsVersion + 1 });
+  },
+
+  // ─── WeLua script management (same shape as the rule management) ───
+
+  addWeluScript: (partId, script) => {
+    const state = get();
+    const obj = state.objects.get(partId);
+    if (!obj || !isPart(obj)) return;
+    const newObjects = new Map(state.objects);
+    newObjects.set(partId, { ...obj, weluScripts: [...(obj.weluScripts || []), script] } as StudioPart);
+    set({ objects: newObjects, objectsVersion: state.objectsVersion + 1 });
+  },
+
+  updateWeluScript: (partId, scriptId, updates) => {
+    const state = get();
+    const obj = state.objects.get(partId);
+    if (!obj || !isPart(obj)) return;
+    const newObjects = new Map(state.objects);
+    newObjects.set(partId, {
+      ...obj,
+      weluScripts: (obj.weluScripts || []).map((s) => s.id === scriptId ? { ...s, ...updates } : s),
+    } as StudioPart);
+    set({ objects: newObjects, objectsVersion: state.objectsVersion + 1 });
+  },
+
+  removeWeluScript: (partId, scriptId) => {
+    const state = get();
+    const obj = state.objects.get(partId);
+    if (!obj || !isPart(obj)) return;
+    const newObjects = new Map(state.objects);
+    newObjects.set(partId, {
+      ...obj,
+      weluScripts: (obj.weluScripts || []).filter((s) => s.id !== scriptId),
+    } as StudioPart);
+    set({ objects: newObjects, objectsVersion: state.objectsVersion + 1 });
+  },
+
+  addGameWeluScript: (script) => {
+    set((state) => ({ gameWeluScripts: [...state.gameWeluScripts, script] }));
+  },
+
+  updateGameWeluScript: (scriptId, updates) => {
+    set((state) => ({
+      gameWeluScripts: state.gameWeluScripts.map((s) => s.id === scriptId ? { ...s, ...updates } : s),
+    }));
+  },
+
+  removeGameWeluScript: (scriptId) => {
+    set((state) => ({
+      gameWeluScripts: state.gameWeluScripts.filter((s) => s.id !== scriptId),
+    }));
+  },
+
+  // ─── Player Inventory ───
+  // Moving an object into the inventory serializes its whole subtree
+  // (parts + groups + their rules/weluScripts) and REMOVES it from the
+  // world — "grab and move objects and groups to inventory and back".
+  // Spawning re-instantiates the template with fresh ids.
+
+  sendObjectToInventory: (id) => {
+    const state = get();
+    const obj = state.objects.get(id);
+    if (!obj) return;
+    _pushUndo(get, set);
+
+    // Collect the subtree (single object or group + descendants).
+    const subtreeIds = new Set(collectDescendants(state.objects, id));
+    const objects: StudioObject[] = [];
+    state.objects.forEach((o) => {
+      if (subtreeIds.has(o.id)) objects.push(JSON.parse(JSON.stringify(o)));
+    });
+    if (objects.length === 0) return;
+
+    const item: InventoryItemData = {
+      id: `item_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 7)}`,
+      name: obj.name,
+      sourceType: isPart(obj) ? 'part' : 'group',
+      objects,
+      rootId: id,
+      createdAt: Date.now(),
+    };
+
+    // Remove the subtree from the world (without firing when_destroyed —
+    // "grabbed" is its own event, not a destruction).
+    set((s) => {
+      const newObjects = new Map(s.objects);
+      subtreeIds.forEach((deleteId) => newObjects.delete(deleteId));
+      const root = s.objects.get(id);
+      if (root?.parentId) {
+        const parent = newObjects.get(root.parentId);
+        if (parent && 'children' in parent) {
+          newObjects.set(root.parentId, { ...parent, children: parent.children.filter((c) => !subtreeIds.has(c)) });
+        }
+      }
+      return {
+        objects: newObjects,
+        selectedIds: s.selectedIds.filter((sid) => !subtreeIds.has(sid)),
+        joints: s.joints.filter((j) => !subtreeIds.has(j.partAId) && !subtreeIds.has(j.partBId)),
+        inventory: [...s.inventory, item],
+        objectsVersion: s.objectsVersion + 1,
+      };
+    });
+    state.addConsoleMessage('success', `[Inventory] "${item.name}" moved to the player inventory.`);
+  },
+
+  sendSelectionToInventory: () => {
+    const state = get();
+    const topIds = topMostSelectedIds(state.objects, state.selectedIds);
+    if (topIds.length === 0) return;
+    for (const id of topIds) {
+      get().sendObjectToInventory(id);
+    }
+  },
+
+  removeInventoryItem: (itemId) => {
+    set((state) => ({
+      inventory: state.inventory.filter((i) => i.id !== itemId),
+      hotbarItemIds: state.hotbarItemIds.map((slotItemId) => slotItemId === itemId ? null : slotItemId),
+    }));
+  },
+
+  renameInventoryItem: (itemId, name) => {
+    set((state) => ({
+      inventory: state.inventory.map((i) => i.id === itemId ? { ...i, name } : i),
+    }));
+  },
+
+  spawnInventoryItem: (itemId, position) => {
+    _pushUndo(get, set);
+    const state = get();
+    const item = state.inventory.find((i) => i.id === itemId);
+    if (!item) return null;
+
+    // Fresh ids for every node (the template's ids may collide with the world).
+    const idRemap = new Map<string, string>();
+    for (const o of item.objects) {
+      idRemap.set(o.id, generateId());
+    }
+    const newObjects = new Map(state.objects);
+    const spawnedRoots: string[] = [];
+    for (const o of item.objects) {
+      const clone = JSON.parse(JSON.stringify(o)) as StudioObject;
+      clone.id = idRemap.get(o.id)!;
+      clone.parentId = o.parentId ? (idRemap.get(o.parentId) ?? null) : null;
+      if ('children' in clone) {
+        clone.children = clone.children.map((c) => idRemap.get(c) ?? c);
+      }
+      newObjects.set(clone.id, clone);
+      if (!clone.parentId) spawnedRoots.push(clone.id);
+    }
+
+    // Reposition the root(s) so the item spawns where asked (default: at
+    // the world's spawn area, offset per root so a multi-root template
+    // doesn't stack up).
+    let spawnBase: Vector3 = position
+      ? { ...position }
+      : { ...state.worldSettings.spawnPointPosition };
+    spawnedRoots.forEach((rootId, index) => {
+      const root = newObjects.get(rootId);
+      if (root && isPart(root)) {
+        newObjects.set(rootId, {
+          ...root,
+          position: { x: spawnBase.x + index * 3, y: spawnBase.y, z: spawnBase.z },
+        } as StudioPart);
+      }
+    });
+
+    set({
+      objects: newObjects,
+      inventory: state.inventory.filter((i) => i.id !== itemId),
+      hotbarItemIds: state.hotbarItemIds.map((slotItemId) => slotItemId === itemId ? null : slotItemId),
+      objectsVersion: state.objectsVersion + 1,
+    });
+    state.addConsoleMessage('success', `[Inventory] "${item.name}" spawned into the world.`);
+    return spawnedRoots[0] ?? null;
+  },
+
+  setHotbarItem: (slot, itemId) => {
+    set((state) => {
+      if (slot < 0 || slot >= HOTBAR_SLOT_COUNT) return {};
+      const next = [...state.hotbarItemIds];
+      // An item can only occupy one slot: clear it from the others first.
+      if (itemId) {
+        for (let i = 0; i < next.length; i++) {
+          if (i !== slot && next[i] === itemId) next[i] = null;
+        }
+      }
+      next[slot] = itemId ?? null;
+      return { hotbarItemIds: next };
+    });
   },
 
   // ─── Atomic Play/Simulate Mode Functions ───

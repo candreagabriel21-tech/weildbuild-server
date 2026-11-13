@@ -110,6 +110,18 @@ export const ACTION_CATEGORY: Record<ActionType, string> = {
   camera_pitch: 'looks',
 
   add_rule: 'variables',
+
+  // WeLua pass: inventory + world actions
+  give_item: 'players',
+  remove_item: 'players',
+  drop_item: 'players',
+  set_gravity: 'physics',
+  set_time_of_day: 'looks',
+  set_weather: 'looks',
+  weld_parts: 'physics',
+  break_joints: 'physics',
+  apply_impulse: 'motion',
+  set_visible: 'looks',
 };
 
 /** Palette entry for one action type. */
