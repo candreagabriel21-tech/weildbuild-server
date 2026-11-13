@@ -570,6 +570,7 @@ class WeluRuntime {
     if (!part || !isPart(part)) return null;
     switch (key) {
       case 'name': return part.name;
+      case 'label': return part.label ?? null; // UI parts (Button/Sign/Panel)
       case 'type': return part.type;
       case 'position': return vecToTable(part.position);
       case 'size': return vecToTable(part.size);
@@ -594,6 +595,7 @@ class WeluRuntime {
     const ip = this.interp!;
     switch (key) {
       case 'name': store.updateObject(partId, { name: ip.toString(value) } as Partial<StudioObject>); break;
+      case 'label': store.updateObject(partId, { label: ip.toString(value) } as Partial<StudioObject>); break; // UI parts
       case 'position': {
         const v = tableToVec(value);
         if (v) store.updateObject(partId, { position: v } as Partial<StudioObject>);
@@ -802,9 +804,9 @@ class WeluRuntime {
       if (!(opts instanceof LuaTable)) return null;
       const store = useStudioStore.getState();
       const str = (k: string, d: string) => (opts.get(k) !== null ? ip2.toString(opts.get(k)) : d);
-      const type = (['Block', 'Sphere', 'Wedge', 'Cylinder', 'Spawn'] as const).includes(str('type', 'Block') as PartType)
-        ? str('type', 'Block') as PartType
-        : 'Block';
+      // v7.5: the UI part family is creatable from Lua too (Button/Sign/Panel).
+      const validTypes: readonly string[] = ['Block', 'Sphere', 'Wedge', 'Cylinder', 'Spawn', 'Button', 'Sign', 'Panel'];
+      const type = validTypes.includes(str('type', 'Block')) ? str('type', 'Block') as PartType : 'Block';
       const pos = tableToVec(opts.get('position')) ?? { x: 0, y: 1, z: 0 };
       const size = tableToVec(opts.get('size')) ?? { x: 1, y: 1, z: 1 };
       const rotation = tableToVec(opts.get('rotation')) ?? { x: 0, y: 0, z: 0 };

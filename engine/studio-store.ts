@@ -32,7 +32,15 @@ import {
   scatterTrees as scatterTreesV2,
 } from './terrain-v2';
 
-export type PartType = 'Block' | 'Sphere' | 'Wedge' | 'Cylinder' | 'Spawn';
+export type PartType = 'Block' | 'Sphere' | 'Wedge' | 'Cylinder' | 'Spawn' | 'Button' | 'Sign' | 'Panel';
+
+/** v7.5: the UI part family — clickable boards with text labels that
+ *  players add from the Insert Part palette. They resize/rotate/colour
+ *  like every other part and fire the usual click/touch rules + WeLua. */
+export const UI_PART_TYPES: readonly PartType[] = ['Button', 'Sign', 'Panel'];
+export function isUiPartType(type: string): boolean {
+  return type === 'Button' || type === 'Sign' || type === 'Panel';
+}
 
 // ─── v13.5: hard value limits (single source of truth) ───
 //
@@ -188,6 +196,8 @@ export interface StudioPart {
   id: string;
   name: string;
   type: PartType;
+  /** v7.5: UI parts (Button/Sign/Panel) — the text shown on the part. */
+  label?: string;
   position: Vector3;
   size: Vector3;
   rotation: Vector3;
@@ -272,7 +282,10 @@ export interface StudioModel {
 export type StudioObject = StudioPart | StudioModel;
 
 export function isPart(obj: StudioObject): obj is StudioPart {
-  return 'type' in obj && ['Block', 'Sphere', 'Wedge', 'Cylinder', 'Spawn'].includes(obj.type);
+  // v7.5: the UI part family (Button/Sign/Panel) is parts too — without
+  // them here, every isPart() gate (rendering, physics, serialisation)
+  // would misread a UI part as a group.
+  return 'type' in obj && (['Block', 'Sphere', 'Wedge', 'Cylinder', 'Spawn'] as string[]).concat(UI_PART_TYPES as unknown as string[]).includes(obj.type);
 }
 
 // ─── Player Inventory (project-level items) ───
@@ -1081,6 +1094,11 @@ export const PART_DEFAULTS: Record<string, { color: string; size: { x: number; y
   Wedge:     { color: '#f7f54f', size: { x: 1, y: 1, z: 1 } },  // Bright yellow
   CornerWedge: { color: '#f7f54f', size: { x: 1, y: 1, z: 1 } }, // Bright yellow
   Spawn:     { color: '#4a90d9', size: { x: 3, y: 0.3, z: 3 } },  // Blue spawn pad
+  // v7.5: UI parts — thin boards, anchored by default (a button you can
+  // push across the map is a very confusing button).
+  Button:    { color: '#ffc93c', size: { x: 4, y: 1.6, z: 0.6 } },  // Chunky gold button
+  Sign:      { color: '#e7e5e4', size: { x: 6, y: 3, z: 0.4 } },    // Big pale signboard
+  Panel:     { color: '#6d5ae0', size: { x: 8, y: 5, z: 0.3 } },    // Wide violet panel
 };
 
 // ─── Undo/Redo helpers ───
@@ -2027,6 +2045,9 @@ export const useStudioStore = create<StudioStore>((set, get) => ({
       rotation: { x: 0, y: 0, z: 0 },
       ...defaultPartProps,
       color: defaults.color,
+      // v7.5: UI parts carry their text label (Panel starts blank — it is
+      // usually a backing board for other UI parts).
+      ...(isUiPartType(type) && type !== 'Panel' ? { label: type } : {}),
       children: [],
       parentId: null,
     };
