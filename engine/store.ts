@@ -147,9 +147,11 @@ export interface PrimitiveData {
   size: number[];
   color: number[];
   rotation: number[];
-  shape_type: "block" | "sphere" | "cylinder" | "wedge" | "corner_wedge" | "spawn_point"
+  shape_type: "block" | "sphere" | "cylinder" | "wedge" | "corner_wedge" | "spawn_point" | "button" | "sign" | "panel"
     | "kill_brick" | "speed_pad" | "checkpoint" | "item_pickup" | "truss" | "ramp"
     | "lava" | "water" | "door" | "teleporter" | "npc" | "player";
+  /** v7.5: UI part text (Button/Sign/Panel). */
+  label?: string;
   name?: string;
   anchored?: boolean;
   locked?: boolean;

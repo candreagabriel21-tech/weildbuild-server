@@ -18,6 +18,8 @@ import {
 } from './weildcode-types';
 import { useStudioStore, isPart, StudioPart, Vector3, PartType } from './studio-store';
 import { playSound, playCue } from './sounds';
+import { WB_CAMERA_BRIDGE } from './welu/welu-runtime';
+import { playerInventory } from './player-inventory';
 
 // ─── Engine State ───
 
@@ -208,6 +210,15 @@ class WeildCodeEngine {
     this.playerEffects.push(resolved);
   }
 
+  /**
+   * v7.4: PUBLIC queue entry for per-player effects. WeLua's player API
+   * (and future systems) uses the exact same pipeline the rule actions
+   * use — the gamehost drains and applies each effect to the right player.
+   */
+  queuePlayerEffect(effect: PlayerEffect): void {
+    this.pushPlayerEffect(effect);
+  }
+
   /** v6.2.1: hand the queued per-player effects to the authority. The
    * gamehost worker calls this every sim tick and applies each effect to
    * its target player. */
@@ -352,6 +363,16 @@ class WeildCodeEngine {
       }
     });
 
+    // FIX (WeLua pass): PART-level on_timer rules were also never scheduled
+    // (nothing ever called fireTrigger(..., 'on_timer')), so timers on parts
+    // silently never fired. Schedule every part's timer rules here too.
+    state.objects.forEach((obj) => {
+      if (!isPart(obj)) return;
+      for (const rule of obj.rules || []) {
+        if (rule.enabled && rule.trigger.type === 'on_timer') this.setupTimer(rule, obj.id);
+      }
+    });
+
     // v7 FIX: game-level on_timer rules were never scheduled anywhere (only
     // part rules were), so a timer attached to a GAME rule silently never
     // fired. Schedule them here; updateTimers already knows the partId === ''
@@ -362,6 +383,68 @@ class WeildCodeEngine {
 
     // Start the update loop
     this.update();
+  }
+
+  /** pass 21 camera actions, now WIRED: the four behaviour flags write
+   *  worldSettings (which the play camera reads every frame); position /
+   *  yaw / pitch write the WB_CAMERA_BRIDGE one-shot that
+   *  GamePlayerCharacter applies the next frame (cutscene shots). */
+  private executeCameraAction(action: WeildCodeAction) {
+    const store = useStudioStore.getState();
+    switch (action.type) {
+      case 'camera_follow_character':
+        store.setWorldSettings({ cameraFollowCharacter: action.params.enabled !== false });
+        break;
+      case 'camera_characterlook_lock':
+        store.setWorldSettings({ cameraCharacterLookLock: action.params.enabled !== false });
+        break;
+      case 'camera_can_orbit':
+        store.setWorldSettings({ cameraCanOrbit: action.params.enabled !== false });
+        break;
+      case 'camera_can_look_through':
+        store.setWorldSettings({ cameraCanLookThroughObjects: action.params.enabled !== false });
+        break;
+      case 'camera_position': {
+        const p = this.paramVec3('', action.params.position, { x: 0, y: 8, z: 14 });
+        WB_CAMERA_BRIDGE.position = p;
+        WB_CAMERA_BRIDGE.nonce++;
+        break;
+      }
+      case 'camera_yaw': {
+        WB_CAMERA_BRIDGE.yaw = ((this.paramNumber('', action.params.yaw, 0) % 360) + 360) % 360;
+        WB_CAMERA_BRIDGE.nonce++;
+        break;
+      }
+      case 'camera_pitch': {
+        WB_CAMERA_BRIDGE.pitch = Math.max(-85, Math.min(85, this.paramNumber('', action.params.pitch, 15)));
+        WB_CAMERA_BRIDGE.nonce++;
+        break;
+      }
+      default: break;
+    }
+  }
+
+  /** on_key_pressed: fires on every part rule (and game rules) whose key
+   *  matches. Called by the play viewport's key handler. */
+  handleKeyPress(key: string): void {
+    if (!this.isRunning) return;
+    const lower = key.toLowerCase();
+    const state = useStudioStore.getState();
+    state.objects.forEach((obj) => {
+      if (!isPart(obj)) return;
+      for (const rule of obj.rules || []) {
+        if (!rule.enabled || rule.trigger.type !== 'on_key_pressed') continue;
+        const param = String(rule.trigger.params.key ?? '').trim().toLowerCase();
+        if (param && param !== lower) continue;
+        this.executeActions(obj.id, rule.actions, rule.id);
+      }
+    });
+    for (const rule of state.gameRules || []) {
+      if (!rule.enabled || rule.trigger.type !== 'on_key_pressed') continue;
+      const param = String(rule.trigger.params.key ?? '').trim().toLowerCase();
+      if (param && param !== lower) continue;
+      this.withActor(undefined, () => this.executeGameActions(rule.actions, rule.id));
+    }
   }
 
   stop() {
@@ -1122,10 +1205,43 @@ class WeildCodeEngine {
       case 'camera_position':
       case 'camera_yaw':
       case 'camera_pitch': {
-        useStudioStore.getState().addConsoleMessage(
-          'info',
-          `[WeildCode] Camera action "${action.type}" is a placeholder (pass 21) - not wired to the camera yet.`,
-        );
+        this.executeCameraAction(action);
+        break;
+      }
+      case 'give_item': {
+        const inv = (globalThis as any).__wbPlayerInventory;
+        const name = this.paramString('', action.params.itemName, '');
+        if (inv && name && inv.giveItemByName) inv.giveItemByName(name);
+        break;
+      }
+      case 'remove_item': {
+        const inv = (globalThis as any).__wbPlayerInventory;
+        const name = this.paramString('', action.params.itemName, '');
+        if (inv && name && inv.removeItemByName) inv.removeItemByName(name);
+        break;
+      }
+      case 'drop_item': {
+        const inv = (globalThis as any).__wbPlayerInventory;
+        const name = this.paramString('', action.params.itemName, '');
+        if (inv && inv.dropItemByName) inv.dropItemByName(name || undefined as any);
+        break;
+      }
+      case 'set_gravity': {
+        const g = Math.max(-200, Math.min(0, this.paramNumber('', action.params.gravity, -35)));
+        useStudioStore.getState().setPhysicsSettings({ gravity: g });
+        useStudioStore.getState().setWorldSettings({ gravity: g });
+        break;
+      }
+      case 'set_time_of_day': {
+        const t = ((this.paramNumber('', action.params.timeOfDay, 12) % 24) + 24) % 24;
+        useStudioStore.getState().setWorldSettings({ timeOfDay: t });
+        break;
+      }
+      case 'set_weather': {
+        const w = String(action.params.weatherType || 'rain');
+        if (['clear', 'cloudy', 'rain', 'snow'].includes(w)) {
+          useStudioStore.getState().setWorldSettings({ weatherType: w as any });
+        }
         break;
       }
       default: {
@@ -1709,10 +1825,68 @@ class WeildCodeEngine {
       case 'camera_position':
       case 'camera_yaw':
       case 'camera_pitch': {
-        useStudioStore.getState().addConsoleMessage(
-          'info',
-          `[WeildCode] Camera action "${action.type}" is a placeholder (pass 21) - not wired to the camera yet.`,
-        );
+        this.executeCameraAction(action);
+        break;
+      }
+      case 'give_item': {
+        const inv = (globalThis as any).__wbPlayerInventory;
+        const name = this.paramString(partId, action.params.itemName, '');
+        if (inv && name && inv.giveItemByName) inv.giveItemByName(name);
+        break;
+      }
+      case 'remove_item': {
+        const inv = (globalThis as any).__wbPlayerInventory;
+        const name = this.paramString(partId, action.params.itemName, '');
+        if (inv && name && inv.removeItemByName) inv.removeItemByName(name);
+        break;
+      }
+      case 'drop_item': {
+        const inv = (globalThis as any).__wbPlayerInventory;
+        const name = this.paramString(partId, action.params.itemName, '');
+        if (inv && inv.dropItemByName) inv.dropItemByName(name || undefined as any);
+        break;
+      }
+      case 'set_gravity': {
+        const g = Math.max(-200, Math.min(0, this.paramNumber(partId, action.params.gravity, -35)));
+        useStudioStore.getState().setPhysicsSettings({ gravity: g });
+        useStudioStore.getState().setWorldSettings({ gravity: g });
+        break;
+      }
+      case 'set_time_of_day': {
+        const t = ((this.paramNumber(partId, action.params.timeOfDay, 12) % 24) + 24) % 24;
+        useStudioStore.getState().setWorldSettings({ timeOfDay: t });
+        break;
+      }
+      case 'set_weather': {
+        const w = String(action.params.weatherType || 'rain');
+        if (['clear', 'cloudy', 'rain', 'snow'].includes(w)) {
+          useStudioStore.getState().setWorldSettings({ weatherType: w as any });
+        }
+        break;
+      }
+      case 'weld_parts': {
+        const targetName = this.paramString(partId, action.params.targetName, '');
+        const target = targetName ? this.findPartByName(targetName) : null;
+        if (target && isPart(target) && target.id !== partId) {
+          useStudioStore.getState().addJoint({
+            id: `joint_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+            type: 'Weld', partAId: partId, partBId: target.id, enabled: true,
+          });
+        }
+        break;
+      }
+      case 'break_joints': {
+        useStudioStore.getState().breakJoints(partId);
+        break;
+      }
+      case 'apply_impulse': {
+        const f = this.paramVec3(partId, action.params.force, { x: 0, y: 50, z: 0 });
+        const world = (globalThis as any).__weildPhysicsWorld;
+        if (world?.addImpulse) world.addImpulse(partId, f, 0.25);
+        break;
+      }
+      case 'set_visible': {
+        useStudioStore.getState().updateObject(partId, { showInWorld: action.params.enabled !== false } as any);
         break;
       }
       case 'modify_player_health': {

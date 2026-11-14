@@ -46,6 +46,11 @@ export interface VisualSettings {
   render_distance: number;
   /** Max device pixel ratio cap. Lower = coarser but much faster on retina. */
   max_dpr: number;
+  /** WEBUILD MERGE: which UI flavor to render - "new" = the WeBuild Tk
+   *  look (default), "old" = the pre-merge candy look (applied via
+   *  data-ui-style="old" on <html>; token overrides in globals.css).
+   *  The switch UI is HIDDEN for now (owner spec) - the plumbing works. */
+  ui_style: "new" | "old";
 }
 
 // v1.9.3: applying the volume needs the shared audio context (sounds.ts).
@@ -83,6 +88,7 @@ export const DEFAULT_VISUAL_SETTINGS: VisualSettings = {
   shadows: 1,
   render_distance: 320,
   max_dpr: 2,
+  ui_style: "new",
 };
 
 /** 1.0: read just the mobile control style (used by the game HUD every frame-free render). */
@@ -235,6 +241,8 @@ export function applyVisualSettings(s: VisualSettings): void {
   } else {
     document.documentElement.removeAttribute("data-animations");
   }
+  // WEBUILD MERGE: new/old UI flavor (hidden switch, but it works).
+  document.documentElement.setAttribute("data-ui-style", s.ui_style === "old" ? "old" : "new");
   document.documentElement.style.setProperty("--ui-scale", String(s.ui_scale ?? 1));
   try {
     // remember volume for the sound system (same key the old slider used)
