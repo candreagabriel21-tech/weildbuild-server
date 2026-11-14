@@ -23,14 +23,8 @@ export type TriggerType =
   | 'on_chat_message'    // A player sends a chat message (optional filters)
   // ─── v7: life-state triggers (rules react to damage + death) ───
   | 'on_player_damaged'  // A player's health decreases (rules or void)
-  | 'on_player_died'     // A player dies (health hits 0 or the void)
-  // ─── WeLua pass: inventory-item + key triggers ───
-  | 'when_used'          // Inventory item: the player USES it while holding it
-  | 'when_equipped'      // Inventory item: selected in the item bar (held)
-  | 'when_unequipped'    // Inventory item: deselected (put away)
-  | 'when_grabbed'       // Object is grabbed into the player's inventory
-  | 'when_dropped'       // Inventory item is placed back into the world
-  | 'on_key_pressed';    // A key is pressed (part or game rules)
+  | 'on_player_died';    // A player dies (health hits 0 or the void)
+
 export interface TriggerParam {
   key: string;
   label: string;
@@ -97,50 +91,6 @@ export interface TriggerDefinition {
 
 /** Full catalog of available triggers */
 export const TRIGGER_DEFINITIONS: TriggerDefinition[] = [
-  {
-    type: 'when_used',
-    label: 'When this item is used',
-    description: 'Inventory items: fires when the player uses this item while holding it (click / Use button)',
-    icon: 'MousePointerClick',
-    params: [],
-  },
-  {
-    type: 'when_equipped',
-    label: 'When this item is equipped',
-    description: 'Inventory items: fires when the player selects this item in the item bar',
-    icon: 'Hand',
-    params: [],
-  },
-  {
-    type: 'when_unequipped',
-    label: 'When this item is unequipped',
-    description: 'Inventory items: fires when the player deselects this item',
-    icon: 'Hand',
-    params: [],
-  },
-  {
-    type: 'when_grabbed',
-    label: 'When this is grabbed',
-    description: 'Fires when a player grabs this object into their inventory (E key in play mode)',
-    icon: 'Grab',
-    params: [],
-  },
-  {
-    type: 'when_dropped',
-    label: 'When this item is dropped',
-    description: 'Inventory items: fires when the item is placed back into the world (Q key / drop)',
-    icon: 'PackageOpen',
-    params: [],
-  },
-  {
-    type: 'on_key_pressed',
-    label: 'When a key is pressed',
-    description: 'Fires when the player presses a key (e.g. "e", "space"). Works on parts and on the game',
-    icon: 'Keyboard',
-    params: [
-      { key: 'key', label: 'Key (e.g. e, space, q)', type: 'string', default: 'e' },
-    ],
-  },
   {
     type: 'when_created',
     label: 'When this is created',
@@ -529,18 +479,7 @@ export type ActionType =
   | 'camera_can_look_through'      // true/false: camera retracts for solid objects
   | 'camera_position'              // set the camera point's world x,y,z
   | 'camera_yaw'                   // set the camera's yaw (point of looking, degrees)
-  | 'camera_pitch'                 // set the camera's pitch (degrees)
-  // ─── WeLua pass: inventory, physics + world actions ───
-  | 'give_item'          // Give the player an inventory item (by name)
-  | 'remove_item'        // Remove an inventory item from the player
-  | 'drop_item'          // Spawn an inventory item into the world in front of the player
-  | 'set_gravity'        // Set the world's gravity
-  | 'set_time_of_day'    // Set the world clock (0-24, 12 = noon)
-  | 'set_weather'        // Set the weather (clear/cloudy/rain/snow)
-  | 'weld_parts'         // Weld this part to a named part
-  | 'break_joints'       // Remove all joints on this part
-  | 'apply_impulse'      // Launch the part with an instant impulse
-  | 'set_visible';       // Show/hide the part (showInWorld)
+  | 'camera_pitch';                // set the camera's pitch (degrees)
 
 export interface ActionParam {
   key: string;
@@ -1303,105 +1242,10 @@ export const ACTION_DEFINITIONS: ActionDefinition[] = [
   {
     type: 'camera_pitch',
     label: 'Camera pitch',
-    description: 'Set the camera\'s pitch, in degrees (-85..85)',
+    description: 'Placeholder (not wired yet): set the camera\'s pitch, in degrees (-85..85)',
     icon: 'RotateCcw',
     params: [
       { key: 'pitch', label: 'Pitch (degrees)', type: 'number', default: 15 },
-    ],
-  },
-  // ─── WeLua pass: inventory-item + key triggers ───
-  // ─── WeLua pass: inventory + world actions ───
-  {
-    type: 'give_item',
-    label: 'Give item',
-    description: 'Give the player an inventory item by name (from the project inventory)',
-    icon: 'PackagePlus',
-    params: [
-      { key: 'itemName', label: 'Item name', type: 'string', default: '' },
-    ],
-  },
-  {
-    type: 'remove_item',
-    label: 'Remove item',
-    description: 'Remove an inventory item from the player by name',
-    icon: 'PackageMinus',
-    params: [
-      { key: 'itemName', label: 'Item name', type: 'string', default: '' },
-    ],
-  },
-  {
-    type: 'drop_item',
-    label: 'Drop item',
-    description: 'Spawn one of the player\'s inventory items back into the world, in front of them',
-    icon: 'PackageOpen',
-    params: [
-      { key: 'itemName', label: 'Item name (blank = the held item)', type: 'string', default: '' },
-    ],
-  },
-  {
-    type: 'set_gravity',
-    label: 'Set gravity',
-    description: 'Change the world\'s gravity (default -35)',
-    icon: 'ArrowDown',
-    params: [
-      { key: 'gravity', label: 'Gravity', type: 'number', default: -35 },
-    ],
-  },
-  {
-    type: 'set_time_of_day',
-    label: 'Set time of day',
-    description: 'Set the world clock (0-24 hours; 12 = noon, 0 = midnight)',
-    icon: 'Clock',
-    params: [
-      { key: 'timeOfDay', label: 'Time (0-24)', type: 'number', default: 12 },
-    ],
-  },
-  {
-    type: 'set_weather',
-    label: 'Set weather',
-    description: 'Change the weather',
-    icon: 'CloudRain',
-    params: [
-      { key: 'weatherType', label: 'Weather', type: 'select', default: 'rain', options: [
-        { label: 'Clear', value: 'clear' },
-        { label: 'Cloudy', value: 'cloudy' },
-        { label: 'Rain', value: 'rain' },
-        { label: 'Snow', value: 'snow' },
-      ]},
-    ],
-  },
-  {
-    type: 'weld_parts',
-    label: 'Weld to part',
-    description: 'Weld this part to another part (by name) so they stick together',
-    icon: 'Link',
-    params: [
-      { key: 'targetName', label: 'Other part\'s name', type: 'string', default: '' },
-    ],
-  },
-  {
-    type: 'break_joints',
-    label: 'Break joints',
-    description: 'Remove all joints (welds, ropes, ...) on this part',
-    icon: 'Unlink',
-    params: [],
-  },
-  {
-    type: 'apply_impulse',
-    label: 'Launch part (impulse)',
-    description: 'Apply an instant impulse to this part — launch it flying',
-    icon: 'Rocket',
-    params: [
-      { key: 'force', label: 'Impulse (x,y,z)', type: 'vector3', default: { x: 0, y: 50, z: 0 } },
-    ],
-  },
-  {
-    type: 'set_visible',
-    label: 'Set visible',
-    description: 'Show or hide this part (hidden parts still run code)',
-    icon: 'Eye',
-    params: [
-      { key: 'enabled', label: 'Visible', type: 'boolean', default: true },
     ],
   },
 ];
@@ -1462,26 +1306,60 @@ export function createBlankAction(type: ActionType): WeildCodeAction {
   };
 }
 
-// ─── WeildCode Advanced Syntax Parser ───
-// Converts between simple mode (structured) and advanced mode (text)
+// ─── WeildCode Advanced Syntax Parser (v2, WEBUILD MERGE) ───
+// Converts between simple mode (structured) and advanced mode (text).
+// v2: this is now the AUTHORING format for the WeLua text editor, so the
+// round-trip is lossless: operand params, nested children (repeat /
+// tell_object / repeat_every) and if_condition's ELSE branch all survive,
+// and unknown actions make the parse FAIL (the old parser silently
+// dropped them). Text form: key="value" for scalars, key=x,y,z for
+// vectors, key=source:value[:extra] for operands.
+
+function operandToCode(op: any): string {
+  if (!op || typeof op !== 'object') return String(op ?? '');
+  const source = String(op.source || 'number');
+  if (source === 'player') return `player:${op.stat ?? 'health'}`;
+  if (source === 'part') return `part:${op.prop ?? 'x'}:${op.value ?? ''}`;
+  if (source === 'variable') return `variable:${op.value ?? ''}`;
+  if (source === 'text') return `text:${op.value ?? ''}`;
+  return `number:${op.value ?? '0'}`;
+}
+
+function parseOperandCode(raw: string): OperandSpec | null {
+  const parts = raw.split(':');
+  const source = parts[0] as OperandSpec['source'];
+  if (source === 'player') return { source, stat: (parts[1] || 'health') as OperandSpec['stat'] };
+  if (source === 'part') return { source, prop: (parts[1] || 'x') as OperandSpec['prop'], value: parts.slice(2).join(':') };
+  if (source === 'variable') return { source, value: parts.slice(1).join(':') };
+  if (source === 'text') return { source, value: parts.slice(1).join(':') };
+  if (source === 'number') return { source, value: parts[1] ?? '0' };
+  return null;
+}
+
+function paramValueToCode(key: string, v: any, def?: ActionParam): string | null {
+  if (v === undefined || v === null) return null;
+  if (typeof v === 'object') {
+    if (def?.type === 'operand') return `${key}=${operandToCode(v)}`;
+    // vector3 / vector3_relative
+    return `${key}=${v.x},${v.y},${v.z}`;
+  }
+  if (v === '' && def?.type !== 'string') return null;
+  return `${key}="${String(v)}"`;
+}
 
 export function ruleToAdvancedCode(rule: WeildCodeRule): string {
-  const triggerDef = TRIGGER_DEFINITIONS.find((d) => d.type === rule.trigger.type);
-  const triggerKeyword = rule.trigger.type;
-
   let paramsStr = '';
   if (Object.keys(rule.trigger.params).length > 0) {
     paramsStr = ' ' + Object.entries(rule.trigger.params)
-      .map(([k, v]) => `${k}="${v}"`)
+      .filter(([, v]) => v !== undefined && v !== null && v !== '')
+      .map(([k, v]) => `${k}="${String(v)}"`)
       .join(' ');
   }
 
-  let code = `${triggerKeyword}${paramsStr} {\n`;
-
+  let code = `${rule.trigger.type}${paramsStr} {\n`;
   for (const action of rule.actions) {
-    code += '  ' + actionToCode(action, 1) + '\n';
+    code += actionToCode(action, 1);
   }
-
   code += '}\n';
   return code;
 }
@@ -1490,75 +1368,89 @@ function actionToCode(action: WeildCodeAction, indent: number): string {
   const pad = '  '.repeat(indent);
   const def = ACTION_DEFINITIONS.find((d) => d.type === action.type);
 
+  const paramEntries = Object.entries(action.params)
+    .map(([k, v]) => [k, v, def?.params.find((p) => p.key === k)] as const)
+    .filter(([, v]) => v !== undefined && v !== null && v !== '');
   let paramsStr = '';
-  const paramEntries = Object.entries(action.params).filter(([_, v]) => v !== undefined && v !== '');
   if (paramEntries.length > 0) {
     paramsStr = ' ' + paramEntries
-      .map(([k, v]) => {
-        if (typeof v === 'object' && v !== null) {
-          return `${k}=${v.x},${v.y},${v.z}`;
-        }
-        return `${k}="${v}"`;
-      })
+      .map(([k, v, pDef]) => paramValueToCode(k, v, pDef))
+      .filter((s): s is string => s !== null)
       .join(' ');
   }
 
-  if (def?.hasChildren && action.children && action.children.length > 0) {
+  if (def?.hasChildren) {
     let code = `${action.type}${paramsStr} {\n`;
-    for (const child of action.children) {
-      code += pad + '  ' + actionToCode(child, indent + 1) + '\n';
+    for (const child of action.children || []) {
+      code += actionToCode(child, indent + 1);
     }
-    code += pad + '}\n';
+    code += pad + '}';
+    if (def.elseChildLabel) {
+      code += ' else {\n';
+      for (const child of action.elseChildren || []) {
+        code += actionToCode(child, indent + 1);
+      }
+      code += pad + '}\n';
+    } else {
+      code += '\n';
+    }
     return code;
   }
 
-  return `${action.type}${paramsStr}`;
+  return `${action.type}${paramsStr}\n`;
 }
 
-/** Parse advanced WeildCode text into a rule (basic parser) */
+/** Parse advanced WeildCode text into a rule (v2: nested + operands). */
 export function parseAdvancedCode(code: string): { trigger: WeildCodeRule['trigger']; actions: WeildCodeAction[] } | null {
   try {
     const trimmed = code.trim();
-    // Find the trigger keyword and opening brace
     const braceIndex = trimmed.indexOf('{');
     if (braceIndex === -1) return null;
 
     const triggerPart = trimmed.substring(0, braceIndex).trim();
-    const bodyPart = trimmed.substring(braceIndex + 1, trimmed.lastIndexOf('}')).trim();
-
-    // Parse trigger
     const triggerWords = triggerPart.split(/\s+/);
     const triggerType = triggerWords[0] as TriggerType;
+    if (!TRIGGER_DEFINITIONS.some((d) => d.type === triggerType)) return null;
     const triggerParams: Record<string, any> = {};
-
-    // Parse trigger params (key="value" format)
     for (let i = 1; i < triggerWords.length; i++) {
       const match = triggerWords[i].match(/^(\w+)="([^"]*)"$/);
-      if (match) {
-        triggerParams[match[1]] = match[2];
-      }
+      if (match) triggerParams[match[1]] = match[2];
     }
 
-    // Parse actions (line by line, basic parsing)
-    const actions: WeildCodeAction[] = [];
-    const lines = bodyPart.split('\n').map(l => l.trim()).filter(l => l && !l.startsWith('//'));
+    // Body lines between the outer braces (brace-depth aware, so nested
+    // action blocks stay inside the body).
+    const bodyStart = braceIndex + 1;
+    const bodyEnd = trimmed.lastIndexOf('}');
+    if (bodyEnd <= bodyStart) return null;
+    const body = trimmed.substring(bodyStart, bodyEnd);
+    const lines = body.split('\n').map((l) => l.trim()).filter((l) => l && !l.startsWith('//'));
 
-    for (const line of lines) {
-      if (line === '{' || line === '}') continue;
-      const action = parseActionCode(line);
-      if (action) actions.push(action);
-    }
-
-    return { trigger: { type: triggerType, params: triggerParams }, actions };
+    const parsed = parseActionLines(lines, 0);
+    if (!parsed || parsed.next < lines.length) return null;
+    return { trigger: { type: triggerType, params: triggerParams }, actions: parsed.actions };
   } catch {
     return null;
   }
 }
 
-function parseActionCode(line: string): WeildCodeAction | null {
-  const words = line.trim().split(/\s+/);
-  if (words.length === 0) return null;
+/** Parse a run of action lines; returns null on any unknown action. */
+function parseActionLines(lines: string[], start: number): { actions: WeildCodeAction[]; next: number } | null {
+  const actions: WeildCodeAction[] = [];
+  let i = start;
+  while (i < lines.length) {
+    const line = lines[i];
+    if (line === '}' || line === 'else {') break;
+    const action = parseActionLine(lines, i);
+    if (!action) return null;
+    actions.push(action.action);
+    i = action.next;
+  }
+  return { actions, next: i };
+}
 
+function parseActionLine(lines: string[], start: number): { action: WeildCodeAction; next: number } | null {
+  const words = lines[start].split(/\s+/);
+  if (words.length === 0) return null;
   const actionType = words[0] as ActionType;
   const def = ACTION_DEFINITIONS.find((d) => d.type === actionType);
   if (!def) return null;
@@ -1567,30 +1459,82 @@ function parseActionCode(line: string): WeildCodeAction | null {
   for (const p of def.params) {
     params[p.key] = p.default ?? '';
   }
+  // If the definition has a boolean default of `true`, an omitted key keeps it.
+  for (const p of def.params) {
+    if (p.type === 'boolean' && params[p.key] === undefined) params[p.key] = false;
+  }
 
-  // Parse key="value" params
   for (let i = 1; i < words.length; i++) {
-    const match = words[i].match(/^(\w+)="([^"]*)"$/);
-    if (match) {
-      const paramDef = def.params.find(p => p.key === match[1]);
-      if (paramDef?.type === 'vector3') {
-        const parts = match[2].split(',').map(Number);
-        if (parts.length === 3) {
-          params[match[1]] = { x: parts[0], y: parts[1], z: parts[2] };
-        }
-      } else if (paramDef?.type === 'number') {
-        params[match[1]] = Number(match[2]);
-      } else {
-        params[match[1]] = match[2];
-      }
+    const match = words[i].match(/^(\w+)=(.*)$/);
+    if (!match) continue;
+    const key = match[1];
+    let raw = match[2];
+    const quoted = raw.startsWith('"') && raw.endsWith('"');
+    if (quoted) raw = raw.slice(1, -1);
+    const paramDef = def.params.find((p) => p.key === key);
+    if (paramDef?.type === 'operand') {
+      const op = parseOperandCode(raw);
+      if (!op) return null;
+      params[key] = op;
+    } else if (paramDef?.type === 'vector3' || paramDef?.type === 'vector3_relative') {
+      const parts = raw.split(',').map(Number);
+      if (parts.length !== 3 || parts.some((n) => Number.isNaN(n))) return null;
+      params[key] = { x: parts[0], y: parts[1], z: parts[2] };
+    } else if (paramDef?.type === 'number') {
+      params[key] = Number(raw);
+    } else if (paramDef?.type === 'boolean') {
+      params[key] = raw === 'true';
+    } else {
+      params[key] = raw;
     }
   }
 
-  return {
-    id: `act_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
+  const action: WeildCodeAction = {
+    id: `act_${Date.now()}_${Math.random().toString(36).substring(2, 7)}_${Math.floor(Math.random() * 1e6)}`,
     type: actionType,
     params,
     children: def.hasChildren ? [] : undefined,
+    elseChildren: def.elseChildLabel ? [] : undefined,
     enabled: true,
   };
+
+  // Nested block: the line ended with "{". Collect children up to the
+  // matching "}", with an optional "} else {" section for if_condition.
+  const trimmedLine = lines[start];
+  if (trimmedLine.endsWith('{')) {
+    let i = start + 1;
+    let depth = 1;
+    const thenLines: string[] = [];
+    const elseLines: string[] = [];
+    let inElse = false;
+    while (i < lines.length) {
+      const line = lines[i];
+      if (line === '} else {') {
+        if (depth !== 1) return null;
+        inElse = true;
+        i++;
+        continue;
+      }
+      for (const ch of line) {
+        if (ch === '{') depth++;
+        else if (ch === '}') depth--;
+      }
+      if (depth === 0) break; // the closing brace of THIS block
+      if (depth < 0) return null;
+      (inElse ? elseLines : thenLines).push(line);
+      i++;
+    }
+    if (depth !== 0) return null; // unbalanced
+    const thenParsed = parseActionLines(thenLines, 0);
+    if (!thenParsed || thenParsed.next < thenLines.length) return null;
+    action.children = thenParsed.actions;
+    if (def.elseChildLabel) {
+      const elseParsed = parseActionLines(elseLines, 0);
+      if (!elseParsed || elseParsed.next < elseLines.length) return null;
+      action.elseChildren = elseParsed.actions;
+    }
+    return { action, next: i + 1 }; // skip the closing brace line
+  }
+
+  return { action, next: start + 1 };
 }

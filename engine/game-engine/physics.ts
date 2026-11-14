@@ -51,12 +51,16 @@
  *   8 iterations (cannon's GSSolver ran 10 - Rapier's solver is a
  *   different, warm-started design where 4 is the default and 8 is a
  *   stability sweet spot for stacks).
- * - PRE-EXISTING QUIRK PRESERVED ON PURPOSE: BodyVelocity/BodyPosition/
- *   BodyGyro/BodyAngularVelocity movers only write the JS mirror, which
- *   the post-step sync then overwrites for collider-backed bodies (they
- *   were equally inert under cannon). BodyForce/BodyThrust and impulses
- *   do reach the solver. Fixing the mirror movers is a separate,
- *   behavior-changing decision - NOT mixed into the engine swap.
+ * - WEBUILD FIX (the "bugged physics" pass): BodyVelocity/BodyPosition/
+ *   BodyGyro/BodyAngularVelocity movers used to write the JS mirror only,
+ *   which the post-step sync then overwrote for collider-backed bodies -
+ *   so those four movers NEVER moved anything (they were equally inert
+ *   under cannon). They now drive the Rapier body directly:
+ *   BodyVelocity / BodyAngularVelocity set the (angular) velocity exactly
+ *   (the Roblox semantic), BodyPosition / BodyGyro run the tuned PD servo
+ *   as a real impulse/torque-impulse with a per-step convergence cap so
+ *   the infinite-maxForce default can no longer oscillate. Collider-less
+ *   bodies keep the mirror math. BodyForce/BodyThrust unchanged.
  * - RopeConstraint (the unilateral max-distance rope) is JointData.rope -
  *   a native Rapier rope joint, so the class is gone.
  */
@@ -1763,7 +1767,6 @@ export class PhysicsWorld {
     this.syncRapierToPhysicsBodies();
 
     // 5. Check water state
-    this.checkWaterState();
 
     // 6. Apply drag
     this.applyDrag(dt);
@@ -1873,17 +1876,20 @@ export class PhysicsWorld {
 
   private applyBodyMoversAndImpulses(dt: number): void {
     for (const body of this.bodies.values()) {
-      if (body.anchored) continue;
-
       const rb = this.rapierBodies.get(body.id);
 
-      // Apply body movers
+      // Apply body movers - anchored bodies included (a BodyGyro /
+      // BodyAngularVelocity on an anchored platform is the classic use;
+      // for anchored bodies the mover drives the mirror rotation, which
+      // the anchored sync branch pushes into the Rapier body).
       for (const mover of body.bodyMovers) {
         if (!mover.enabled) continue;
         this.applyBodyMover(body, mover, dt, rb);
       }
 
-      // Apply impulses
+      if (body.anchored) continue;
+
+      // Apply impulses (dynamic bodies only)
       const effMass = effectiveMass(body.mass);
       for (const impulse of body._impulses) {
         if (!impulse.applied) {
@@ -1944,39 +1950,80 @@ export class PhysicsWorld {
 
       case 'BodyVelocity':
         if (mover.velocity) {
-          const P = mover.P ?? 5000;
-          const maxForce = mover.maxForce ?? { x: Infinity, y: Infinity, z: Infinity };
-          for (const axis of ['x', 'y', 'z'] as const) {
-            const diff = mover.velocity[axis] - body.velocity[axis];
-            const force = signedClamp(diff * P, maxForce[axis]);
-            body.velocity[axis] += (force / effMass) * dt;
+          // WEBUILD FIX: set the velocity exactly (the BodyVelocity
+          // semantic) instead of feeding a P-servo into the overwritten
+          // mirror. The mirror path keeps the old servo math.
+          if (rb) {
+            rb.wakeUp();
+            rb.setLinvel({ x: mover.velocity.x, y: mover.velocity.y, z: mover.velocity.z }, true);
+            body.velocity.x = mover.velocity.x;
+            body.velocity.y = mover.velocity.y;
+            body.velocity.z = mover.velocity.z;
+          } else {
+            for (const axis of ['x', 'y', 'z'] as const) {
+              const diff = mover.velocity[axis] - body.velocity[axis];
+              const force = signedClamp(diff * (mover.P ?? 5000), (mover.maxForce ?? { x: Infinity, y: Infinity, z: Infinity })[axis]);
+              body.velocity[axis] += (force / effMass) * dt;
+            }
           }
         }
         break;
 
       case 'BodyPosition':
         if (mover.position) {
-          const P = mover.P ?? 5000;
-          const D = mover.D ?? 500;
-          const maxForce = mover.maxForce ?? { x: Infinity, y: Infinity, z: Infinity };
+          // WEBUILD FIX: the PD servo now reaches the Rapier body as a real
+          // impulse (J = dv * mass, the collider mass IS effectiveMass).
+          // dv is capped at half the remaining error per step so the
+          // infinite maxForce default converges instead of oscillating.
+          const dv: Record<'x' | 'y' | 'z', number> = { x: 0, y: 0, z: 0 };
           for (const axis of ['x', 'y', 'z'] as const) {
             const diff = mover.position[axis] - body.position[axis];
-            const force = signedClamp(diff * P - body.velocity[axis] * D, maxForce[axis]);
-            body.velocity[axis] += (force / effMass) * dt;
+            const force = signedClamp(diff * (mover.P ?? 5000) - body.velocity[axis] * (mover.D ?? 500), (mover.maxForce ?? { x: Infinity, y: Infinity, z: Infinity })[axis]);
+            let step = (force / effMass) * dt;
+            // Cap at half the remaining error per step - but never below
+            // twice the per-step gravity Δv, so a hovering target can
+            // actually fight gravity. (Without the floor the cap shrank
+            // faster than the error and the body sagged below the target.)
+            const cap = Math.max(0.5 * Math.abs(diff), 2 * Math.abs(this.effectiveGravity()) * dt);
+            if (Math.abs(step) > cap) step = Math.sign(step) * cap;
+            dv[axis] = step;
+          }
+          if (rb) {
+            rb.wakeUp();
+            rb.applyImpulse({ x: dv.x * effMass, y: dv.y * effMass, z: dv.z * effMass }, true);
+          } else {
+            body.velocity.x += dv.x;
+            body.velocity.y += dv.y;
+            body.velocity.z += dv.z;
           }
         }
         break;
 
       case 'BodyGyro':
         if (mover.cframe) {
-          const P = mover.P ?? 5000;
-          const maxTorque = mover.maxTorque ?? { x: Infinity, y: Infinity, z: Infinity };
+          // WEBUILD FIX: real torque impulse with the same convergence cap
+          // as BodyPosition (mirror path keeps the old math).
+          const dw: Record<'x' | 'y' | 'z', number> = { x: 0, y: 0, z: 0 };
           for (const axis of ['x', 'y', 'z'] as const) {
             const targetRad = (mover.cframe[axis] * Math.PI) / 180;
             const currentRad = (body.rotation[axis] * Math.PI) / 180;
             const diff = targetRad - currentRad;
-            const torque = signedClamp(diff * P, maxTorque[axis]);
-            body.angularVelocity[axis] += (torque / effMass) * dt * 0.1;
+            const torque = signedClamp(diff * (mover.P ?? 5000), (mover.maxTorque ?? { x: Infinity, y: Infinity, z: Infinity })[axis]);
+            let step = (torque / effMass) * dt * 0.1;
+            const cap = 0.5 * Math.abs(diff);
+            if (Math.abs(step) > cap) step = Math.sign(step) * cap;
+            dw[axis] = step;
+          }
+          if (rb && !body.anchored) {
+            rb.wakeUp();
+            rb.applyTorqueImpulse({ x: dw.x * effMass, y: dw.y * effMass, z: dw.z * effMass }, true);
+          } else {
+            // Anchored (or collider-less): rotate the mirror toward the
+            // target by the capped per-step amount.
+            body.rotation.x += dw.x * 180 / Math.PI;
+            body.rotation.y += dw.y * 180 / Math.PI;
+            body.rotation.z += dw.z * 180 / Math.PI;
+            body._anchoredDirty = true;
           }
         }
         break;
@@ -1995,12 +2042,24 @@ export class PhysicsWorld {
 
       case 'BodyAngularVelocity':
         if (mover.angularVelocity) {
-          const P = mover.P ?? 5000;
-          const maxTorque = mover.maxTorque ?? { x: Infinity, y: Infinity, z: Infinity };
-          for (const axis of ['x', 'y', 'z'] as const) {
-            const diff = mover.angularVelocity[axis] - body.angularVelocity[axis];
-            const torque = signedClamp(diff * P, maxTorque[axis]);
-            body.angularVelocity[axis] += (torque / effMass) * dt * 0.1;
+          // WEBUILD FIX: set the angular velocity exactly (mirror path
+          // keeps the old servo math).
+          if (rb && !body.anchored) {
+            rb.wakeUp();
+            rb.setAngvel({ x: mover.angularVelocity.x, y: mover.angularVelocity.y, z: mover.angularVelocity.z }, true);
+            body.angularVelocity.x = mover.angularVelocity.x;
+            body.angularVelocity.y = mover.angularVelocity.y;
+            body.angularVelocity.z = mover.angularVelocity.z;
+          } else {
+            // Anchored (or collider-less): spin the mirror rotation.
+            const degPerSec = 180 / Math.PI;
+            body.angularVelocity.x = mover.angularVelocity.x;
+            body.angularVelocity.y = mover.angularVelocity.y;
+            body.angularVelocity.z = mover.angularVelocity.z;
+            body.rotation.x += mover.angularVelocity.x * dt * degPerSec;
+            body.rotation.y += mover.angularVelocity.y * dt * degPerSec;
+            body.rotation.z += mover.angularVelocity.z * dt * degPerSec;
+            body._anchoredDirty = true;
           }
         }
         break;
@@ -2023,6 +2082,11 @@ export class PhysicsWorld {
         // updateBody/syncFromPart.
         if (body._anchoredDirty) {
           rb.setTranslation({ x: body.position.x, y: body.position.y, z: body.position.z }, false);
+          rb.setRotation(quatFromEulerXYZ(
+            body.rotation.x * Math.PI / 180,
+            body.rotation.y * Math.PI / 180,
+            body.rotation.z * Math.PI / 180,
+          ), false);
           body._anchoredDirty = false;
         }
         body.isGrounded = body.position.y <= 0.01;
@@ -2090,10 +2154,6 @@ export class PhysicsWorld {
   }
 
   // ─── Water Physics ───
-
-  private checkWaterState(): void {
-    // Water state is set externally via setWaterState
-  }
 
   setWaterState(bodyId: string, waterHeight: number): void {
     const body = this.bodies.get(bodyId);
@@ -2217,119 +2277,6 @@ export class PhysicsWorld {
     }
   }
 
-  // ─── Character Simulation (legacy compatibility) ───
-
-  stepCharacter(
-    character: CharacterState,
-    keys: Set<string>,
-    waterHeight: number | null,
-    dt: number
-  ): CharacterState {
-    const SPEED = DEFAULT_CHARACTER_SPEED;
-    const JUMP_FORCE = DEFAULT_JUMP_FORCE;
-    const grav = this.effectiveGravity();
-
-    // Movement input
-    let moveX = 0, moveZ = 0;
-    if (keys.has('w') || keys.has('arrowup')) moveZ -= SPEED;
-    if (keys.has('s') || keys.has('arrowdown')) moveZ += SPEED;
-    if (keys.has('a') || keys.has('arrowleft')) moveX -= SPEED;
-    if (keys.has('d') || keys.has('arrowright')) moveX += SPEED;
-
-    character.velocity.x = moveX;
-    character.velocity.z = moveZ;
-
-    // Gravity
-    character.velocity.y += grav * dt;
-
-    // Water check
-    character.isInWater = waterHeight !== null && character.position.y < waterHeight;
-    if (character.isInWater) {
-      const buoyancy = Math.abs(grav) * 0.85;
-      character.velocity.y += buoyancy * dt;
-      character.velocity.x *= (1 - WATER_DRAG * dt);
-      character.velocity.y *= (1 - WATER_DRAG * dt);
-      character.velocity.z *= (1 - WATER_DRAG * dt);
-      const forceMultiplier = [0, 0.2, 0.5, 1.0, 2.0][this.settings.waterForce] ?? 0.5;
-      character.velocity.x += this.settings.waterDirection.x * forceMultiplier * dt * 10;
-      character.velocity.z += this.settings.waterDirection.z * forceMultiplier * dt * 10;
-    }
-
-    // Jump
-    if (keys.has(' ') && character.isGrounded) {
-      character.velocity.y = JUMP_FORCE;
-      character.isGrounded = false;
-    }
-
-    // Integrate
-    character.position.x += character.velocity.x * dt;
-    character.position.y += character.velocity.y * dt;
-    character.position.z += character.velocity.z * dt;
-
-    // Ground collision
-    const charHalfHeight = 1.2475;
-    if (character.position.y - charHalfHeight < 0) {
-      character.position.y = charHalfHeight;
-      if (character.velocity.y < 0) character.velocity.y = 0;
-      character.isGrounded = true;
-    }
-
-    // Part collision
-    for (const body of this.bodies.values()) {
-      if (!body.canCollide) continue;
-      const aabb = computeAABB(body.position, body.size);
-      const charMinX = character.position.x - 0.5;
-      const charMaxX = character.position.x + 0.5;
-      const charMinY = character.position.y - charHalfHeight;
-      const charMaxY = character.position.y + charHalfHeight;
-      const charMinZ = character.position.z - 0.5;
-      const charMaxZ = character.position.z + 0.5;
-
-      if (
-        charMinX < aabb.maxX && charMaxX > aabb.minX &&
-        charMinY < aabb.maxY && charMaxY > aabb.minY &&
-        charMinZ < aabb.maxZ && charMaxZ > aabb.minZ
-      ) {
-        const overlapX1 = charMaxX - aabb.minX;
-        const overlapX2 = aabb.maxX - charMinX;
-        const overlapY1 = charMaxY - aabb.minY;
-        const overlapY2 = aabb.maxY - charMinY;
-        const overlapZ1 = charMaxZ - aabb.minZ;
-        const overlapZ2 = aabb.maxZ - charMinZ;
-        const minX = Math.min(overlapX1, overlapX2);
-        const minY = Math.min(overlapY1, overlapY2);
-        const minZ = Math.min(overlapZ1, overlapZ2);
-
-        if (minY <= minX && minY <= minZ) {
-          if (overlapY1 < overlapY2) {
-            character.position.y = aabb.minY - charHalfHeight;
-          } else {
-            character.position.y = aabb.maxY + charHalfHeight;
-            character.isGrounded = true;
-          }
-          if (character.velocity.y < 0 && overlapY1 >= overlapY2) {
-            character.velocity.y = 0;
-          } else if (character.velocity.y > 0 && overlapY1 < overlapY2) {
-            character.velocity.y = 0;
-          }
-        } else if (minX <= minZ) {
-          if (overlapX1 < overlapX2) {
-            character.position.x = aabb.minX - 0.5;
-          } else {
-            character.position.x = aabb.maxX + 0.5;
-          }
-        } else {
-          if (overlapZ1 < overlapZ2) {
-            character.position.z = aabb.minZ - 0.5;
-          } else {
-            character.position.z = aabb.maxZ + 0.5;
-          }
-        }
-      }
-    }
-
-    return character;
-  }
 }
 
 /** A part's effective friction (its own override or its material default). */
@@ -2364,115 +2311,4 @@ export function aabbOverlap(a: AABB, b: AABB): boolean {
     a.minY <= b.maxY && a.maxY >= b.minY &&
     a.minZ <= b.maxZ && a.maxZ >= b.minZ
   );
-}
-
-// Legacy compatibility exports
-export function partToPhysicsBody(part: StudioPart): PhysicsBody {
-  const mass = calculateMass(part.type, part.size, part.material, part.density);
-  const material = getMaterialProps(part.material);
-  return {
-    id: part.id,
-    position: { ...part.position },
-    velocity: { x: 0, y: 0, z: 0 },
-    angularVelocity: { x: 0, y: 0, z: 0 },
-    size: { ...part.size },
-    rotation: { ...part.rotation },
-    mass,
-    anchored: part.anchored,
-    canCollide: part.canCollide,
-    friction: part.friction ?? material.friction,
-    elasticity: part.elasticity ?? material.elasticity,
-    isGrounded: false,
-    isAwake: true,
-    isInWater: false,
-    bodyMovers: [...(part.bodyMovers || [])],
-    partType: part.type,
-    _impulses: [],
-  };
-}
-
-// Legacy stepPhysics function for backwards compatibility
-export function stepPhysics(bodies: PhysicsBody[], deltaTime: number): void {
-  const dt = Math.min(deltaTime, 1 / 30);
-  for (const body of bodies) {
-    body.isGrounded = false;
-    if (!body.anchored) {
-      body.velocity.y += GRAVITY * dt;
-    }
-  }
-  for (const body of bodies) {
-    if (!body.anchored) {
-      body.position.x += body.velocity.x * dt;
-      body.position.y += body.velocity.y * dt;
-      body.position.z += body.velocity.z * dt;
-    }
-  }
-  for (let i = 0; i < bodies.length; i++) {
-    for (let j = i + 1; j < bodies.length; j++) {
-      const a = bodies[i], b = bodies[j];
-      if (a.anchored && b.anchored) continue;
-      if (!a.canCollide || !b.canCollide) continue;
-      const aAABB = computeAABB(a.position, a.size);
-      const bAABB = computeAABB(b.position, b.size);
-      if (!aabbOverlap(aAABB, bAABB)) continue;
-      if (a.anchored) {
-        resolveCollision(b, a);
-      } else if (b.anchored) {
-        resolveCollision(a, b);
-      } else {
-        resolveCollision(a, b);
-      }
-    }
-  }
-}
-
-function resolveCollision(moving: PhysicsBody, static_: PhysicsBody): { resolved: boolean; normal: { x: number; y: number; z: number } } {
-  if (moving.anchored || !static_.canCollide || !moving.canCollide) {
-    return { resolved: false, normal: { x: 0, y: 0, z: 0 } };
-  }
-  const movingAABB = computeAABB(moving.position, moving.size);
-  const staticAABB = computeAABB(static_.position, static_.size);
-  if (!aabbOverlap(movingAABB, staticAABB)) {
-    return { resolved: false, normal: { x: 0, y: 0, z: 0 } };
-  }
-  const overlapX1 = movingAABB.maxX - staticAABB.minX;
-  const overlapX2 = staticAABB.maxX - movingAABB.minX;
-  const overlapY1 = movingAABB.maxY - staticAABB.minY;
-  const overlapY2 = staticAABB.maxY - movingAABB.minY;
-  const overlapZ1 = movingAABB.maxZ - staticAABB.minZ;
-  const overlapZ2 = staticAABB.maxZ - movingAABB.minZ;
-  const minOverlapX = Math.min(overlapX1, overlapX2);
-  const minOverlapY = Math.min(overlapY1, overlapY2);
-  const minOverlapZ = Math.min(overlapZ1, overlapZ2);
-  const normal = { x: 0, y: 0, z: 0 };
-  if (minOverlapY <= minOverlapX && minOverlapY <= minOverlapZ) {
-    if (overlapY1 < overlapY2) {
-      moving.position.y -= minOverlapY;
-      normal.y = -1;
-    } else {
-      moving.position.y += minOverlapY;
-      normal.y = 1;
-      moving.isGrounded = true;
-    }
-    moving.velocity.y = 0;
-  } else if (minOverlapX <= minOverlapZ) {
-    if (overlapX1 < overlapX2) {
-      moving.position.x -= minOverlapX;
-      normal.x = -1;
-    } else {
-      moving.position.x += minOverlapX;
-      normal.x = 1;
-    }
-    moving.velocity.x = 0;
-  } else {
-    if (overlapZ1 < overlapZ2) {
-      moving.position.z -= minOverlapZ;
-      normal.z = -1;
-    } else {
-      moving.position.z += minOverlapZ;
-      normal.z = 1;
-    }
-    moving.velocity.z = 0;
-  }
-  return { resolved: true, normal };
 }

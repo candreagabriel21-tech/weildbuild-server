@@ -208,7 +208,6 @@ async function main(): Promise<void> {
   const { useStudioStore, isPart } = await import('../../../engine/studio-store');
   const { restoreStudioState } = await import('../../../engine/studio-project');
   const { weildCodeEngine } = await import('../../../engine/weildcode-engine');
-  const { weluRuntime } = await import('../../../engine/welu/welu-runtime');
   const { PhysicsWorld } = await import('../../../engine/game-engine/physics');
 
   type StudioPart = import('../../../engine/studio-store').StudioPart;
@@ -510,7 +509,6 @@ async function main(): Promise<void> {
       // v7: fire the on_player_died game rules (once per death).
       pushStats(p);
       try { weildCodeEngine.handlePlayerDied(p.username); } catch { /* never kill the sim */ }
-        try { weluRuntime.handlePlayerDied(p.username); } catch { /* never kill the sim */ }
     }
   }
 
@@ -566,7 +564,6 @@ async function main(): Promise<void> {
         if (p.hp < before) {
           pushStats(p);
           try { weildCodeEngine.handlePlayerDamaged(p.username, p.hp - before, p.hp); } catch { /* never kill the sim */ }
-          try { weluRuntime.handlePlayerDamaged(p.username, p.hp - before, p.hp); } catch { /* never kill the sim */ }
         }
         // pass 15: die at hp < 1, not hp <= 0. The HUD rounds HP UP, so a
         // player at 0.9 hp shows 1 pip and never dies. < 1 catches that.
@@ -579,7 +576,6 @@ async function main(): Promise<void> {
         if (p.hp < before) {
           pushStats(p);
           try { weildCodeEngine.handlePlayerDamaged(p.username, p.hp - before, p.hp); } catch { /* never kill the sim */ }
-          try { weluRuntime.handlePlayerDamaged(p.username, p.hp - before, p.hp); } catch { /* never kill the sim */ }
         }
         if (p.hp < 1) { p.hp = 0; killPlayer(p); }
         break;
@@ -708,7 +704,6 @@ async function main(): Promise<void> {
         partsKeyframeDirty = true;
         // v1.5: game rules - on_player_join (optional username filter).
         try { weildCodeEngine.handlePlayerJoined(username); } catch { /* never kill the sim */ }
-        try { weluRuntime.handlePlayerJoined(username); } catch { /* never kill the sim */ }
       }
     } else if (m.t === 'playerLeave' && typeof m.socketId === 'string') {
       const leaving = players.get(m.socketId);
@@ -716,7 +711,6 @@ async function main(): Promise<void> {
       // v1.5: game rules - on_player_leave.
       if (leaving) {
         try { weildCodeEngine.handlePlayerLeft(leaving.username); } catch { /* never kill the sim */ }
-        try { weluRuntime.handlePlayerLeft(leaving.username); } catch { /* never kill the sim */ }
       }
     } else if (m.t === 'pstate' && typeof m.socketId === 'string') {
       // ─── v6.2.6: the 0.25 s client state report (THE player channel) ───
@@ -734,13 +728,11 @@ async function main(): Promise<void> {
       const username = typeof m.username === 'string' ? m.username : undefined;
       setEngineActorPos(username);
       try { weildCodeEngine.handleClick(m.partId, username); } catch { /* rules must never kill the sim */ }
-        try { weluRuntime.handleClick(m.partId, username); } catch { /* never kill the sim */ }
     } else if (m.t === 'chat' && typeof m.message === 'string') {
       // v1.5: game rules - on_chat_message (optional username/contains filters).
       const username = String(m.username || 'Player');
       setEngineActorPos(username);
       try { weildCodeEngine.handleChatMessage(username, String(m.message)); } catch { /* never kill the sim */ }
-        try { weluRuntime.handleChat(username, String(m.message)); } catch { /* never kill the sim */ }
     } else if (m.t === 'getWorldState') {
       // ─── v6.2.7: full-state sync for a late joiner ───
       // The gamehost only asks when the instance was already lived-in
@@ -822,7 +814,6 @@ async function main(): Promise<void> {
         // must see THIS player's reported spot, not a stale value.)
         setEngineActorPos(p.username);
         try { weildCodeEngine.handleTouch(id, 'player', p.username); } catch { /* never kill the sim */ }
-          try { weluRuntime.handleTouch(id, 'player', p.username); } catch { /* never kill the sim */ }
       }
       p.touched = stillTouched;
     }
@@ -864,7 +855,6 @@ async function main(): Promise<void> {
         // "a player fell off the world" the same as any other death).
         pushStats(p);
         try { weildCodeEngine.handlePlayerDied(p.username); } catch { /* never kill the sim */ }
-        try { weluRuntime.handlePlayerDied(p.username); } catch { /* never kill the sim */ }
       }
     }
 
@@ -972,7 +962,6 @@ async function main(): Promise<void> {
         // terrain, the baseplate, or another part). Rules with a
         // partNames filter won't match this call.
         try { weildCodeEngine.handleTouch(id, 'parts'); } catch { /* never kill the sim */ }
-        try { weluRuntime.handleTouch(id, 'parts'); } catch { /* never kill the sim */ }
 
         // v7.1 NEW: also fire when_touched on the part `id` landed on (if
         // it's another part). This is the correct "something touched me"
@@ -995,7 +984,6 @@ async function main(): Promise<void> {
           if (Math.abs(otherTop - idBottom) > 0.25) return;
           // Found the part `id` landed on. Fire the rule on it.
           try { weildCodeEngine.handleTouch(other.id, 'parts', undefined, touchingName); } catch { /* never kill the sim */ }
-          try { weluRuntime.handleTouch(other.id, 'parts', undefined, touchingName); } catch { /* never kill the sim */ }
         });
       }
       (pb as any)._wasGrounded = pb.isGrounded;
@@ -1342,10 +1330,6 @@ async function main(): Promise<void> {
   // Start the rules engine (single authority).
   try {
     weildCodeEngine.start();
-    // v7.4: WeLua runs on the gamehost with FULL world authority —
-    // scripts' world changes apply for everyone; player-only effects go
-    // through the same per-player effect queue the rules use.
-    try { weluRuntime.setWorldAuthority(true); weluRuntime.start(); } catch (e) { console.error('[WeLua] gamehost start failed', e); }
   } catch (e: any) {
     console.warn('[world-runtime] engine start failed (continuing physics-only):', e?.message);
   }
@@ -1407,7 +1391,6 @@ async function main(): Promise<void> {
     running = false;
     clearInterval(tick);
     try { weildCodeEngine.stop(); } catch { /* already stopped */ }
-    try { weluRuntime.stop(); } catch { /* already stopped */ }
     post({ t: 'stopped' });
     setTimeout(() => process.exit(0), 50).unref();
   }
