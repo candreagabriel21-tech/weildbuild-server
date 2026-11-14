@@ -1,5 +1,5 @@
 // ═══════════════════════════════════════════════════════════════════
-// WeLua — Stage 3: the interpreter (generator-based tree walker)
+// WeLua - Stage 3: the interpreter (generator-based tree walker)
 // ═══════════════════════════════════════════════════════════════════
 // Every eval/exec method is a JS generator. A native builtin written as
 // a generator function can `yield` a SuspendSignal; the signal bubbles
@@ -12,7 +12,7 @@
 //   • multiple returns + varargs
 //   • metatables: __index, __newindex, __call, __tostring, __pairs
 //   • the standard library (base, math, string with real Lua patterns,
-//     table, a sandboxed os subset) — no io / no files / no os.execute
+//     table, a sandboxed os subset) - no io / no files / no os.execute
 //   • a step + wall-clock budget so an infinite loop kills ONE script,
 //     never the game (FatalLuaError is not catchable by pcall)
 
@@ -67,7 +67,7 @@ export class LuaTable {
     if (!this.map.has(1)) return 0;
     let j = 1;
     while (this.map.has(j * 2)) j *= 2;
-    // j is present and 2j is absent — binary-search a border in (j, 2j]
+    // j is present and 2j is absent - binary-search a border in (j, 2j]
     let lo = j, hi = j * 2;
     while (lo + 1 < hi) {
       const mid = Math.floor((lo + hi) / 2);
@@ -123,7 +123,7 @@ export class LuaError extends Error {
   }
 }
 
-/** Budget exhaustion / host kill — pcall must NOT swallow this. */
+/** Budget exhaustion / host kill - pcall must NOT swallow this. */
 export class FatalLuaError extends Error {
   constructor(message: string) {
     super(message);
@@ -544,7 +544,7 @@ export class LuaInterpreter {
         }
       }
       if (f.nativeGen) {
-        // suspending native — drive its generator, forwarding yields to the host
+        // suspending native - drive its generator, forwarding yields to the host
         let gen: Generator<YieldSignal, LuaValue | LuaValue[] | void, unknown>;
         try {
           gen = f.nativeGen(this, args);
@@ -585,7 +585,7 @@ export class LuaInterpreter {
    * Drive a call to completion WITHOUT allowing suspends. pcall, sort,
    * gsub and the __index/__newindex paths all suspend properly now, so
    * this is only reached from direct TS callers (e.g. __tostring inside
-   * tostring/print) — a welu.wait() there is reported clearly.
+   * tostring/print) - a welu.wait() there is reported clearly.
    */
   syncCall(fn: LuaValue, args: LuaValue[], line = 0): LuaValue[] {
     const gen = this.callValue(fn, args, line);
@@ -598,7 +598,7 @@ export class LuaInterpreter {
 
   // ─── indexing with metatables ───
   // The generator versions (used by the interpreter's own paths) let an
-  // __index/__newindex FUNCTION suspend — welu.wait inside a metamethod
+  // __index/__newindex FUNCTION suspend - welu.wait inside a metamethod
   // works. The plain sync versions remain for TS-side callers that need
   // a value immediately (they error if the metamethod tries to wait).
 
@@ -815,7 +815,7 @@ function argTable(ip: LuaInterpreter, args: LuaValue[], i: number): LuaTable {
   return v;
 }
 
-/** print() sink — the runtime replaces this to write into the studio console. */
+/** print() sink - the runtime replaces this to write into the studio console. */
 let weluPrintSink: (line: string) => void = (line) => {
   // eslint-disable-next-line no-console
   console.log(`[WeLua] ${line}`);
@@ -1139,7 +1139,7 @@ function installStdlib(interp: LuaInterpreter): void {
       if (typeof a === 'string' && typeof b === 'string') return a < b;
       throw new LuaError('attempt to compare two incomparable values');
     };
-    // merge sort (stable — Lua's table.sort isn't, but stable is friendlier)
+    // merge sort (stable - Lua's table.sort isn't, but stable is friendlier)
     const merged: LuaValue[] = new Array(arr.length);
     const mergeSort = function* (lo: number, hi: number): Generator<YieldSignal, void, unknown> {
       if (hi - lo < 2) return;

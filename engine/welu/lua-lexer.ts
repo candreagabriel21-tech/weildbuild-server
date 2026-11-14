@@ -1,5 +1,5 @@
 // ═══════════════════════════════════════════════════════════════════
-// WeLua — the WeildBuild scripting language (Lua dialect)
+// WeLua - the WeildBuild scripting language (Lua dialect)
 // ─── Stage 1: the lexer ───
 // ═══════════════════════════════════════════════════════════════════
 // WeLua is real Lua (5.4-flavoured) so players can code with actual
@@ -156,7 +156,7 @@ export function tokenize(source: string): Token[] {
           i = end + close.length;
           continue;
         }
-        // not a long comment after all — treat as line comment
+        // not a long comment after all - treat as line comment
       }
       // line comment
       while (i < n && source[i] !== '\n') i++;

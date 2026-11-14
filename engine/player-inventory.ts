@@ -1,5 +1,5 @@
 // ═══════════════════════════════════════════════════════════════════
-// Player Inventory — runtime manager for play mode
+// Player Inventory - runtime manager for play mode
 // ═══════════════════════════════════════════════════════════════════
 // Owns everything about items while a game runs:
 //
@@ -13,12 +13,12 @@
 //
 // Items come from two places: the PROJECT inventory (the creator's
 // starter items, seeded at play start) and parts grabbed during play.
-// Everything is runtime-only — stopping play restores the world.
+// Everything is runtime-only - stopping play restores the world.
 //
 // Equipped items also spawn their template into the world as hidden
 // parts (showInWorld=false, non-collidable). That gives their rules
 // (when_used / when_equipped / when_touched...) a REAL part context to
-// run against — the same trick the engine uses for every other rule.
+// run against - the same trick the engine uses for every other rule.
 
 import * as THREE from 'three';
 import {
@@ -32,7 +32,7 @@ import { playSound } from './sounds';
 
 // ─── Bridges (module singletons, like TSF_PLAYER_BRIDGE) ───
 
-/** The local player's live transform — written every frame by the play
+/** The local player's live transform - written every frame by the play
  *  viewport, read by the held-item renderer + drop positioning. */
 export const WB_INVENTORY_BRIDGE = {
   x: 0, y: 0, z: 0,
@@ -66,7 +66,7 @@ export interface InventoryItemRuntime {
   itemId: string;
   name: string;
   sourceType: 'part' | 'group';
-  /** serialized subtree (parts + models) — the spawn/held template */
+  /** serialized subtree (parts + models) - the spawn/held template */
   objects: StudioObject[];
   /** root id within `objects` */
   rootId: string;
@@ -226,6 +226,42 @@ class PlayerInventoryManager {
       this.deselect();
     }
     this.bump();
+  }
+
+  /**
+   * Swap semantics for drag & drop: the dragged item takes `slot`; whatever
+   * sat there (or held the dragged item's old slot) ends up where the drag
+   * came from, or back in the backpack. Used by both the on-screen hotbar
+   * and the inventory dialog (the dialog has NO hotbar of its own - it
+   * drags into / out of the real bar).
+   */
+  swapSlotWithItem(slot: number, itemId: string): void {
+    if (!this.active || slot < 0 || slot >= HOTBAR_SLOT_COUNT) return;
+    const fromSlot = this.slots.indexOf(itemId);
+    const occupant = this.slots[slot];
+    if (fromSlot === slot) return;
+    this.slots[slot] = itemId;
+    if (fromSlot >= 0) this.slots[fromSlot] = occupant ?? null; // hotbar-to-hotbar exchange
+    // fromSlot < 0 (dragged from the backpack): the occupant simply falls
+    // back to the backpack because it is no longer in any slot.
+    if (this.selectedSlot !== null && !this.slots[this.selectedSlot]) {
+      this.deselect();
+    }
+    this.bump();
+  }
+
+  /** Directly exchange the contents of two hotbar slots. */
+  swapSlots(a: number, b: number): void {
+    if (!this.active || a < 0 || b < 0 || a >= HOTBAR_SLOT_COUNT || b >= HOTBAR_SLOT_COUNT || a === b) return;
+    const tmp = this.slots[a];
+    this.slots[a] = this.slots[b];
+    this.slots[b] = tmp;
+    this.bump();
+  }
+
+  /** The slot an item currently occupies, or -1 (backpack). */
+  slotOf(itemId: string): number {
+    return this.slots.indexOf(itemId);
   }
 
   // ─── use (swing + fire rules) ───
@@ -530,7 +566,7 @@ class PlayerInventoryManager {
       }
       nodeIds.push(clone.id);
       if (isPart(clone)) {
-        // hidden, non-physical, parked at the player — pure rule context
+        // hidden, non-physical, parked at the player - pure rule context
         clone.showInWorld = false;
         clone.canCollide = false;
         clone.anchored = true;

@@ -1,9 +1,9 @@
 // ═══════════════════════════════════════════════════════════════════
-// WeLua — the runtime: scheduler + `welu` world API + event dispatch
+// WeLua - the runtime: scheduler + `welu` world API + event dispatch
 // ═══════════════════════════════════════════════════════════════════
 // One WeluRuntime instance runs while the game plays (same lifecycle as
 // the WeildCode engine: started/stopped by PhysicsSimulation / the
-// toolbar's stop paths). Every user script runs as a "thread" — a JS
+// toolbar's stop paths). Every user script runs as a "thread" - a JS
 // generator driven by the scheduler:
 //
 //   • welu.wait(t) yields a wait signal; the scheduler resumes later
@@ -12,7 +12,7 @@
 //
 // The world API mirrors what the block-rule engine can do (parts, the
 // player, effects, variables, weather...) plus the NEW systems (items,
-// the camera bridge), so Lua scripts can build anything blocks can —
+// the camera bridge), so Lua scripts can build anything blocks can -
 // and more.
 
 import {
@@ -35,12 +35,16 @@ interface WeluThread {
   label: string;
   /** The player whose event spawned this thread (server effect routing). */
   actor: string | null;
+  /** The part the script/callback belongs to (welu.this() inside it). */
+  partId: string | null;
 }
 
 interface WeluTimer {
   intervalSeconds: number;
   fn: LuaValue;
   nextAt: number;
+  /** welu.after: run once, then drop. */
+  once: boolean;
 }
 
 interface PartScriptBinding {
@@ -56,11 +60,14 @@ export const WB_CAMERA_BRIDGE = {
   yaw: null as number | null,
   pitch: null as number | null,
   nonce: 0,
+  /** TRUE from the first welu.camera write until release(): the play
+   * viewport then lets the script own the camera every frame. */
+  active: false,
 };
 
 const MAX_THREADS = 400;
-const MAX_TIMERS = 64;
-const MAX_TICK_CALLBACKS = 64;
+const MAX_TIMERS = 256;
+const MAX_TICK_CALLBACKS = 256;
 
 function nowMs(): number {
   return typeof performance !== 'undefined' ? performance.now() : Date.now();
@@ -103,10 +110,17 @@ class WeluRuntime {
   private currentScriptPartId: string | null = null;
   private localUsername = 'Player';
 
+  // Browser-only bridge: the rule engine announces player damage/death as
+  // window events (no import cycle); we route them to onPlayerDamaged /
+  // onPlayerDied handlers. The gamehost dispatches to both engines
+  // directly, so this only matters for local (browser) play.
+  private windowBound = false;
+  private windowHandlers: Array<[string, EventListener]> = [];
+
   // ─── multiplayer authority ───
   // TRUE on singleplayer/Test Play and on the gamehost (the authority).
   // FALSE on clients in server-authoritative multiplayer: their scripts
-  // still RUN (player-only code executes on the player's own machine —
+  // still RUN (player-only code executes on the player's own machine -
   // zero latency), but world writes are gated off because the server
   // streams the real state.
   private worldAuthority = true;
@@ -166,6 +180,7 @@ class WeluRuntime {
     this.grabbedHandlers = [];
     this.droppedHandlers = [];
 
+    this.bindWindowEvents();
     this.interp = new LuaInterpreter({ sliceMs: 80, maxSteps: 1_500_000 });
     setPrintSink((line) => {
       useStudioStore.getState().addConsoleMessage('info', `[WeLua] ${line}`);
@@ -198,8 +213,32 @@ class WeluRuntime {
     this.tick();
   }
 
+  private bindWindowEvents(): void {
+    if (this.windowBound || typeof window === 'undefined') return;
+    this.windowBound = true;
+    const onDamaged = (e: Event) => {
+      const d = (e as CustomEvent).detail || {};
+      this.handlePlayerDamaged(String(d.username ?? ''), Number(d.amount ?? 0), Number(d.healthAfter ?? 0));
+    };
+    const onDied = (e: Event) => {
+      const d = (e as CustomEvent).detail || {};
+      this.handlePlayerDied(String(d.username ?? ''));
+    };
+    window.addEventListener('wb:player-damaged', onDamaged);
+    window.addEventListener('wb:player-died', onDied);
+    this.windowHandlers = [['wb:player-damaged', onDamaged], ['wb:player-died', onDied]];
+  }
+
+  private unbindWindowEvents(): void {
+    if (!this.windowBound || typeof window === 'undefined') return;
+    for (const [name, fn] of this.windowHandlers) window.removeEventListener(name, fn);
+    this.windowHandlers = [];
+    this.windowBound = false;
+  }
+
   stop(): void {
     this.running = false;
+    this.unbindWindowEvents();
     this.cancelSchedule();
     this.threads = [];
     this.timers = [];
@@ -218,7 +257,7 @@ class WeluRuntime {
       this.currentScriptPartId = partId;
       const gen = ip.runChunk(chunk, this.makeScriptScope(partId));
       // Run the chunk to its first suspend (a top-level welu.wait).
-      this.spawnThread(gen, script.name, true);
+      this.spawnThread(gen, script.name, true, null, partId);
       this.currentScriptPartId = prev;
     } catch (e) {
       this.currentScriptPartId = null;
@@ -272,11 +311,13 @@ class WeluRuntime {
       }
     }
 
-    // 2) timers
-    for (const timer of this.timers) {
+    // 2) timers (welu.after entries fire once and are removed)
+    for (let ti = this.timers.length - 1; ti >= 0; ti--) {
+      const timer = this.timers[ti];
       if (timer.nextAt <= now) {
-        timer.nextAt = now + timer.intervalSeconds * 1000;
-        this.invokeCallback(timer.fn, [], `timer(${timer.intervalSeconds}s)`);
+        if (timer.once) this.timers.splice(ti, 1);
+        else timer.nextAt = now + timer.intervalSeconds * 1000;
+        this.invokeCallback(timer.fn, [], timer.once ? `after(${timer.intervalSeconds}s)` : `timer(${timer.intervalSeconds}s)`);
       }
     }
 
@@ -284,7 +325,7 @@ class WeluRuntime {
     if (this.tickCallbacks.length > 0) {
       const callbacks = this.tickCallbacks.slice(0, MAX_TICK_CALLBACKS);
       for (const cb of callbacks) {
-        this.invokeCallback(cb.fn, [dt], 'onTick');
+        this.invokeCallback(cb.fn, [dt], 'onTick', null, cb.partId);
       }
     }
 
@@ -293,8 +334,8 @@ class WeluRuntime {
   }
 
   /** Spawn a thread and run it until it finishes or suspends. */
-  private spawnThread(gen: Generator<unknown, unknown, unknown>, label: string, immediate = true, actor: string | null = null): void {
-    const th: WeluThread = { id: ++this.threadSeq, gen, resumeAt: null, label, actor };
+  private spawnThread(gen: Generator<unknown, unknown, unknown>, label: string, immediate = true, actor: string | null = null, partId: string | null = null): void {
+    const th: WeluThread = { id: ++this.threadSeq, gen, resumeAt: null, label, actor, partId };
     this.threads.push(th);
     if (immediate) this.resumeThread(th);
   }
@@ -304,7 +345,9 @@ class WeluRuntime {
     if (!ip) return;
     ip.beginSlice();
     const prevActor = this.currentActor;
+    const prevPartId = this.currentScriptPartId;
     this.currentActor = th.actor; // player API routes effects to the acting player
+    this.currentScriptPartId = th.partId; // welu.this() works inside callbacks
     try {
       const r = th.gen.next();
       if (r.done) {
@@ -327,20 +370,21 @@ class WeluRuntime {
       this.reportError(e, th.label);
     } finally {
       this.currentActor = prevActor;
+      this.currentScriptPartId = prevPartId;
     }
   }
 
   /** Run a Lua callback as a short thread. */
-  private invokeCallback(fn: LuaValue, args: LuaValue[], label: string, actor: string | null = null): void {
+  private invokeCallback(fn: LuaValue, args: LuaValue[], label: string, actor: string | null = null, partId: string | null = null): void {
     const ip = this.interp;
     if (!ip || !ip.isCallable(fn)) return;
     if (this.threads.length > MAX_THREADS) {
-      useStudioStore.getState().addConsoleMessage('warn', `[WeLua] Too many running scripts — dropping a "${label}" callback.`);
+      useStudioStore.getState().addConsoleMessage('warn', `[WeLua] Too many running scripts - dropping a "${label}" callback.`);
       return;
     }
     try {
       const gen = ip.startCall(fn, args);
-      this.spawnThread(gen, label, true, actor);
+      this.spawnThread(gen, label, true, actor, partId);
     } catch (e) {
       this.reportError(e, label);
     }
@@ -376,7 +420,7 @@ class WeluRuntime {
   handleClick(partId: string, actor?: string): void {
     if (!this.running) return;
     for (const h of this.clickHandlers) {
-      if (h.partId === partId) this.invokeCallback(h.fn, [], `onClick(${partId})`, actor ?? null);
+      if (h.partId === partId) this.invokeCallback(h.fn, [], `onClick(${partId})`, actor ?? null, partId);
     }
   }
 
@@ -384,7 +428,7 @@ class WeluRuntime {
     if (!this.running) return;
     for (const h of this.touchHandlers) {
       if (h.partId === partId) {
-        this.invokeCallback(h.fn, [actorName ?? actor ?? '', touchType === 'player'], `onTouch(${partId})`, actor ?? null);
+        this.invokeCallback(h.fn, [actorName ?? actor ?? '', touchType === 'player'], `onTouch(${partId})`, actor ?? null, partId);
       }
     }
   }
@@ -392,7 +436,7 @@ class WeluRuntime {
   handleDestroyed(partId: string): void {
     if (!this.running) return;
     for (const h of this.destroyHandlers) {
-      if (h.partId === partId) this.invokeCallback(h.fn, [], `onDestroy(${partId})`);
+      if (h.partId === partId) this.invokeCallback(h.fn, [], `onDestroy(${partId})`, null, partId);
     }
     this.handleCache.delete(partId);
   }
@@ -463,6 +507,7 @@ class WeluRuntime {
     let handle = this.handleCache.get(partId);
     if (handle) return handle;
     handle = new LuaTable();
+    handle.set('__wbPartId', partId); // raw field so native helpers can resolve the part
     const runtime = this;
     const ip = this.interp!;
 
@@ -484,7 +529,7 @@ class WeluRuntime {
 
     // methods
     const define = (name: string, fn: (ip2: LuaInterpreter, args: LuaValue[]) => LuaValue | LuaValue[] | void) => {
-      handle!.set(name, { native: fn } as LuaFunction);
+      handle!.set(name, { native: (ip2, args) => fn(ip2, stripSelf(handle, args)) } as LuaFunction);
     };
     const getSelf = (): StudioPart | undefined => {
       const obj = useStudioStore.getState().objects.get(partId);
@@ -640,6 +685,7 @@ class WeluRuntime {
     copy.rules = undefined; // rules do NOT travel with clones (same as block rules)
     copy.weluScripts = undefined;
     store.addObject(copy);
+    this.handlePartCreated(copy.id);
     return copy;
   }
 
@@ -721,13 +767,13 @@ class WeluRuntime {
       name: string,
       impl: (ip2: LuaInterpreter, args: LuaValue[]) => LuaValue | LuaValue[] | void,
     ) => {
-      welu.set(name, { native: impl } as LuaFunction);
+      welu.set(name, { native: (ip2, args) => impl(ip2, stripSelf(welu, args)) } as LuaFunction);
     };
     const genFn = (
       name: string,
       impl: (ip2: LuaInterpreter, args: LuaValue[]) => Generator<unknown, LuaValue | LuaValue[] | void, unknown>,
     ) => {
-      welu.set(name, { nativeGen: impl } as unknown as LuaFunction);
+      welu.set(name, { nativeGen: (ip2, args) => impl(ip2, stripSelf(welu, args)) } as unknown as LuaFunction);
     };
 
     // ── util ──
@@ -762,6 +808,114 @@ class WeluRuntime {
       const volume = args.length > 1 ? clamp01(ip2.toNumber(args[1])) : 0.5;
       void playSound(name, volume);
     });
+
+    // ── threads + timers + vector helpers (the "do almost anything" kit) ──
+    fn('spawn', (ip2, args) => {
+      const cb = args[0];
+      if (!ip2.isCallable(cb) || this.threads.length >= MAX_THREADS) return;
+      const gen = ip2.startCall(cb, []);
+      this.spawnThread(gen, 'spawn()');
+    });
+    fn('after', (ip2, args) => {
+      const seconds = Math.max(0.05, clampNum(ip2.toNumber(args[0] ?? 1), 0.05, 3600));
+      const cb = args[1];
+      if (ip2.isCallable(cb) && this.timers.length < MAX_TIMERS) {
+        this.timers.push({ intervalSeconds: seconds, fn: cb, nextAt: nowMs() + seconds * 1000, once: true });
+      }
+    });
+    fn('every', (ip2, args) => {
+      const seconds = Math.max(0.05, clampNum(ip2.toNumber(args[0] ?? 1), 0.05, 3600));
+      const cb = args[1];
+      if (ip2.isCallable(cb) && this.timers.length < MAX_TIMERS) {
+        this.timers.push({ intervalSeconds: seconds, fn: cb, nextAt: nowMs() + seconds * 1000, once: false });
+      }
+    });
+
+    /** Resolve a Lua arg that may be a part handle or a {x,y,z} table. */
+    const argToVec = (ip2b: LuaInterpreter, v: LuaValue): Vector3 | null => {
+      if (v instanceof LuaTable) {
+        const pid = v.get('__wbPartId');
+        if (typeof pid === 'string') {
+          const part = useStudioStore.getState().objects.get(pid);
+          if (part && isPart(part)) return { ...part.position };
+        }
+        return tableToVec(v);
+      }
+      return null;
+    };
+    fn('distance', (ip2, args) => {
+      const a = argToVec(ip2, args[0]);
+      const b = argToVec(ip2, args[1]);
+      if (!a || !b) return 0;
+      return Math.hypot(a.x - b.x, a.y - b.y, a.z - b.z);
+    });
+    fn('magnitude', (ip2, args) => {
+      const a = argToVec(ip2, args[0]);
+      return a ? Math.hypot(a.x, a.y, a.z) : 0;
+    });
+    fn('lerp', (ip2, args) => {
+      const a = argToVec(ip2, args[0]);
+      const b = argToVec(ip2, args[1]);
+      const t = Math.max(0, Math.min(1, ip2.toNumber(args[2] ?? 0)));
+      if (!a || !b) return null;
+      return vecToTable({ x: a.x + (b.x - a.x) * t, y: a.y + (b.y - a.y) * t, z: a.z + (b.z - a.z) * t });
+    });
+    fn('moveTowards', (ip2, args) => {
+      if (!runtime.canWriteWorld()) return null; // clients: the server owns the world
+      const h = args[0];
+      const partId = h instanceof LuaTable ? h.get('__wbPartId') : null;
+      const target = tableToVec(args[1]);
+      const step = Math.max(0, ip2.toNumber(args[2] ?? 1));
+      if (typeof partId !== 'string' || !target) return null;
+      const store = useStudioStore.getState();
+      const part = store.objects.get(partId);
+      if (!part || !isPart(part)) return null;
+      const dx = target.x - part.position.x;
+      const dy = target.y - part.position.y;
+      const dz = target.z - part.position.z;
+      const len = Math.hypot(dx, dy, dz);
+      const np = len < 1e-6 || len <= step
+        ? { ...target }
+        : { x: part.position.x + (dx / len) * step, y: part.position.y + (dy / len) * step, z: part.position.z + (dz / len) * step };
+      store.updateObject(partId, { position: np } as Partial<StudioObject>);
+      return vecToTable(np);
+    });
+
+    // ── screen UI control (Buttons / Signs / Text / Panels by name) ──
+    const resolveUiPart = (ip2b: LuaInterpreter, v: LuaValue): string | null => {
+      if (v instanceof LuaTable) {
+        const pid = v.get('__wbPartId');
+        return typeof pid === 'string' ? pid : null;
+      }
+      const name = ip2b.toString(v ?? '');
+      const store = useStudioStore.getState();
+      let found: string | null = null;
+      store.objects.forEach((obj) => {
+        if (found || !isPart(obj)) return;
+        if (obj.name.toLowerCase() === name.toLowerCase()) found = obj.id;
+      });
+      return found;
+    };
+    const hud = new LuaTable();
+    const hudFn = (name: string, impl: (ip2b: LuaInterpreter, args: LuaValue[]) => void) => {
+      hud.set(name, { native: (ip2, args) => impl(ip2, stripSelf(hud, args)) } as LuaFunction);
+    };
+    hudFn('setText', (ip2, args) => {
+      const pid = resolveUiPart(ip2, args[0]);
+      if (!pid) return;
+      useStudioStore.getState().updateObject(pid, { label: ip2.toString(args[1] ?? '') } as Partial<StudioObject>);
+    });
+    hudFn('show', (ip2, args) => {
+      const pid = resolveUiPart(ip2, args[0]);
+      if (!pid) return;
+      useStudioStore.getState().updateObject(pid, { showInWorld: ip2.truthy(args[1] ?? true) } as Partial<StudioObject>);
+    });
+    hudFn('setColor', (ip2, args) => {
+      const pid = resolveUiPart(ip2, args[0]);
+      if (!pid) return;
+      useStudioStore.getState().updateObject(pid, { color: ip2.toString(args[1] ?? '#ffffff') } as Partial<StudioObject>);
+    });
+    welu.set('hud', hud);
 
     // ── context + finding parts ──
     fn('this', () => {
@@ -831,6 +985,7 @@ class WeluRuntime {
         bodyMovers: [],
       };
       store.addObject(part);
+      runtime.handlePartCreated(part.id);
       return this.partHandle(part.id);
     });
 
@@ -861,7 +1016,7 @@ class WeluRuntime {
 
     // ── world settings ──
     // Virtual properties on the welu table (gravity / timeOfDay / weather)
-    // dispatched through one metatable — reads hit the store, writes go back.
+    // dispatched through one metatable - reads hit the store, writes go back.
     const propHooks = new Map<string, { get: () => LuaValue; set: (v: number | string) => void }>();
     propHooks.set('gravity', {
       get: () => useStudioStore.getState().physicsSettings.gravity,
@@ -904,21 +1059,31 @@ class WeluRuntime {
     // ── camera ──
     const camera = new LuaTable();
     const camFn = (name: string, impl: (ip2: LuaInterpreter, args: LuaValue[]) => void) => {
-      camera.set(name, { native: impl } as LuaFunction);
+      camera.set(name, { native: (ip2, args) => impl(ip2, stripSelf(camera, args)) } as LuaFunction);
     };
     camFn('setPosition', (ip2, args) => {
       const v = tableToVec(args[0]);
       if (v) {
         WB_CAMERA_BRIDGE.position = v;
+        WB_CAMERA_BRIDGE.active = true;
         WB_CAMERA_BRIDGE.nonce++;
       }
     });
     camFn('setYaw', (ip2, args) => {
       WB_CAMERA_BRIDGE.yaw = ((ip2.toNumber(args[0] ?? 0) % 360) + 360) % 360;
+      WB_CAMERA_BRIDGE.active = true;
       WB_CAMERA_BRIDGE.nonce++;
     });
     camFn('setPitch', (ip2, args) => {
       WB_CAMERA_BRIDGE.pitch = Math.max(-85, Math.min(85, ip2.toNumber(args[0] ?? 0)));
+      WB_CAMERA_BRIDGE.active = true;
+      WB_CAMERA_BRIDGE.nonce++;
+    });
+    camFn('release', () => {
+      WB_CAMERA_BRIDGE.active = false;
+      WB_CAMERA_BRIDGE.position = null;
+      WB_CAMERA_BRIDGE.yaw = null;
+      WB_CAMERA_BRIDGE.pitch = null;
       WB_CAMERA_BRIDGE.nonce++;
     });
     welu.set('camera', camera);
@@ -936,12 +1101,12 @@ class WeluRuntime {
     } } as LuaFunction);
     player.metatable = playerMeta;
     const playerFn = (name: string, impl: (ip2: LuaInterpreter, args: LuaValue[]) => LuaValue | LuaValue[] | void) => {
-      player.set(name, { native: impl } as LuaFunction);
+      player.set(name, { native: (ip2, args) => impl(ip2, stripSelf(player, args)) } as LuaFunction);
     };
     // Player-only code (kill/teleport/heal THIS player): on the gamehost
     // it goes through the shared per-player effect queue (the gamehost
-    // applies it to the right player); everywhere else — singleplayer and
-    // the player's OWN client — it runs RIGHT HERE on this machine.
+    // applies it to the right player); everywhere else - singleplayer and
+    // the player's OWN client - it runs RIGHT HERE on this machine.
     playerFn('teleport', (ip2, args) => {
       const v = tableToVec(args[0]) ?? (args.length >= 3 ? { x: ip2.toNumber(args[0]), y: ip2.toNumber(args[1]), z: ip2.toNumber(args[2]) } : null);
       if (!v) return;
@@ -1017,7 +1182,7 @@ class WeluRuntime {
       const seconds = Math.max(0.05, clampNum(ip2.toNumber(args[0] ?? 1), 0.05, 3600));
       const cb = args[1];
       if (ip2.isCallable(cb) && this.timers.length < MAX_TIMERS) {
-        this.timers.push({ intervalSeconds: seconds, fn: cb, nextAt: nowMs() + seconds * 1000 });
+        this.timers.push({ intervalSeconds: seconds, fn: cb, nextAt: nowMs() + seconds * 1000, once: false });
       }
     } } as LuaFunction);
     welu.set('onClick', { native: (ip2, args) => register(this.clickHandlers, ip2, args, true) } as LuaFunction);
@@ -1096,7 +1261,7 @@ class WeluRuntime {
    * Run a player-targeting change. On the GAMEHOST (server-authoritative
    * multiplayer) it is queued through the rule engine's per-player effect
    * pipeline so the gamehost applies it to the acting player. Everywhere
-   * else — singleplayer / Test Play / the player's OWN client — the change
+   * else - singleplayer / Test Play / the player's OWN client - the change
    * executes immediately on this machine (the user's ask: player-only
    * code runs on the player's machine).
    */
@@ -1139,6 +1304,13 @@ class WeluRuntime {
 }
 
 // ─── small helpers ───
+
+/** Lua colon calls (obj:fn(a)) compile to obj.fn(obj, a): a native
+ * reached through a table sees the OWNER TABLE as args[0]. Strip it so
+ * impls always see their real arguments, whatever call style was used. */
+function stripSelf(owner: LuaValue, args: LuaValue[]): LuaValue[] {
+  return args.length > 0 && args[0] === owner ? args.slice(1) : args;
+}
 
 function clamp01(v: number): number {
   return Math.max(0, Math.min(1, Number.isFinite(v) ? v : 0));

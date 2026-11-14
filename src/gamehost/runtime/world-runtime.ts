@@ -1342,7 +1342,7 @@ async function main(): Promise<void> {
   // Start the rules engine (single authority).
   try {
     weildCodeEngine.start();
-    // v7.4: WeLua runs on the gamehost with FULL world authority —
+    // v7.4: WeLua runs on the gamehost with FULL world authority -
     // scripts' world changes apply for everyone; player-only effects go
     // through the same per-player effect queue the rules use.
     try { weluRuntime.setWorldAuthority(true); weluRuntime.start(); } catch (e) { console.error('[WeLua] gamehost start failed', e); }

@@ -1,5 +1,5 @@
 /**
- * camera-popper.ts — a port of Roblox's classic Popper.lua camera occlusion
+ * camera-popper.ts - a port of Roblox's classic Popper.lua camera occlusion
  * ("Prevents your camera from clipping through walls"), rewritten for the
  * WeildBuild play camera.
  *
@@ -10,15 +10,15 @@
  * rescue tiers, near-clearance nudges). Two owner reports it never solved:
  *
  *   1. "Walking up a wedge gives the camera a heart attack." The old sweep
- *      treated EVERY part as a full box — a wedge's slope is an invisible
+ *      treated EVERY part as a full box - a wedge's slope is an invisible
  *      wall in the box above it, so ascending a ramp made the anchor→camera
  *      segment "intersect" geometry that does not exist, retracting hard,
- *      then releasing, then retracting — jitter the whole way up.
+ *      then releasing, then retracting - jitter the whole way up.
  *
  *   2. "Looking through walls is a simple gesture away at the edges." A
  *      center-line sweep cannot see a wall crossing the view FRUSTURE edge
  *      near the lens; the camera ended up with geometry inside its near
- *      plane, where the renderer clips it away — see-through.
+ *      plane, where the renderer clips it away - see-through.
  *
  * Popper (shipped in Roblox for over a decade) solves both by construction:
  * it sweeps the camera's near-plane RECT from the subject toward the camera
@@ -26,12 +26,12 @@
  *
  *   - HARD limit: an occluder's solid reaches past the target plane (the
  *     near-plane rect projected a near-plane buffer PAST the desired camera
- *     position) — i.e. the camera would sit inside/nearly inside geometry.
+ *     position) - i.e. the camera would sit inside/nearly inside geometry.
  *     Applied immediately and unconditionally.
  *
  *   - SOFT limit: an occluder blocks the swept box between subject and
  *     camera but ends before the target plane (it pokes the view volume
- *     without swallowing the lens). Applied ONLY when it is persistent —
+ *     without swallowing the lens). Applied ONLY when it is persistent -
  *     either the camera just passed through it (promotion) or dead-reckoning
  *     the character + camera rotation shows it stays blocked, and every
  *     body-scaled sample point around the subject is occluded too. This is
@@ -53,7 +53,7 @@
  * Non-occluding states (filtered at build time, like Roblox's canOcclude):
  * canCollide=false parts (touch-only triggers), cameraCanLookThrough parts
  * (per-part checkbox; character parts default to it), and transparent parts
- * (transparency >= 0.2 — glass you are meant to see through).
+ * (transparency >= 0.2 - glass you are meant to see through).
  *
  * ─── Port notes (semantics kept 1:1 with popper.lua) ───
  *
@@ -160,7 +160,7 @@ export function makePopperPart(
 }
 
 /** The interval filled by the last successful rayPartInterval call
- *  (test hook — the hot path reads the module scratch directly). */
+ *  (test hook - the hot path reads the module scratch directly). */
 export function lastRayHit(): { enter: number; exit: number } {
   return { enter: _hitEnter, exit: _hitExit };
 }
@@ -170,7 +170,7 @@ export function lastRayHit(): { enter: number; exit: number } {
 // Fills _hitEnter/_hitExit with the ray's parameter interval inside the
 // part's solid (world-scaled t; _hitEnter < 0 means the origin starts
 // inside). Returns false when the solid cannot overlap [0, maxT] at all.
-// Convex shapes only — the interval is a single [enter, exit] pair.
+// Convex shapes only - the interval is a single [enter, exit] pair.
 
 let _hitEnter = 0;
 let _hitExit = 0;
@@ -243,7 +243,7 @@ export function rayPartInterval(
     }
   } else {
     // block (6-plane box) and wedge (5-plane prism from the physics engine:
-    // tall face at +Z, slope descending toward -Z) — both via plane clips.
+    // tall face at +Z, slope descending toward -Z) - both via plane clips.
     // X slabs (both shapes):
     if (Math.abs(ldx) < 1e-12) {
       if (lx < -part.hw || lx > part.hw) return false;
@@ -270,7 +270,7 @@ export function rayPartInterval(
         if (ldz > 0) { if (t2 < tExit) tExit = t2; } else { if (t2 > tEnter) tEnter = t2; }
       }
       // slope plane: hd*y - hh*z ≤ 0 (through (y=hh,z=hd) and (y=-hh,z=-hd),
-      // outward normal (0, hd, -hh) — matches the physics ConvexPolyhedron)
+      // outward normal (0, hd, -hh) - matches the physics ConvexPolyhedron)
       const nx = 0, ny = part.hd, nz = -part.hh;
       const denom = ny * ldy + nz * ldz;
       const num = -(ny * ly + nz * lz); // plane: n·p ≤ 0 → n·p + 0 ≤ 0
@@ -316,7 +316,7 @@ export function pointInPart(part: PopperPart, x: number, y: number, z: number): 
     return _hitEnter <= 1e-9 && _hitExit >= -1e-9;
   }
   // rayPartInterval can only return false here when the solid misses the
-  // degenerate range [0,0] — i.e. the point is outside (the interval exists
+  // degenerate range [0,0] - i.e. the point is outside (the interval exists
   // but lies entirely at t>0 or t<0), EXCEPT for edge cases where the point
   // is outside along +x. Retry with a direction that cannot be parallel to
   // any face plane.
@@ -332,7 +332,7 @@ export function pointInPart(part: PopperPart, x: number, y: number, z: number): 
 // returns where it lands: the first surface it runs into, the origin itself
 // when it starts inside a solid (Roblox hit-at-origin), or the endpoint when
 // nothing blocks it. Non-collidable parts are not in the occluder list, so
-// there is nothing to pierce — the ignore-list walk reduces to a min scan.
+// there is nothing to pierce - the ignore-list walk reduces to a min scan.
 
 export interface CollisionPointResult {
   x: number; y: number; z: number;
@@ -409,11 +409,11 @@ function segmentPromotes(
   // No overlap with [0, L] from a at all: the part does not cross the
   // segment from a's side. If a is INSIDE, rayPartInterval still returns
   // true above (interval straddles 0), so reaching here means a is outside
-  // and the part is beyond b or behind a — but check b-inside via the
+  // and the part is beyond b or behind a - but check b-inside via the
   // reverse cast, which popper's second ray covers.
   if (rayPartInterval(part, bx, by, bz, -ndx, -ndy, -ndz, L)) {
     if (_hitEnter <= 0) {
-      // b inside, a outside: the reverse ray crosses in before a — but the
+      // b inside, a outside: the reverse ray crosses in before a - but the
       // forward interval above returned false, which for a outside means the
       // solid does not overlap [0,L] from a. Both cannot hold for a convex
       // part; treat as no crossing (defensive).
@@ -467,7 +467,7 @@ export function queryPoint(
       // Trivial hard limit: the solid reaches past the target plane.
       if (limitDist < hard) hard = limitDist;
     } else {
-      // Soft candidate — promote when the camera passed through it.
+      // Soft candidate - promote when the camera passed through it.
       const promoted = hasLast && segmentPromotes(part, lastX, lastY, lastZ, tx, ty, tz);
       if (promoted) {
         if (limitDist < hard) hard = limitDist;

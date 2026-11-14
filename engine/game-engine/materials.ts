@@ -22,7 +22,7 @@ export interface MaterialDefinition {
    * pass 17: for the Wireframe material, textureSet is 'wireframe_grid'
    * (a 10×10 stud baseplate grid baked into one tile). For the surface
    * materials (Cobblestone, Brick, Grass, …) the albedo map is NOT bound
-   * to the mesh — only the normal + roughness maps are — so the part's
+   * to the mesh - only the normal + roughness maps are - so the part's
    * `color` tints the surface instead of being multiplied with a coloured
    * albedo (green grass on a red ball reads as red grass, not black). The
    * wireframe_grid albedo IS bound because the grid lines are the whole
@@ -32,14 +32,14 @@ export interface MaterialDefinition {
   /**
    * True for materials that should render with the built-in three.js
    * `wireframe` flag (triangle outlines). Kept on the type for legacy
-   * saves; pass 17 no longer sets it on any material — the Wireframe
+   * saves; pass 17 no longer sets it on any material - the Wireframe
    * material now renders via the wireframe_grid texture instead.
    */
   wireframe?: boolean;
   /**
    * How many times the albedo/normal/roughness maps tile across one stud
    * of part surface. Defaults to 1 (one tile per stud). Lower = larger
-   * feature size, higher = finer tiling. (Legacy field — the pass-17
+   * feature size, higher = finer tiling. (Legacy field - the pass-17
    * renderer derives tile size from part size with a 2:1 growth cap, and
    * uses textureTileStuds for fixed-size tiles like the wireframe grid.)
    */
@@ -50,7 +50,7 @@ export interface MaterialDefinition {
    * the wireframe grid always shows a 1-stud minor grid + 10-stud major
    * grid because one tile = 10 studs). When unset, the renderer derives
    * tile size from the part's longest axis (1 stud for small parts,
-   * growing up to 2 studs for big walls — the "max 2:1 stretch" cap).
+   * growing up to 2 studs for big walls - the "max 2:1 stretch" cap).
    */
   textureTileStuds?: number;
   /**
@@ -75,7 +75,7 @@ export const MATERIALS: Record<string, MaterialDefinition> = {
   // black with no env map; pass 19 lowers them so the albedo shows. The 14
   // new materials (WoodBark…Magma) cover the rest of the owner's texture
   // library. SmoothPlastic is removed (not needed).
-  // pass 20: Plastic is now TEXTURE-LESS (flat colour) — the classic smooth
+  // pass 20: Plastic is now TEXTURE-LESS (flat colour) - the classic smooth
   // plastic for parts. The textured plastic PBR set moved to a new
   // RoughPlastic material. So a plain Plastic part is a flat colour, and
   // RoughPlastic shows the plastic surface texture.
@@ -113,7 +113,7 @@ export const MATERIALS: Record<string, MaterialDefinition> = {
   Lava:             { name: 'Lava',             color: '#ffffff', roughness: 0.5,  metalness: 0.0, friction: 0.7,  elasticity: 0.1,  density: 2.7,  physicalType: 'hard', textureSet: 'lava' },
   Magma:            { name: 'Magma',            color: '#ffffff', roughness: 0.6,  metalness: 0.0, friction: 0.7,  elasticity: 0.1,  density: 2.7,  physicalType: 'hard', textureSet: 'magma' },
   // Neon: not textured. The glow follows the part's own colour
-  // (emissiveMatchesColor), so a blue Neon part glows blue — not the fixed
+  // (emissiveMatchesColor), so a blue Neon part glows blue - not the fixed
   // #FF4444 red it used to. emissiveIntensity 2.0 keeps the bright glow.
   Neon:             { name: 'Neon',             color: '#FF4444', roughness: 0.0,  metalness: 0.0, emissive: '#FF4444', emissiveIntensity: 2.0, emissiveMatchesColor: true, friction: 0.3, elasticity: 0.2, density: 1.0, physicalType: 'hard' },
   // Wireframe: the classic baseplate grid. Baked into a static 1024² texture

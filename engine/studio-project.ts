@@ -25,7 +25,7 @@ import type {
   PhysicsSettings,
   GlobalTimer,
 } from './studio-store';
-import { useStudioStore, isPart, clampPartSizeValue, normalizeRotationValue, clampUnitValue, repairObjectTreeData } from './studio-store';
+import { useStudioStore, isPart, clampPartSizeValue, normalizeRotationValue, clampUnitValue, repairObjectTreeData, isUiPartType } from './studio-store';
 import type { InventoryItemData } from './studio-store';
 import type { WeluScript } from './welu/welu-types';
 import type { WeildCodeRule } from './weildcode-types';
@@ -82,6 +82,10 @@ export interface StudioProjectState {
 
   // Metadata
   schemaVersion: 1;
+
+  /** v7.7: built-in game mode carried with the world ('build-to-survive' |
+   * 'tower-sword-fight' | null). Lets a .wbworld file play as that mode. */
+  gameMode?: 'build-to-survive' | 'tower-sword-fight' | null;
 }
 
 // ─── Deep-clone helper (avoids sharing references between store & snapshot) ───
@@ -117,6 +121,7 @@ export function snapshotStudioState(): StudioProjectState {
     gameWeluScripts: deepClone(s.gameWeluScripts),
     inventory: deepClone(s.inventory),
     hotbarItemIds: [...s.hotbarItemIds],
+    gameMode: s.gameMode ?? null,
     avatar: { ...s.avatar },
     schemaVersion: 1,
   };
@@ -172,6 +177,19 @@ export function restoreStudioState(state: StudioProjectState): void {
     if (isPart(cloned) && cloned.isSpawnPoint && Number(cloned.transparency) === 0.6) {
       cloned.transparency = 0;
     }
+    // v7.7: screen UI parts are NEVER physical. Older saves could carry
+    // canCollide=true on them; force the safe defaults so the 3D engine,
+    // camera occlusion and the transform tools stay away from UI elements,
+    // and fill in the new layer/corner/rotation fields.
+    if (isPart(cloned) && (cloned.isScreenUi || isUiPartType(cloned.type))) {
+      cloned.isScreenUi = true;
+      cloned.canCollide = false;
+      cloned.anchored = true;
+      if ((cloned as any).cameraCanLookThrough === undefined) (cloned as any).cameraCanLookThrough = false;
+      if (cloned.uiLayer === undefined) cloned.uiLayer = 0;
+      if (!cloned.uiCorner) cloned.uiCorner = 'rounded';
+      if (cloned.screenRotation === undefined) cloned.screenRotation = 0;
+    }
     // v13.5: same value repair as loadProject - a restored snapshot must never
     // resurrect zero/negative sizes or 370-degree rotations into the store.
     if (isPart(cloned)) {
@@ -193,7 +211,7 @@ export function restoreStudioState(state: StudioProjectState): void {
 
   // pass 26 (ghost-objects fix): heal the tree on every restore. Saves made
   // before the top-most copy/dupe fix can carry parts whose parent is gone
-  // — invisible to the Explorer but still rendered by the game (the "ghost
+  // - invisible to the Explorer but still rendered by the game (the "ghost
   // objects" report). repairObjectTreeData brings them back as honest
   // top-level objects and drops stale child listings.
   const repaired = repairObjectTreeData(newObjects);
@@ -222,7 +240,7 @@ export function restoreStudioState(state: StudioProjectState): void {
   useStudioStore.setState({
     objects: repaired,
     objectsVersion: (useStudioStore.getState().objectsVersion || 0) + 1,
-    // pass 26.1: a fresh world load — the explorer collapses every folder.
+    // pass 26.1: a fresh world load - the explorer collapses every folder.
     worldLoadNonce: (useStudioStore.getState().worldLoadNonce || 0) + 1,
     joints: deepClone(state.joints),
     worldSettings: migratedWorld,
@@ -240,6 +258,7 @@ export function restoreStudioState(state: StudioProjectState): void {
     gameWeluScripts: deepClone(state.gameWeluScripts ?? []),
     inventory: deepClone(state.inventory ?? []),
     hotbarItemIds: [...(state.hotbarItemIds ?? [null, null, null, null])],
+    gameMode: state.gameMode ?? null,
     avatar: { ...state.avatar },
     showTerrain: !!state.terrainHeightmap,
     selectedIds: [],

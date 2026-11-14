@@ -1,5 +1,5 @@
 // ═══════════════════════════════════════════════════════════════════
-// WeLua — Stage 2: the parser (Lua 5.4-flavoured recursive descent)
+// WeLua - Stage 2: the parser (Lua 5.4-flavoured recursive descent)
 // ═══════════════════════════════════════════════════════════════════
 // Produces a plain AST. The interpreter walks this tree with generator
 // functions so any native builtin can suspend the whole script (that is
@@ -17,7 +17,7 @@ export type Expr =
   | { kind: 'Str'; value: string; line: number }
   | { kind: 'Vararg'; line: number }
   | { kind: 'Var'; name: string; line: number }
-  | { kind: 'Paren'; inner: Expr; line: number }   // (expr) — truncates multi-values to one
+  | { kind: 'Paren'; inner: Expr; line: number }   // (expr) - truncates multi-values to one
   | { kind: 'Index'; obj: Expr; key: Expr; line: number }
   | { kind: 'Call'; fn: Expr; args: Expr[]; line: number }
   | { kind: 'Method'; obj: Expr; name: string; args: Expr[]; line: number }
@@ -237,7 +237,7 @@ export class Parser {
         }
         case 'function': {
           this.next();
-          // function a.b.c:d() ... — build the target Index chain
+          // function a.b.c:d() ... - build the target Index chain
           let target: Expr = { kind: 'Var', name: this.expectName().value, line };
           let name = target.name;
           let isMethod = false;

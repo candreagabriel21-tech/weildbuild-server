@@ -1,5 +1,5 @@
 // ═══════════════════════════════════════════════════════════════════
-// camera-look (pass 27) — the editor camera's direction math, extracted
+// camera-look (pass 27) - the editor camera's direction math, extracted
 // from EditorCameraRig so it can be behaviorally verified without a
 // canvas (the gizmo "look along an axis" turn is pure yaw/pitch math).
 // ═══════════════════════════════════════════════════════════════════
@@ -21,7 +21,7 @@ export function dirFromYawPitch(yaw: number, pitch: number, out: THREE.Vector3):
  *  direction (x, y, z) with the standard world-up (no roll).
  *
  *  Straight up/down is degenerate (any yaw gives the same view
- *  direction), so the caller passes `keepYaw` — the turn keeps the
+ *  direction), so the caller passes `keepYaw` - the turn keeps the
  *  camera's current facing, which reads as "tilt in place".
  *  Straight up/down is NOT clamped here: the axis gizmo's ±Y clicks
  *  should look exactly along Y (a drag afterwards re-clamps to 1.55). */

@@ -5,16 +5,16 @@
 // ═══════════════════════════════════════════════════════════════════
 // Device-level editor knobs (pass 26 + pass 26.1):
 //
-//   • Auto-Save Interval — how many minutes between Auto-Saves (0 = off).
-//   • Dupe Offset — how far (studs) a duplicated or pasted object lands
+//   • Auto-Save Interval - how many minutes between Auto-Saves (0 = off).
+//   • Dupe Offset - how far (studs) a duplicated or pasted object lands
 //     from its original. It was hardcoded (+2 x for dupe, +3 x for paste)
 //     before; both paths read this single setting now.
-//   • Snap Unit — the snap step in studs, ALSO saved per device now
+//   • Snap Unit - the snap step in studs, ALSO saved per device now
 //     (pass 26.1 user request: "the snap unit value should also be
 //     saved"). 0 = no snapping.
 //
 // These tune how THIS device's editor feels, so they live in localStorage
-// (like the graphics settings), NOT in worldSettings — a world file never
+// (like the graphics settings), NOT in worldSettings - a world file never
 // carries them, and loading someone else's world doesn't change your editor.
 
 const STORAGE_KEY = 'wb-editor-settings-v1';
@@ -22,11 +22,11 @@ const STORAGE_KEY = 'wb-editor-settings-v1';
 export const EDITOR_SETTINGS_CHANGED = 'wb-editor-settings-changed';
 
 export interface EditorSettings {
-  /** Minutes between Auto-Saves. 0 disables auto-saving. 0.5–60. */
+  /** Minutes between Auto-Saves. 0 disables auto-saving. 0.5-60. */
   autoSaveIntervalMin: number;
-  /** Studs a duplicate/paste is offset from its original (x axis). 0–50. */
+  /** Studs a duplicate/paste is offset from its original (x axis). 0-50. */
   dupeOffset: number;
-  /** The snap step in studs. 0 = no snapping. 0–100. */
+  /** The snap step in studs. 0 = no snapping. 0-100. */
   snapUnit: number;
 }
 

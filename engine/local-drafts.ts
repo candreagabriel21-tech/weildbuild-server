@@ -197,7 +197,7 @@ export async function loadLocalDraft(id: string): Promise<DraftMeta> {
     throw new Error('That draft has no loadable world data.');
   }
   restoreStudioState(studioState as StudioProjectState);
-  // pass 26: opening an Auto-Save does NOT make it the current draft — the
+  // pass 26: opening an Auto-Save does NOT make it the current draft - the
   // next manual Save must create a fresh "My Save", never overwrite the
   // rotating AutoSave-N slot it came from.
   setCurrentDraftId(isAutoDraftId(id) ? null : record.id);
@@ -226,7 +226,7 @@ export async function renameLocalDraft(id: string, name: string): Promise<DraftM
 //
 // The user's spec: "Auto-Saves are saves that happen every 5 minutes.
 // Maximum is 5 auto-saves before they start to over-write each other.
-// Autosaves get different names (AutoSave-1/AutoSave-2 etc.)" — the slots
+// Autosaves get different names (AutoSave-1/AutoSave-2 etc.)" - the slots
 // use FIXED ids (wb-autosave-1..5) so rotation is id-stable, and the next
 // auto-save always lands in the first empty slot or the OLDEST one.
 
@@ -263,7 +263,7 @@ export function pickAutoSlot(metas: DraftMeta[], now: number): number {
 
 /** Snapshot the live studio store into the next rotating Auto-Save slot.
  *  Returns null when auto-saving doesn't apply (play/simulation running,
- *  or an empty world — the same guards the old 30s autosave had). */
+ *  or an empty world - the same guards the old 30s autosave had). */
 export async function saveAutoDraft(): Promise<DraftMeta | null> {
   const store = useStudioStore.getState();
   if (store.playState.isPlaying || store.simulationState.isSimulating) return null;

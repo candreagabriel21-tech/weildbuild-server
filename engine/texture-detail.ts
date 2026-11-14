@@ -1,5 +1,5 @@
 /**
- * texture-detail.ts — pass 24 "reduce the textures".
+ * texture-detail.ts - pass 24 "reduce the textures".
  *
  * The owner's report: "The material colors for materials are too opaque...
  * grass applied on a white part isn't white, it becomes green. The texture
@@ -8,9 +8,9 @@
  * Every textured material ships a photographic albedo JPG whose OWN colour
  * (green grass, red brick, brown wood) dominated the part's colour: the
  * renderer bound `map = albedo`, so `color` (the part's chosen colour) only
- * darkened the photo — grass on a white part rendered as the photo's green,
+ * darkened the photo - grass on a white part rendered as the photo's green,
  * not white. Measured on the shipped assets (scripts/analyze-albedos.py):
- * grass chroma 0.201, wood_planks 0.381, lava 0.493 — heavily coloured.
+ * grass chroma 0.201, wood_planks 0.381, lava 0.493 - heavily coloured.
  *
  * The fix: the albedo becomes a GREYSCALE DETAIL MAP. The part's colour is
  * the ONLY hue source; the albedo contributes its luminance pattern as a
@@ -20,7 +20,7 @@
  *   out    = partColor * detail          (three.js: map × material.color)
  *
  * - mean-normalized: self-scales across dark sets (leather mean luma
- *   0.168) and bright ones (snow 0.926) — every set lands in roughly the
+ *   0.168) and bright ones (snow 0.926) - every set lands in roughly the
  *   same ±20-25% band around its own mean.
  * - luma uses the Rec.709 weights; hue is gone by construction (R=G=B),
  *   so "the part's colour + texture" is literal: grass on a white part
@@ -29,13 +29,13 @@
  * - the band is clamped [0.6, 1.4]: the detail never darkens the part
  *   below 60% nor brightens it above 140% of its colour.
  *
- * The remap runs ONCE per texture set (canvas luminance pass, 256² —
+ * The remap runs ONCE per texture set (canvas luminance pass, 256² -
  * detail does not need more), cached by set; parts `.clone()` the cached
  * map exactly like they already clone the photographic albedo, so
  * per-part `.repeat` keeps working and clones share one GPU image.
  *
  * Wireframe (wireframe_grid) is exempt: its albedo IS the product (the
- * baseplate grid lines, already near-neutral) — desaturating it would be
+ * baseplate grid lines, already near-neutral) - desaturating it would be
  * a no-op that costs a canvas.
  */
 import * as THREE from 'three';
@@ -53,7 +53,7 @@ export const ALBEDO_DETAIL_MAX = 1.4;
  * only cost a canvas. */
 export const ALBEDO_DETAIL_EXEMPT: ReadonlySet<string> = new Set(['wireframe_grid']);
 
-/** The remap, pure — unit-tested by verify-pass24-textures.ts against the
+/** The remap, pure - unit-tested by verify-pass24-textures.ts against the
  * real shipped JPGs. detail(luma, mean) as documented above. */
 export function detailRemap(luma: number, mean: number): number {
   if (mean <= 1e-6) return 1;
@@ -71,7 +71,7 @@ const detailCache = new Map<string, THREE.Texture>();
 /**
  * Build (once per texture set, then cached) the greyscale detail map for
  * an albedo source texture. Returns a texture whose RGB channels carry
- * the detail value (R=G=B, sRGB) — bind it as `map` next to the part's
+ * the detail value (R=G=B, sRGB) - bind it as `map` next to the part's
  * `color`; three.js multiplies them, which IS "part colour + texture".
  *
  * `src` is the useLoader-resolved albedo (its `.image` is the decoded
@@ -100,7 +100,7 @@ export function getDetailTexture(textureSet: string, src: THREE.Texture): THREE.
     sum += (0.2126 * px[i] + 0.7152 * px[i + 1] + 0.0722 * px[i + 2]) / 255;
   }
   const mean = sum / (px.length / 4);
-  // Pass 2: greyscale detail in [MIN, MAX] — R=G=B, alpha untouched.
+  // Pass 2: greyscale detail in [MIN, MAX] - R=G=B, alpha untouched.
   for (let i = 0; i < px.length; i += 4) {
     const luma = (0.2126 * px[i] + 0.7152 * px[i + 1] + 0.0722 * px[i + 2]) / 255;
     const v = Math.round(detailRemap(luma, mean) * 255);

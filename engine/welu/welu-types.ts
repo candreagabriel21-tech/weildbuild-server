@@ -1,5 +1,5 @@
 // ═══════════════════════════════════════════════════════════════════
-// WeLua — shared types + the API reference shown in the code editor
+// WeLua - shared types + the API reference shown in the code editor
 // ═══════════════════════════════════════════════════════════════════
 // WeLua is WeildBuild's scripting language: real Lua plus a `welu` API
 // that talks to the world (parts, players, inventory, effects, camera).
@@ -91,7 +91,7 @@ export const WELU_API_REFERENCE: WeluApiEntry[] = [
   { group: 'world', signature: 'welu.gravity', description: 'Read or write world gravity (default -35).' },
   { group: 'world', signature: 'welu.timeOfDay', description: 'Read or write the clock (0-24 hours; 12 = noon).' },
   { group: 'world', signature: 'welu.weather', description: 'Read or write the weather: "clear", "cloudy", "rain", "snow".' },
-  { group: 'world', signature: 'welu.camera.setPosition(v) / .setYaw(deg) / .setPitch(deg)', description: 'Cutscene camera: jump the camera to a position / yaw / pitch.' },
+  { group: 'world', signature: 'welu.camera.setPosition(v) / .setYaw(deg) / .setPitch(deg) / .release()', description: 'Cutscene camera: jump the camera to a position / yaw / pitch. welu.camera.release() gives control back to the player.' },
   { group: 'world', signature: 'welu.sound(name, volume)', description: 'Play a sound: click, pop, boom, whoosh, chime, alert.' },
   { group: 'world', signature: 'welu.message(text, duration, color)', description: 'Show a message on every player\'s screen.' },
   { group: 'world', signature: 'welu.getVar(name) / welu.setVar(name, value)', description: 'Global variables shared with block rules.' },
@@ -105,12 +105,21 @@ export const WELU_API_REFERENCE: WeluApiEntry[] = [
   { group: 'util', signature: 'welu.wait(seconds)', description: 'Pause this script (other scripts keep running). THE way to make delays.' },
   { group: 'util', signature: 'welu.time()', description: 'Seconds since the game started.' },
   { group: 'util', signature: 'welu.print(...)', description: 'Print to the studio Output panel (also: print(...)).' },
+  { group: 'util', signature: 'welu.spawn(fn)', description: 'Run fn in its own thread right away (does not block this script).' },
+  { group: 'util', signature: 'welu.after(seconds, fn)', description: 'Run fn ONCE after the delay.' },
+  { group: 'util', signature: 'welu.every(seconds, fn)', description: 'Run fn every N seconds (same as welu.onTimer).' },
+  { group: 'util', signature: 'welu.distance(a, b)', description: 'Distance between two {x,y,z} points or parts.' },
+  { group: 'util', signature: 'welu.magnitude(v)', description: 'Length of a {x,y,z} vector.' },
+  { group: 'util', signature: 'welu.lerp(a, b, t)', description: 'Blend two {x,y,z} vectors (t between 0 and 1).' },
+  { group: 'parts', signature: 'welu.moveTowards(part, target, step)', description: 'Move a part up to step studs toward target {x,y,z}. Returns the new position.' },
+  { group: 'world', signature: 'welu.hud.setText(name, text)', description: 'Change the text of a screen UI element (Button/Sign/Text) by name.' },
+  { group: 'world', signature: 'welu.hud.show(name, visible) / .setColor(name, hex)', description: 'Show or hide a screen UI element, or recolor it.' },
 ];
 
 /** A ready-to-paste example shown in the editor's WeLua tab. */
 export const WELU_EXAMPLES: Array<{ title: string; code: string }> = [
   {
-    title: 'Disappearing bridge (onTouch + wait)',
+    title: 'Disappearing bridge',
     code: [
       '-- Put this on a part: it vanishes 1s after being stepped on,',
       '-- and comes back 5s later.',
@@ -127,7 +136,7 @@ export const WELU_EXAMPLES: Array<{ title: string; code: string }> = [
     ].join('\n'),
   },
   {
-    title: 'Gold pickup (giveItem + destroy)',
+    title: 'Gold pickup',
     code: [
       '-- Put this on a golden part: picking it up gives a point.',
       'welu.onTouch(function(other, isPlayer)',
@@ -141,7 +150,7 @@ export const WELU_EXAMPLES: Array<{ title: string; code: string }> = [
     ].join('\n'),
   },
   {
-    title: 'Magic sword (when_used rules via WeLua)',
+    title: 'Magic sword',
     code: [
       '-- Game script: using the "Sword" item swings the arm and',
       '-- launches whoever it hits (the when_used rules handle damage).',
@@ -174,7 +183,7 @@ export const WELU_EXAMPLES: Array<{ title: string; code: string }> = [
     ].join('\n'),
   },
   {
-    title: 'Tower of blocks (create + loops)',
+    title: 'Tower of blocks',
     code: [
       '-- Game script: build a colorful tower at spawn.',
       'welu.onStart(function()',
@@ -194,4 +203,69 @@ export const WELU_EXAMPLES: Array<{ title: string; code: string }> = [
       'end)',
     ].join('\n'),
   },
+  {
+    title: 'Zombie waves',
+    code: [
+      '-- Game script: a wave of zombies every 20s. They chase the',
+      '-- player and hurt them on contact (10 damage, 1s cooldown).',
+      'local zombies = {}',
+      'local hits = {}',
+      'welu.every(20, function()',
+      '  welu.message("A zombie wave spawns!", 3, "#ff5555")',
+      '  for i = 1, 5 do',
+      '    local z = welu.create({',
+      '      name = "Zombie", type = "Block",',
+      '      position = {x = 40 + i * 2, y = 2, z = 40 + i * 2},',
+      '      size = {x = 2, y = 4, z = 2},',
+      '      color = "#3f7d3f",',
+      '    })',
+      '    table.insert(zombies, z)',
+      '  end',
+      'end)',
+      'welu.onTick(function()',
+      '  for _, z in ipairs(zombies) do',
+      '    if z and z.visible then',
+      '      welu.moveTowards(z, welu.player.position, 0.15)',
+      '      if welu.distance(z, welu.player.position) < 3 then',
+      '        if welu.time() - (hits[z] or 0) > 1 then',
+      '          hits[z] = welu.time()',
+      '          welu.player:damage(10)',
+      '        end',
+      '      end',
+      '    end',
+      '  end',
+      'end)',
+    ].join('\n'),
+  },
+  {
+    title: 'Camera cutscene',
+    code: [
+      '-- Game script: hold a cinematic angle on the spawn for 5s,',
+      '-- then give the camera back to the player.',
+      'welu.onStart(function()',
+      '  welu.camera.setPosition({x = 0, y = 30, z = 40})',
+      '  welu.camera.setPitch(-30)',
+      '  welu.wait(5)',
+      '  welu.camera.release()',
+      'end)',
+    ].join('\n'),
+  },
+  {
+    title: 'Countdown clock',
+    code: [
+      '-- Game script: one-shot and repeating timers drive a HUD Sign',
+      '-- named "Status". welu.after runs once, welu.every repeats.',
+      'welu.onStart(function()',
+      '  local n = 0',
+      '  welu.after(3, function()',
+      '    welu.print("3 seconds passed!")',
+      '  end)',
+      '  welu.every(1, function()',
+      '    n = n + 1',
+      '    welu.hud.setText("Status", "Tick " .. n)',
+      '  end)',
+      'end)',
+    ].join('\n'),
+  },
 ];
+

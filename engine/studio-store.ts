@@ -32,21 +32,24 @@ import {
   scatterTrees as scatterTreesV2,
 } from './terrain-v2';
 
-export type PartType = 'Block' | 'Sphere' | 'Wedge' | 'Cylinder' | 'Spawn' | 'Button' | 'Sign' | 'Panel';
+export type PartType = 'Block' | 'Sphere' | 'Wedge' | 'Cylinder' | 'Spawn' | 'Button' | 'Sign' | 'Panel' | 'Text';
 
-/** v7.5: the UI part family — clickable boards with text labels that
+/** v7.5: the UI part family - clickable boards with text labels that
  *  players add from the Insert Part palette. They resize/rotate/colour
- *  like every other part and fire the usual click/touch rules + WeLua. */
-export const UI_PART_TYPES: readonly PartType[] = ['Button', 'Sign', 'Panel'];
+ *  like every other part and fire the usual click/touch rules + WeLua.
+ *  v7.7: Text joins the family (plain text, no card behind it). */
+export const UI_PART_TYPES: readonly PartType[] = ['Button', 'Sign', 'Panel', 'Text'];
 
-/** v7.6: default on-screen rects (normalized center x/y + size w/h). */
-export const UI_SCREEN_DEFAULT_RECT: Record<'Button' | 'Sign' | 'Panel', { x: number; y: number; w: number; h: number }> = {
+/** v7.6: default on-screen rects (normalized center x/y + size w/h; the
+ *  SIZE is a fraction of the 1280x720 design space, see ScreenUiLayer). */
+export const UI_SCREEN_DEFAULT_RECT: Record<'Button' | 'Sign' | 'Panel' | 'Text', { x: number; y: number; w: number; h: number }> = {
   Button: { x: 0.5, y: 0.5, w: 0.18, h: 0.08 },
   Sign:   { x: 0.5, y: 0.5, w: 0.24, h: 0.06 },
   Panel:  { x: 0.5, y: 0.5, w: 0.34, h: 0.22 },
+  Text:   { x: 0.5, y: 0.12, w: 0.25, h: 0.05 },
 };
 export function isUiPartType(type: string): boolean {
-  return type === 'Button' || type === 'Sign' || type === 'Panel';
+  return type === 'Button' || type === 'Sign' || type === 'Panel' || type === 'Text';
 }
 
 // ─── v13.5: hard value limits (single source of truth) ───
@@ -203,7 +206,7 @@ export interface StudioPart {
   id: string;
   name: string;
   type: PartType;
-  /** v7.5: UI parts (Button/Sign/Panel) — the text shown on the part. */
+  /** v7.5: UI parts (Button/Sign/Panel/Text) - the text shown on the part. */
   label?: string;
   /**
    * v7.6: TRUE = a screen-space 2D element (StarterUI), not a 3D world
@@ -218,6 +221,15 @@ export interface StudioPart {
    * layout scales to any window size.
    */
   screenRect?: { x: number; y: number; w: number; h: number };
+  /**
+   * v7.7: screen UI extras. screenRotation = degrees on screen (the
+   * Rotate tool drives it); uiLayer = render order (higher on top);
+   * uiCorner = 'sharp' | 'rounded' box corners. All three are optional
+   * with the defaults 0 / 0 / 'rounded'.
+   */
+  screenRotation?: number;
+  uiLayer?: number;
+  uiCorner?: 'sharp' | 'rounded';
   position: Vector3;
   size: Vector3;
   rotation: Vector3;
@@ -302,7 +314,7 @@ export interface StudioModel {
 export type StudioObject = StudioPart | StudioModel;
 
 export function isPart(obj: StudioObject): obj is StudioPart {
-  // v7.5: the UI part family (Button/Sign/Panel) is parts too — without
+  // v7.5: the UI part family (Button/Sign/Panel) is parts too - without
   // them here, every isPart() gate (rendering, physics, serialisation)
   // would misread a UI part as a group.
   return 'type' in obj && (['Block', 'Sphere', 'Wedge', 'Cylinder', 'Spawn'] as string[]).concat(UI_PART_TYPES as unknown as string[]).includes(obj.type);
@@ -602,7 +614,7 @@ export interface StudioStore {
 
   // Play mode snapshot (internal - not exposed to consumers)
   _playSnapshot: string | null;
-  /** pass 26: the editor's timeOfDay when play started — stopPlayMode
+  /** pass 26: the editor's timeOfDay when play started - stopPlayMode
    *  restores it, so a day/night cycle running during Test Play can never
    *  bleed back into the saved project ("test play until noon, exit, and
    *  the project is still midnight"). */
@@ -629,7 +641,7 @@ export interface StudioStore {
    *  Position/rotation/size-only writes do NOT bump it, so the explorer tree
    *  doesn't re-render while you drag parts (v13.6 editor lag fix). */
   objectsVersion: number;
-  /** pass 26.1: bumped whenever a whole world is (re)loaded — the
+  /** pass 26.1: bumped whenever a whole world is (re)loaded - the
    *  explorer uses it to remount its nodes so every folder comes back
    * COLLAPSED (user request). */
   worldLoadNonce: number;
@@ -674,7 +686,7 @@ export interface StudioStore {
   setActiveTool: (tool: ToolMode) => void;
   setActiveTab: (tab: StudioTab) => void;
   duplicateSelected: () => void;
-  /** pass 26: normalize parent/child links — orphaned parts (parent gone)
+  /** pass 26: normalize parent/child links - orphaned parts (parent gone)
    *  become visible top-level objects, models drop dead/stale child ids. */
   repairObjectTree: () => void;
   /** pass 26.1: move objects into a group (parentId) or to the top level
@@ -860,6 +872,12 @@ export interface StudioStore {
   inventory: InventoryItemData[];
   /** Which project inventory item occupies each hotbar slot (1-4). */
   hotbarItemIds: (string | null)[];
+  /**
+   * v7.7: the built-in game mode this project plays as ('build-to-survive'
+   * | 'tower-sword-fight'). Set from an imported .wbworld; StudioPlayViewport
+   * activates the matching manager. null = a normal sandbox world.
+   */
+  gameMode: 'build-to-survive' | 'tower-sword-fight' | null;
   /** Move the current selection (parts and/or groups) into the inventory. */
   sendSelectionToInventory: () => void;
   /** Send a single object (part or group) into the inventory. */
@@ -906,7 +924,7 @@ export function collectLeafPartIds(objects: Map<string, StudioObject>, id: strin
 /** pass 26 (ghost-objects fix): the selected ids that are NOT a descendant
  *  of another selected id. Copy/cut/dupe used to process EVERY selected id,
  *  so selecting a group together with one of its own children cloned the
- *  child twice — once inside the cloned group, once loose. The loose copy
+ *  child twice - once inside the cloned group, once loose. The loose copy
  *  was the "ghost / suddenly ungrouped object" report. Every clone path now
  *  operates on the top-most selection only. */
 export function topMostSelectedIds(objects: Map<string, StudioObject>, selectedIds: string[]): string[] {
@@ -924,7 +942,7 @@ export function topMostSelectedIds(objects: Map<string, StudioObject>, selectedI
   return keep;
 }
 
-/** pass 26.1 (user request — better naming): strip copy-number suffixes
+/** pass 26.1 (user request - better naming): strip copy-number suffixes
  *  from an object name: "Block (7) (8)" / "Block 7" → "Block". Repeated
  *  suffixes from the old clone chain collapse in one go. */
 export function stripObjectNameSuffix(name: string): string {
@@ -937,8 +955,8 @@ export function stripObjectNameSuffix(name: string): string {
   return out || name.trim();
 }
 
-/** pass 26.1 (user request — better naming): the next free copy name for
- *  `base` among `objects` — "Block" → "Block 2", "Block 3", … instead of
+/** pass 26.1 (user request - better naming): the next free copy name for
+ *  `base` among `objects` - "Block" → "Block 2", "Block 3", … instead of
  *  the old ever-growing "Block6 (7) (8) … (89)" pile. Old-style names
  *  ("Block (7)", "Block 7") still count as occupied numbers for their
  *  base, so renumbering never collides. */
@@ -946,7 +964,7 @@ export function nextObjectName(base: string, objects: Map<string, StudioObject>)
   const clean = stripObjectNameSuffix(base);
   // Which FAMILY SLOTS are taken? Every object whose name reduces to the
   // same base occupies its number slot ("Wall" = 1, "Wall 2" = 2,
-  // "Wall (4)" = 4 — old-style names count too, so renumbering never
+  // "Wall (4)" = 4 - old-style names count too, so renumbering never
   // collides). The first free slot wins: a fresh family starts at the
   // plain base name, otherwise the first free "base N" from 2 up.
   const taken = new Set<number>();
@@ -996,7 +1014,7 @@ export function rootOrderOf(objects: Map<string, StudioObject>): string[] {
  *    a different parent (stale listings rendered + dragged objects twice).
  *  - A part whose parent is gone (or never listed it) becomes top-level:
  *    it used to stay in the map invisible to the Explorer while the game
- *    still rendered it — the exact "ghost objects aren't there but the
+ *    still rendered it - the exact "ghost objects aren't there but the
  *    game treats them as real" report. Re-parenting to root keeps the
  *    user's data instead of deleting it. */
 export function repairObjectTreeData(objects: Map<string, StudioObject>): Map<string, StudioObject> {
@@ -1114,11 +1132,12 @@ export const PART_DEFAULTS: Record<string, { color: string; size: { x: number; y
   Wedge:     { color: '#f7f54f', size: { x: 1, y: 1, z: 1 } },  // Bright yellow
   CornerWedge: { color: '#f7f54f', size: { x: 1, y: 1, z: 1 } }, // Bright yellow
   Spawn:     { color: '#4a90d9', size: { x: 3, y: 0.3, z: 3 } },  // Blue spawn pad
-  // v7.5: UI parts — thin boards, anchored by default (a button you can
+  // v7.5: UI parts - thin boards, anchored by default (a button you can
   // push across the map is a very confusing button).
   Button:    { color: '#f0ad4e', size: { x: 4, y: 1.6, z: 0.6 } },  // Chunky gold button
   Sign:      { color: '#e7e5e4', size: { x: 6, y: 3, z: 0.4 } },    // Big pale signboard
   Panel:     { color: '#6d5ae0', size: { x: 8, y: 5, z: 0.3 } },    // Wide violet panel
+  Text:      { color: '#ffffff', size: { x: 6, y: 1.5, z: 0.1 } },  // v7.7: plain white text
 };
 
 // ─── Undo/Redo helpers ───
@@ -1306,6 +1325,7 @@ export const useStudioStore = create<StudioStore>((set, get) => ({
   gameWeluScripts: [],
   inventory: [],
   hotbarItemIds: [null, null, null, null],
+  gameMode: null,
   clipboard: null,
   physicsSettings: {
     gravity: -35,
@@ -1606,7 +1626,7 @@ export const useStudioStore = create<StudioStore>((set, get) => ({
       }
     });
     // pass 26 (ghost fix): normalize the result so no loose/orphaned clone
-    // can leak through (defensive — the top-most pass already prevents them).
+    // can leak through (defensive - the top-most pass already prevents them).
     const repaired = repairObjectTreeData(newObjects);
     set({ objects: repaired, selectedIds: newIds });
     if (newIds.length > 0) {
@@ -1619,7 +1639,7 @@ export const useStudioStore = create<StudioStore>((set, get) => ({
     const clipboardObjects: StudioObject[] = [];
     // pass 26 (ghost fix): only the TOP-MOST selected objects. A selection
     // that contains a group AND one of its children used to copy the child
-    // twice (once via the group's descendants, once standalone) — pasting
+    // twice (once via the group's descendants, once standalone) - pasting
     // then produced a loose, ungrouped extra copy.
     const seen = new Set<string>();
     topMostSelectedIds(state.objects, state.selectedIds).forEach((id) => {
@@ -1662,7 +1682,7 @@ export const useStudioStore = create<StudioStore>((set, get) => ({
       const clipboardObjects: StudioObject[] = [];
       const cutFromIds: string[] = [];
       const allIdsToDelete = new Set<string>();
-      // pass 26 (ghost fix): cut only the TOP-MOST selected objects — the
+      // pass 26 (ghost fix): cut only the TOP-MOST selected objects - the
       // same dedupe copy/copy/paste got (a selected child of a selected
       // group used to land in the clipboard twice).
       const seen = new Set<string>();
@@ -1739,7 +1759,7 @@ export const useStudioStore = create<StudioStore>((set, get) => ({
     // Map old IDs → new IDs for rebuilding parent/child relationships
     const idMap = new Map<string, string>();
     // pass 26 (ghost fix): a clipboard must never contain the same object
-    // twice (old clipboards from before the top-most copy fix could) — the
+    // twice (old clipboards from before the top-most copy fix could) - the
     // second clone would overwrite the idMap entry and the first clone
     // leaked out as a loose, ungrouped "ghost" object.
     const seen = new Set<string>();
@@ -1806,7 +1826,7 @@ export const useStudioStore = create<StudioStore>((set, get) => ({
       return obj && obj.parentId === null;
     });
 
-    // pass 26 (ghost fix): normalize the pasted tree — every pasted object
+    // pass 26 (ghost fix): normalize the pasted tree - every pasted object
     // ends up either properly grouped under its pasted parent or honestly
     // top-level. No invisible-to-the-Explorer orphans.
     const repaired = repairObjectTreeData(newObjects);
@@ -1837,7 +1857,7 @@ export const useStudioStore = create<StudioStore>((set, get) => ({
       }
     }
     // A multi-drag moves the top-most dragged objects (dragging a group
-    // drags its contents with it — a separately dragged child is skipped).
+    // drags its contents with it - a separately dragged child is skipped).
     const moving = topMostSelectedIds(state.objects, ids);
     if (moving.length === 0) return;
     _pushUndo(get, set);
@@ -1855,7 +1875,7 @@ export const useStudioStore = create<StudioStore>((set, get) => ({
     });
     // 2) attach
     if (parentId === null) {
-      // to the top level — insert at a root position when given, else append.
+      // to the top level - insert at a root position when given, else append.
       let rootOrder = rootOrderOf(newObjects).filter((id) => !moving.includes(id));
       if (typeof index === 'number' && index >= 0 && index <= rootOrder.length) {
         rootOrder = [...rootOrder.slice(0, index), ...moving, ...rootOrder.slice(index)];
@@ -1909,7 +1929,7 @@ export const useStudioStore = create<StudioStore>((set, get) => ({
         set({ objects: newObjects, objectsVersion: get().objectsVersion + 1 });
       }
     } else {
-      // Roots render in map order — rebuild the map with the two swapped.
+      // Roots render in map order - rebuild the map with the two swapped.
       const rootOrder = rootOrderOf(state.objects);
       [rootOrder[i], rootOrder[j]] = [rootOrder[j], rootOrder[i]];
       set({ objects: reorderRootsInMap(state.objects, rootOrder), objectsVersion: get().objectsVersion + 1 });
@@ -2061,7 +2081,7 @@ export const useStudioStore = create<StudioStore>((set, get) => ({
     const isScreenUi = isUiPartType(type);
     let screenRect: { x: number; y: number; w: number; h: number } | undefined;
     if (isScreenUi) {
-      const base = UI_SCREEN_DEFAULT_RECT[type as 'Button' | 'Sign' | 'Panel'];
+      const base = UI_SCREEN_DEFAULT_RECT[type as 'Button' | 'Sign' | 'Panel' | 'Text'];
       // cascade new elements so they don't stack exactly on top of each other
       let n = 0;
       state.objects.forEach((o) => { if (isPart(o) && o.isScreenUi) n++; });
@@ -2094,11 +2114,15 @@ export const useStudioStore = create<StudioStore>((set, get) => ({
       rotation: { x: 0, y: 0, z: 0 },
       ...defaultPartProps,
       color: defaults.color,
-      // v7.5: UI parts carry their text label (Panel starts blank — it is
+      // v7.5: UI parts carry their text label (Panel starts blank - it is
       // usually a backing board for other UI parts).
       ...(isUiPartType(type) && type !== 'Panel' ? { label: type } : {}),
       // v7.6: screen-space flag + on-screen rect (StarterUI elements).
-      ...(isScreenUi ? { isScreenUi: true, screenRect } : {}),
+      // v7.7: screen UI is never physical - canCollide OFF + non-collide
+      // defaults keep the 3D engine, camera occlusion and tools away.
+      ...(isScreenUi
+        ? { isScreenUi: true, screenRect, canCollide: false, anchored: true, uiLayer: 0, uiCorner: 'rounded' as const, screenRotation: 0 }
+        : {}),
       children: [],
       parentId: null,
     };
@@ -2953,8 +2977,8 @@ export const useStudioStore = create<StudioStore>((set, get) => ({
     const state = get();
     // pass 20 (user request): the baseplate defaults to the Wireframe
     // material (white) so a fresh studio shows the classic 1-stud grid
-    // baseplate. It's still a plain Block — movable, rotatable,
-    // recolorable, deletable — just with the wireframe-grid texture and a
+    // baseplate. It's still a plain Block - movable, rotatable,
+    // recolorable, deletable - just with the wireframe-grid texture and a
     // white base colour. The pass-14 GLSL-grid Wireframe that broke the
     // Vercel prerender is gone for good (pass 16+ uses a baked static
     // texture). Old saves keep whatever material they had. Structurally
@@ -3521,7 +3545,7 @@ export const useStudioStore = create<StudioStore>((set, get) => ({
   // ─── Player Inventory ───
   // Moving an object into the inventory serializes its whole subtree
   // (parts + groups + their rules/weluScripts) and REMOVES it from the
-  // world — "grab and move objects and groups to inventory and back".
+  // world - "grab and move objects and groups to inventory and back".
   // Spawning re-instantiates the template with fresh ids.
 
   sendObjectToInventory: (id) => {
@@ -3547,7 +3571,7 @@ export const useStudioStore = create<StudioStore>((set, get) => ({
       createdAt: Date.now(),
     };
 
-    // Remove the subtree from the world (without firing when_destroyed —
+    // Remove the subtree from the world (without firing when_destroyed -
     // "grabbed" is its own event, not a destruction).
     set((s) => {
       const newObjects = new Map(s.objects);
@@ -3724,7 +3748,7 @@ export const useStudioStore = create<StudioStore>((set, get) => ({
     // STEP 2: Now that all loops are stopped, safely restore the snapshot.
     // Nothing can overwrite this because isPlaying === false.
     const restored = restoreSnapshot(state._playSnapshot);
-    // pass 26: put the editor's clock back too — "test play it until it
+    // pass 26: put the editor's clock back too - "test play it until it
     // gets from midnight to noon, exit, and your project is still
     // midnight" (the auto-cycle may only run inside games).
     const timeAtStart = state._timeOfDayAtPlayStart;

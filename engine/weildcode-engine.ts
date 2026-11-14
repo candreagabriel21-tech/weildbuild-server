@@ -213,7 +213,7 @@ class WeildCodeEngine {
   /**
    * v7.4: PUBLIC queue entry for per-player effects. WeLua's player API
    * (and future systems) uses the exact same pipeline the rule actions
-   * use — the gamehost drains and applies each effect to the right player.
+   * use - the gamehost drains and applies each effect to the right player.
    */
   queuePlayerEffect(effect: PlayerEffect): void {
     this.pushPlayerEffect(effect);
@@ -2815,9 +2815,17 @@ class WeildCodeEngine {
    * rule code and the play viewports share one guarded path). */
   private emitPlayerDamaged(username: string, amount: number, healthAfter: number): void {
     this.handlePlayerDamaged(username, amount, healthAfter);
+    // Announce to WeLua without an import cycle (browser play only; the
+    // gamehost dispatches to weluRuntime directly).
+    if (typeof window !== 'undefined') {
+      window.dispatchEvent(new CustomEvent('wb:player-damaged', { detail: { username, amount, healthAfter } }));
+    }
   }
   private emitPlayerDied(username: string): void {
     this.handlePlayerDied(username);
+    if (typeof window !== 'undefined') {
+      window.dispatchEvent(new CustomEvent('wb:player-died', { detail: { username } }));
+    }
   }
 
   /** First part with the given name (null when missing). */

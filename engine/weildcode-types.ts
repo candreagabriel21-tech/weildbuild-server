@@ -1389,7 +1389,7 @@ export const ACTION_DEFINITIONS: ActionDefinition[] = [
   {
     type: 'apply_impulse',
     label: 'Launch part (impulse)',
-    description: 'Apply an instant impulse to this part — launch it flying',
+    description: 'Apply an instant impulse to this part - launch it flying',
     icon: 'Rocket',
     params: [
       { key: 'force', label: 'Impulse (x,y,z)', type: 'vector3', default: { x: 0, y: 50, z: 0 } },
