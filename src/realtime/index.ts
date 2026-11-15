@@ -20,8 +20,7 @@
 //   • user:online      , client emits { username } on connect
 //   • friend:request   , routed to a specific user by username
 //   • friend:accepted  , routed to a specific user by username
-//   • game:invite      , multiplayer invite push, routed to a user by
-//                        username (NEW, user request)
+//   • game:invite      , multiplayer invite push, routed by username (NEW)
 //   • game:join        , join a game room, broadcast player list
 //   • game:move        , broadcast position/rotation to the room
 //   • game:chat        , broadcast a chat message to the room
@@ -370,11 +369,12 @@ io.on("connection", (socket: Socket) => {
   });
 
   // ─── Game invite push (NEW, user request) ───
-  // "Invite friend" inside a multiplayer game: the sender's client emits
-  // { to, gameId, gameName } and the recipient gets an instant push
-  // notification (same delivery style as the announcement push). The
-  // sender identity comes from the verified session (payload 'from' is
-  // ignored), so nobody can spoof invites.
+  // "Invite friend" inside a multiplayer game: the sender emits
+  // { to, gameId, gameName }. The recipient gets an instant notification
+  // pop-up (same delivery style as announcements). Sender identity comes
+  // from the verified session (payload 'from' is ignored) - anti-spoof.
+  // The HTTP /friends game_invite call PERSISTS the invite to the
+  // recipient's inbox, so this push is only the instant-delivery path.
   socket.on("game:invite", (payload: GameInvitePayload) => {
     const from = verifiedUsername(socket);
     const { to, gameId, gameName } = payload;

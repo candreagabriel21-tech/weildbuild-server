@@ -11,7 +11,7 @@ import {
 } from "../../db/users";
 import {
   sendFriendRequest, acceptFriendRequest, declineFriendRequest,
-  removeFriend, cancelFriendRequest, saveDMMessage, getDMMessages,
+  removeFriend, cancelFriendRequest, saveDMMessage, getDMMessages, createNotification,
 } from "../../db/data";
 import { requireRateLimit } from "../../db/ratelimits";
 import { safeHandler, validateBody, clientIp } from "../../shared/http";
@@ -35,6 +35,15 @@ const friendActionSchema = z.discriminatedUnion("action", [
     from: z.string().min(1),
     to: z.string().min(1),
     content: z.string().min(1).max(1000),
+  }),
+  // (user request) multiplayer game invite. Persisted as a notification
+  // for the recipient (inbox) + pushed realtime by the sender's client.
+  z.object({
+    action: z.literal("game_invite"),
+    to: z.string().min(1),
+    gameId: z.string().min(1),
+    gameName: z.string().max(80).optional(),
+    link: z.string().max(200).optional(),
   }),
 ]);
 
@@ -237,6 +246,25 @@ friendsRouter.post("/", safeHandler(async (req, res) => {
       return res.json({ success: true, message });
     }
 
+    case "game_invite": {
+      // Sender = the verified session user (never trust a body 'from').
+      // Recipient must exist. Creates a notification in THEIR inbox so the
+      // invite survives even if they are offline (the realtime push is the
+      // instant-delivery path, done by the sender's client).
+      const rl = await requireRateLimit("general_api", sessionUser);
+      if (rl) return res.status(429).json({ error: rl.error, retryAfter: rl.retryAfter });
+      const target = await getUser(body.to);
+      if (!target) return res.status(404).json({ error: "Player not found." });
+      const gameName = typeof body.gameName === "string" && body.gameName ? body.gameName : "a game";
+      const link = typeof body.link === "string" && body.link ? body.link : "";
+      const msg = link
+        ? `${sessionUser} invited you to play "${gameName}". Play it: ${link}`
+        : `${sessionUser} invited you to play "${gameName}".`;
+      await createNotification(body.to, "game_invite", msg, sessionUser, {
+        title: `${sessionUser} invited you to play!`,
+      });
+      return res.json({ success: true });
+    }
     default:
       return res.status(400).json({ error: "Unknown action" });
   }
