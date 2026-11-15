@@ -636,6 +636,7 @@ io.on("connection", (socket) => {
         objects: slice,
         joints: i === 0 ? state.joints : undefined,
         globalVariables: i === 0 ? state.globalVariables : undefined,
+        worldSettings: i === 0 ? (state as { worldSettings?: unknown }).worldSettings : undefined,
       });
     }
     console.log(
@@ -674,6 +675,21 @@ io.on("connection", (socket) => {
     if (!partId || partId.length > 128) return;
     const player = instance.players.get(socket.id);
     worldSims.click(instance.id, partId, player?.username);
+  });
+
+  // ── game:itemused { instanceId, itemName } ──
+  // pass 27.2: the held item only exists on the holder's screen, so item
+  // use is a client-only event - relay it so the host's WeLua onItemUsed
+  // scripts (magic sword etc.) run with real world authority.
+  socket.on("game:itemused", (payload: unknown) => {
+    const p = asRecord(payload);
+    socket.data.lastSeen = Date.now(); // duplicate guard liveness
+    const instance = resolvePlayerInstance(socket.id, p.instanceId);
+    if (!instance) return;
+    const itemName = typeof p.itemName === "string" ? p.itemName : "";
+    if (!itemName || itemName.length > 128) return;
+    const player = instance.players.get(socket.id);
+    worldSims.itemUsed(instance.id, itemName, player?.username);
   });
 
   // ── game:move { instanceId, position, rotation, anim? } ──

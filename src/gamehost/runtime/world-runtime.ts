@@ -262,6 +262,17 @@ async function main(): Promise<void> {
       }
     }
   }
+  // pass 27.2: no Spawn part either - fall back to the world's Spawn
+  // Position setting. The .wbworld export keeps spawn_point at the payload
+  // top level and the init message only carries studioState, so this
+  // setting (what creators set in World Settings) was silently ignored
+  // and everyone spawned at {0,5,0}.
+  if (!spawnPoint) {
+    const wsp = (studioState.worldSettings as { spawnPointPosition?: { x: number; y: number; z: number } } | undefined)?.spawnPointPosition;
+    if (wsp && typeof wsp.x === 'number' && typeof wsp.y === 'number' && typeof wsp.z === 'number') {
+      spawnPoint = { x: wsp.x, y: wsp.y, z: wsp.z };
+    }
+  }
   if (!spawnPoint) spawnPoint = { x: 0, y: 5, z: 0 };
 
   // Server-authoritative mode ON + play mode ON (the engine only runs
@@ -692,6 +703,9 @@ async function main(): Promise<void> {
   let storeSyncAccum = 0;           // 7 Hz store write-back
   let slowPassAccum = 0;            // 0.5 s body add/remove/anchored sync
   let sleepPassAccum = 0;           // 0.33 s far-body sleep/wake pass
+  // pass 27.2: last world-settings values streamed in a snapshot.
+  let lastSentTimeOfDay: number | null = null;
+  let lastSentWeather: string | null = null;
 
   // ─── Input / click / chat / reports from the host ───
   parentPort!.on('message', (m: any) => {
@@ -735,6 +749,14 @@ async function main(): Promise<void> {
       setEngineActorPos(username);
       try { weildCodeEngine.handleClick(m.partId, username); } catch { /* rules must never kill the sim */ }
         try { weluRuntime.handleClick(m.partId, username); } catch { /* never kill the sim */ }
+    } else if (m.t === 'itemUsed' && typeof m.itemName === 'string') {
+      // pass 27.2: the held item only exists on the holder's screen, so
+      // item use is a client-only event relayed by the gamehost main
+      // process. Run onItemUsed scripts here with real world authority
+      // (the magic sword's applyImpulse is authority-gated on clients).
+      const username = typeof m.username === 'string' ? m.username : undefined;
+      setEngineActorPos(username);
+      try { weluRuntime.handleItemUsed(m.itemName, username); } catch { /* never kill the sim */ }
     } else if (m.t === 'chat' && typeof m.message === 'string') {
       // v1.5: game rules - on_chat_message (optional username/contains filters).
       const username = String(m.username || 'Player');
@@ -764,6 +786,11 @@ async function main(): Promise<void> {
         objects,
         joints: useStudioStore.getState().joints,
         globalVariables: useStudioStore.getState().globalVariables,
+        // pass 27.2: late joiners also need the host's live sky settings.
+        worldSettings: {
+          timeOfDay: useStudioStore.getState().worldSettings.timeOfDay,
+          weatherType: useStudioStore.getState().worldSettings.weatherType,
+        },
       });
     } else if (m.t === 'stop') {
       shutdown();
@@ -1300,7 +1327,8 @@ async function main(): Promise<void> {
               prev.color === obj.color &&
               prev.size?.x === obj.size?.x && prev.size?.y === obj.size?.y && prev.size?.z === obj.size?.z &&
               prev.transparency === obj.transparency &&
-              prev.material === obj.material
+              prev.material === obj.material &&
+              prev.label === obj.label
             ) return;
           }
         }
@@ -1311,13 +1339,23 @@ async function main(): Promise<void> {
       lastObjectsRef = new Map(objects as any);
     }
 
+    // pass 27.2: stream world settings (WeLua time-of-day / weather) when
+    // the host's copy changed - clients run scripts with no world
+    // authority, so this is the only way their sky stays in sync.
+    const wsNow = useStudioStore.getState().worldSettings;
+    let wsOut: { timeOfDay: number; weatherType: string } | null = null;
+    if (wsNow.timeOfDay !== lastSentTimeOfDay || wsNow.weatherType !== lastSentWeather) {
+      wsOut = { timeOfDay: wsNow.timeOfDay, weatherType: wsNow.weatherType };
+    }
+
     // v6.2.2: nothing changed anywhere -> send nothing at all.
     if (
       playersOut.length === 0 &&
       parts.length === 0 &&
       partUpdatesOut.length === 0 &&
       fxOut.length === 0 &&
-      messagesOut.length === 0
+      messagesOut.length === 0 &&
+      wsOut === null
     ) {
       return null;
     }
@@ -1328,6 +1366,11 @@ async function main(): Promise<void> {
       if (partsKeyframeQueue.length === 0) partsKeyframeQueue = null;
     }
 
+    if (wsOut) {
+      lastSentTimeOfDay = wsNow.timeOfDay;
+      lastSentWeather = wsNow.weatherType;
+    }
+
     return {
       t: 'snapshot',
       seq,
@@ -1336,6 +1379,7 @@ async function main(): Promise<void> {
       partUpdates: partUpdatesOut.splice(0, partUpdatesOut.length),
       fx: fxOut.splice(0, fxOut.length),
       messages: messagesOut.splice(0, messagesOut.length),
+      ...(wsOut ? { worldSettings: wsOut } : {}),
     };
   }
 

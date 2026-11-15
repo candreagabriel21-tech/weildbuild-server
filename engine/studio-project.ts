@@ -51,7 +51,7 @@ export interface StudioProjectState {
   physicsSettings: PhysicsSettings;
 
   // Terrain v2
-  terrainHeightmap: TerrainHeightmapV2 | null;
+  terrainHeightmap: SerializedTerrainHeightmap | null;
   terrainConfig: TerrainGeneratorConfig;
   waterBodies: WaterBodyV2[];
   treeInstances: TreeInstanceV2[];
@@ -95,6 +95,60 @@ function deepClone<T>(value: T): T {
   return JSON.parse(JSON.stringify(value));
 }
 
+// ─── pass 27.2: TerrainHeightmap needs typed serialization ───
+// A JSON round-trip DESTROYS a TerrainHeightmap: `heights: Float32Array`
+// becomes a plain index-keyed object and `paintColors: Map` becomes {}.
+// Paint colors were lost outright, and the first terrain brush after a
+// restore produced an EMPTY heights array (NaN renders + NaN physics).
+// The snapshot stores plain arrays; restore revives the typed containers.
+
+export type SerializedTerrainHeightmap = Omit<TerrainHeightmapV2, 'heights' | 'paintColors'> & {
+  heights: number[];
+  paintColors?: [number, string][];
+};
+
+function cloneHeightmap(hm: TerrainHeightmapV2): SerializedTerrainHeightmap {
+  return {
+    ...hm,
+    heights: Array.from(hm.heights),
+    paintColors: hm.paintColors ? Array.from(hm.paintColors.entries()) : undefined,
+  };
+}
+
+/** pass 27.2: revive a serialized heightmap into the typed runtime form.
+ * Also RESCUES already-broken saves whose heights/paintColors went
+ * through the old JSON deep-clone (plain object forms). Returns null for
+ * absent/garbage input (restore then treats the world as terrain-less,
+ * exactly like the old null path). */
+export function reviveTerrainHeightmap(
+  hm: SerializedTerrainHeightmap | TerrainHeightmapV2 | null | undefined,
+): TerrainHeightmapV2 | null {
+  if (!hm || typeof hm !== 'object') return null;
+  if (!hm.width || !hm.length || !hm.cellSize) return null;
+  let heights: Float32Array;
+  if (hm.heights instanceof Float32Array) {
+    heights = hm.heights;
+  } else if (Array.isArray(hm.heights)) {
+    heights = Float32Array.from(hm.heights);
+  } else if (hm.heights && typeof hm.heights === 'object') {
+    heights = Float32Array.from(Object.values(hm.heights as unknown as Record<string, number>).map(Number));
+  } else {
+    return null;
+  }
+  const pc = hm.paintColors as unknown;
+  let paintColors: Map<number, string> | undefined;
+  if (pc instanceof Map) {
+    paintColors = pc as Map<number, string>;
+  } else if (Array.isArray(pc)) {
+    paintColors = new Map<number, string>(pc as [number, string][]);
+  } else if (pc && typeof pc === 'object') {
+    paintColors = new Map<number, string>(
+      Object.entries(pc as Record<string, string>).map(([k, v]) => [Number(k), v]),
+    );
+  }
+  return { ...hm, heights, paintColors };
+}
+
 // ─── Snapshot: capture the full studio state from the live store ───
 
 export function snapshotStudioState(): StudioProjectState {
@@ -108,7 +162,7 @@ export function snapshotStudioState(): StudioProjectState {
     joints: deepClone(s.joints),
     worldSettings: { ...s.worldSettings },
     physicsSettings: { ...s.physicsSettings },
-    terrainHeightmap: s.terrainHeightmap ? deepClone(s.terrainHeightmap) : null,
+    terrainHeightmap: s.terrainHeightmap ? cloneHeightmap(s.terrainHeightmap) : null,
     terrainConfig: { ...s.terrainConfig },
     waterBodies: deepClone(s.waterBodies),
     treeInstances: deepClone(s.treeInstances),
@@ -245,7 +299,7 @@ export function restoreStudioState(state: StudioProjectState): void {
     joints: deepClone(state.joints),
     worldSettings: migratedWorld,
     physicsSettings: migratedPhysics,
-    terrainHeightmap: state.terrainHeightmap ? deepClone(state.terrainHeightmap) : null,
+    terrainHeightmap: reviveTerrainHeightmap(state.terrainHeightmap),
     terrainConfig: deepClone(state.terrainConfig),
     waterBodies: deepClone(state.waterBodies),
     treeInstances: deepClone(state.treeInstances),

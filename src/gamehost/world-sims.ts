@@ -46,6 +46,8 @@ export interface WorldSnapshot {
   partUpdates: any[];
   fx: any[];
   messages: any[];
+  /** pass 27.2: present only when the host's time-of-day / weather changed. */
+  worldSettings?: { timeOfDay: number; weatherType: string };
 }
 
 const SIM_SWEEP_MS = 5000;
@@ -363,6 +365,8 @@ export class WorldSimManager {
     objects: any[];
     joints: any[];
     globalVariables: Record<string, unknown>;
+    /** pass 27.2: the host's live sky settings (timeOfDay / weatherType). */
+    worldSettings?: { timeOfDay: number; weatherType: string };
   } | null> {
     const sim = this.sims.get(instanceId);
     if (!sim || !sim.ready || sim.disposed) return Promise.resolve(null);
@@ -407,6 +411,16 @@ export class WorldSimManager {
     const sim = this.sims.get(instanceId);
     if (sim && sim.ready && !sim.disposed) {
       sim.worker.postMessage({ t: "click", partId, username: username || "" });
+    }
+  }
+
+  /** pass 27.2: item-use (sword swings etc.) from a player. The held item
+   * only exists on the holder's screen, so the host must be told to run
+   * onItemUsed WeLua scripts with real world authority. */
+  itemUsed(instanceId: string, itemName: string, username?: string): void {
+    const sim = this.sims.get(instanceId);
+    if (sim && sim.ready && !sim.disposed) {
+      sim.worker.postMessage({ t: "itemUsed", itemName, username: username || "" });
     }
   }
 

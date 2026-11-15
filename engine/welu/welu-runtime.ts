@@ -791,6 +791,10 @@ class WeluRuntime {
     fn('message', (ip2, args) => {
       const text = ip2.toString(args[0] ?? '');
       if (!text) return;
+      // pass 27.2: authority-gated. Every machine runs the same scripts -
+      // without this each client fired its own copy of every screen message
+      // (and the host's copy streamed in on top, doubling announcements).
+      if (!this.canWriteWorld()) return;
       const duration = args.length > 1 ? clampNum(ip2.toNumber(args[1]), 0.5, 60) : 3;
       const color = args.length > 2 ? ip2.toString(args[2]) : '#ffffff';
       useStudioStore.getState().addScreenMessage({
@@ -901,16 +905,21 @@ class WeluRuntime {
       hud.set(name, { native: (ip2, args) => impl(ip2, stripSelf(hud, args)) } as LuaFunction);
     };
     hudFn('setText', (ip2, args) => {
+      // pass 27.2: host-authoritative - the host's label streams to clients
+      // as a part update, so local client copies must not also write it.
+      if (!this.canWriteWorld()) return;
       const pid = resolveUiPart(ip2, args[0]);
       if (!pid) return;
       useStudioStore.getState().updateObject(pid, { label: ip2.toString(args[1] ?? '') } as Partial<StudioObject>);
     });
     hudFn('show', (ip2, args) => {
+      if (!this.canWriteWorld()) return; // pass 27.2: host-authoritative
       const pid = resolveUiPart(ip2, args[0]);
       if (!pid) return;
       useStudioStore.getState().updateObject(pid, { showInWorld: ip2.truthy(args[1] ?? true) } as Partial<StudioObject>);
     });
     hudFn('setColor', (ip2, args) => {
+      if (!this.canWriteWorld()) return; // pass 27.2: host-authoritative
       const pid = resolveUiPart(ip2, args[0]);
       if (!pid) return;
       useStudioStore.getState().updateObject(pid, { color: ip2.toString(args[1] ?? '#ffffff') } as Partial<StudioObject>);
