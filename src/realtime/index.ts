@@ -20,6 +20,8 @@
 //   • user:online      , client emits { username } on connect
 //   • friend:request   , routed to a specific user by username
 //   • friend:accepted  , routed to a specific user by username
+//   • game:invite      , multiplayer invite push, routed to a user by
+//                        username (NEW, user request)
 //   • game:join        , join a game room, broadcast player list
 //   • game:move        , broadcast position/rotation to the room
 //   • game:chat        , broadcast a chat message to the room
@@ -59,6 +61,7 @@ interface UserOnlinePayload { username?: string }
 interface FriendRequestPayload { from?: string; to?: string }
 interface FriendAcceptedPayload { username?: string; friend?: string }
 interface DmNewPayload { from?: string; to?: string }
+interface GameInvitePayload { from?: string; to?: string; gameId?: string; gameName?: string }
 interface GameJoinPayload { gameId?: string; username?: string; avatar?: unknown }
 interface GameMovePayload { gameId?: string; position?: number[]; rotation?: number[] }
 interface GameChatPayload { gameId?: string; username?: string; message?: string }
@@ -363,6 +366,25 @@ io.on("connection", (socket: Socket) => {
     } else {
       // Recipient offline, they'll fetch the DM on next login
       console.log(`[dm:new] ${from} → ${to} (offline, not relayed)`);
+    }
+  });
+
+  // ─── Game invite push (NEW, user request) ───
+  // "Invite friend" inside a multiplayer game: the sender's client emits
+  // { to, gameId, gameName } and the recipient gets an instant push
+  // notification (same delivery style as the announcement push). The
+  // sender identity comes from the verified session (payload 'from' is
+  // ignored), so nobody can spoof invites.
+  socket.on("game:invite", (payload: GameInvitePayload) => {
+    const from = verifiedUsername(socket);
+    const { to, gameId, gameName } = payload;
+    if (!from || !to || !gameId) return;
+    const targetSocketId = usernameToSocketId.get(to);
+    if (targetSocketId) {
+      io.to(targetSocketId).emit("game:invite", { from, to, gameId, gameName });
+      console.log(`[game:invite] ${from} → ${to} (${gameName || gameId})`);
+    } else {
+      console.log(`[game:invite] ${from} → ${to} (offline, not relayed)`);
     }
   });
 
