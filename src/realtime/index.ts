@@ -60,7 +60,7 @@ interface UserOnlinePayload { username?: string }
 interface FriendRequestPayload { from?: string; to?: string }
 interface FriendAcceptedPayload { username?: string; friend?: string }
 interface DmNewPayload { from?: string; to?: string }
-interface GameInvitePayload { from?: string; to?: string; gameId?: string; gameName?: string }
+interface GameInvitePayload { from?: string; to?: string; gameId?: string; gameName?: string; instanceId?: string }
 interface GameJoinPayload { gameId?: string; username?: string; avatar?: unknown }
 interface GameMovePayload { gameId?: string; position?: number[]; rotation?: number[] }
 interface GameChatPayload { gameId?: string; username?: string; message?: string }
@@ -377,11 +377,13 @@ io.on("connection", (socket: Socket) => {
   // recipient's inbox, so this push is only the instant-delivery path.
   socket.on("game:invite", (payload: GameInvitePayload) => {
     const from = verifiedUsername(socket);
-    const { to, gameId, gameName } = payload;
+    const { to, gameId, gameName, instanceId } = payload;
     if (!from || !to || !gameId) return;
     const targetSocketId = usernameToSocketId.get(to);
     if (targetSocketId) {
-      io.to(targetSocketId).emit("game:invite", { from, to, gameId, gameName });
+      // (user request) pass the inviter's instanceId so the recipient can
+      // join the SAME session via /instances/join { gameId, instanceId }.
+      io.to(targetSocketId).emit("game:invite", { from, to, gameId, gameName, instanceId });
       console.log(`[game:invite] ${from} → ${to} (${gameName || gameId})`);
     } else {
       console.log(`[game:invite] ${from} → ${to} (offline, not relayed)`);

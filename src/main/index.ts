@@ -22,6 +22,7 @@ import { storageRouter } from "./routes/storage";
 import { reportsRouter } from "./routes/reports";
 import { instancesRouter, internalRouter } from "./routes/instances";
 import { votesRouter } from "./routes/votes";
+import { bridgeRouter } from "../bridge/render-bridge";
 import { getEffectiveSettings } from "../db/settings";
 import { ensureDatabase } from "../db/ensure";
 import { prisma } from "../db/client";
@@ -40,6 +41,9 @@ app.use(cors({ origin: corsOrigin, credentials: true }));
 // on top; anything beyond 4 MB of decoded world bytes is rejected in
 // the games route itself.
 app.use(express.json({ limit: "8mb" }));
+
+// ── Bridge: laptop worker polls /__bridge/* (see src/bridge/render-bridge.ts) ──
+app.use("/__bridge", bridgeRouter);
 
 // ── Health check (Render + uptime monitors) ──
 const startedAt = Date.now();

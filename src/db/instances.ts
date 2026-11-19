@@ -120,6 +120,42 @@ export interface PlacementResult {
 }
 
 /**
+ * (user request) Join a SPECIFIC instance - the one the friend who invited
+ * you is currently in. Returns { result } if that instance exists, is
+ * running, lives on an alive host, AND still has room; otherwise returns
+ * { result: undefined } so the caller can fall back to findOrCreateInstance
+ * (the normal "fill the fullest room" path). This is what makes an invite
+ * land you in your friend's actual session instead of a different room.
+ */
+export async function joinSpecificInstance(
+  instanceId: string,
+): Promise<{ result?: PlacementResult; error?: string }> {
+  await sweepStale();
+  const staleBefore = new Date(Date.now() - HOST_STALE_MS);
+  const aliveHosts = await prisma.serverHost.findMany({
+    where: { status: "online", lastHeartbeat: { gte: staleBefore } },
+  });
+  const hostUrlById = new Map(aliveHosts.map((h) => [h.id, h.url]));
+  if (hostUrlById.size === 0) return { error: "No game servers are currently online" };
+
+  // Look up the exact instance + resolve the game's max players for the
+  // "still has room" check.
+  const inst = await prisma.gameInstance.findUnique({ where: { id: instanceId } });
+  if (!inst || inst.status !== "running") return { result: undefined };
+  const url = hostUrlById.get(inst.hostId);
+  if (!url) return { result: undefined }; // host went offline
+
+  let maxPlayers = DEFAULT_MAX_PLAYERS_PER_INSTANCE;
+  if (!inst.gameId.startsWith("preadded-")) {
+    const game = await prisma.game.findUnique({ where: { id: inst.gameId } });
+    if (game) maxPlayers = ((game.extraData as any)?.max_players as number) || maxPlayers;
+  }
+  if (inst.playerCount >= maxPlayers) return { result: undefined }; // room full -> fallback
+
+  return { result: { instanceId: inst.id, socketUrl: url, created: false } };
+}
+
+/**
  * Find or create an instance for a player joining a game.
  *  1. Prefer an EXISTING instance of this game with room left
  *     (fill the fullest first, Server 1's instances before Server 2's).

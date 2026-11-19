@@ -12,6 +12,7 @@
     "start:main": "node dist/main/index.js",
     "start:realtime": "node dist/realtime/index.js",
     "start:gamehost": "node dist/gamehost/index.js",
+    "start:bridge": "node laptop-bridge.mjs",
     "dev:main": "tsx watch src/main/index.ts",
     "dev:realtime": "tsx watch src/realtime/index.ts",
     "dev:gamehost": "tsx watch src/gamehost/index.ts",

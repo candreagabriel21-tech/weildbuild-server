@@ -44,6 +44,7 @@ const friendActionSchema = z.discriminatedUnion("action", [
     gameId: z.string().min(1),
     gameName: z.string().max(80).optional(),
     link: z.string().max(200).optional(),
+    instanceId: z.string().max(64).optional(),
   }),
 ]);
 

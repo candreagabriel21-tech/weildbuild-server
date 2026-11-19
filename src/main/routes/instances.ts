@@ -15,7 +15,7 @@ import { safeHandler, validateBody, isInternalRequest } from "../../shared/http"
 import { requireAuth, originOk, attachUser, extractToken } from "../middleware";
 import { requireRateLimit } from "../../db/ratelimits";
 import {
-  registerHost, hostHeartbeat, findOrCreateInstance, listInstances,
+  registerHost, hostHeartbeat, findOrCreateInstance, joinSpecificInstance, listInstances,
 } from "../../db/instances";
 import { incrementGamePlays } from "../../db/data";
 
@@ -28,7 +28,9 @@ export const internalRouter = Router();
 
 // ─────────────── Client-facing: join a game ───────────────
 
-const joinSchema = z.object({ gameId: z.string().min(1).max(50) });
+// (user request) optional instanceId: when joining via a friend's invite,
+// the client asks for the SPECIFIC instance the friend is in.
+const joinSchema = z.object({ gameId: z.string().min(1).max(50), instanceId: z.string().min(1).max(64).optional() });
 
 // POST /instances/join
 instancesRouter.post("/join", safeHandler(async (req, res) => {
@@ -41,9 +43,19 @@ instancesRouter.post("/join", safeHandler(async (req, res) => {
 
   const parsed = validateBody(joinSchema, req.body, res);
   if ("error" in parsed) return;
-  const { gameId } = parsed.data;
+  const { gameId, instanceId } = parsed.data;
 
-  const { result, error } = await findOrCreateInstance(gameId, async (hostUrl, gid, maxPlayers) => {
+  // (user request) invite join: try the friend's specific instance first.
+  // Only counts a play / creates a room if that instance is gone or full.
+  let result: { instanceId: string; socketUrl: string; created: boolean } | undefined;
+  let error: string | undefined;
+  if (instanceId) {
+    const specific = await joinSpecificInstance(instanceId);
+    if (specific.error) { error = specific.error; }
+    else if (specific.result) { result = specific.result; }
+  }
+  if (!result && !error) {
+    const placed = await findOrCreateInstance(gameId, async (hostUrl, gid, maxPlayers) => {
     try {
       const response = await fetch(`${hostUrl}/internal/instances`, {
         method: "POST",
@@ -64,7 +76,10 @@ instancesRouter.post("/join", safeHandler(async (req, res) => {
       console.error(`[instances] host ${hostUrl} unreachable: ${e.message}`);
       return null;
     }
-  });
+    });
+    if (placed.error || !placed.result) { error = placed.error || "No game servers available"; }
+    else { result = placed.result; }
+  }
 
   if (error || !result) {
     return res.status(503).json({ error: error || "No game servers available" });
