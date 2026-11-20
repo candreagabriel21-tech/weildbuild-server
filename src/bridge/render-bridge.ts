@@ -20,7 +20,8 @@ import { Router } from "express";
 import crypto from "crypto";
 
 const INTERNAL_TOKEN = process.env.INTERNAL_TOKEN || "";
-const JOB_TIMEOUT_MS = parseInt(process.env.BRIDGE_JOB_TIMEOUT_MS || "30000", 10);
+const JOB_TIMEOUT_MS = parseInt(process.env.BRIDGE_JOB_TIMEOUT_MS || "45000", 10);
+const POLL_HOLD_MS = parseInt(process.env.BRIDGE_POLL_HOLD_MS || "20000", 10);
 let lastPollAt = 0;
 
 interface PendingEntry {
@@ -44,6 +45,49 @@ const pending = new Map<string, PendingEntry>();
 const queue: Job[] = [];
 let waiters: (() => void)[] = [];
 
+// ─────────────────────────────────────────────────────────────
+// JSON transport helpers. Prisma args and results can contain
+// Buffer (the `world Bytes` game-world blob, up to 4 MB), Date and
+// BigInt values that plain JSON would mangle. Buffers travel as
+// {__wbBytes: base64} (a 4 MB world ≈ 5.4 MB — fits the 8 MB
+// express.json limit), Dates as {__wbDate: iso}, BigInts as
+// numbers. The laptop rehydrates args before Prisma sees them and
+// marks results the same way; /result revives them on arrival.
+// ─────────────────────────────────────────────────────────────
+function toTransportSafe(value: unknown): unknown {
+  if (Buffer.isBuffer(value) || value instanceof Uint8Array) {
+    return { __wbBytes: Buffer.from(value).toString("base64") };
+  }
+  if (value instanceof Date) return { __wbDate: value.toISOString() };
+  if (typeof value === "bigint") return Number(value);
+  if (Array.isArray(value)) return value.map(toTransportSafe);
+  if (value && typeof value === "object") {
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+      out[k] = toTransportSafe(v);
+    }
+    return out;
+  }
+  return value;
+}
+
+function reviveTransport(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(reviveTransport);
+  if (value && typeof value === "object") {
+    const rec = value as Record<string, unknown>;
+    if (typeof rec.__wbBytes === "string" && Object.keys(rec).length === 1) {
+      return Buffer.from(rec.__wbBytes, "base64");
+    }
+    if (typeof rec.__wbDate === "string" && Object.keys(rec).length === 1) {
+      return new Date(rec.__wbDate);
+    }
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(rec)) out[k] = reviveTransport(v);
+    return out;
+  }
+  return value;
+}
+
 function enqueue(job: Omit<Job, "jobId">): Promise<unknown> {
   const jobId = crypto.randomUUID();
   return new Promise((resolve, reject) => {
@@ -53,7 +97,7 @@ function enqueue(job: Omit<Job, "jobId">): Promise<unknown> {
       }
     }, JOB_TIMEOUT_MS);
     pending.set(jobId, { resolve, reject, timer });
-    queue.push({ ...job, jobId });
+    queue.push({ ...job, jobId, args: toTransportSafe(job.args) });
     waiters.shift()?.(); // wake one long-poll waiter
   });
 }
@@ -190,7 +234,7 @@ bridgeRouter.get("/poll", (req, res) => {
             const i = waiters.indexOf(resolve);
             if (i >= 0) waiters.splice(i, 1);
             resolve();
-          }, 25000);
+          }, POLL_HOLD_MS);
         });
         job = queue.shift() || null;
       }
@@ -201,14 +245,18 @@ bridgeRouter.get("/poll", (req, res) => {
   })();
 });
 
-// POST /__bridge/result  { jobId, ok, data|error }  — laptop pushes result
+// POST /__bridge/result?token=...  { jobId, ok, data|error }  — laptop pushes result
 bridgeRouter.post("/result", (req, res) => {
+  if (INTERNAL_TOKEN && req.query.token !== INTERNAL_TOKEN) {
+    res.status(401).json({ error: "bad token" });
+    return;
+  }
   const r = req.body || {};
   const entry = pending.get(r.jobId);
   if (entry) {
     pending.delete(r.jobId);
     clearTimeout(entry.timer);
-    if (r.ok) entry.resolve(r.data);
+    if (r.ok) entry.resolve(reviveTransport(r.data));
     else entry.reject(new Error(r.error || "bridge error"));
   }
   res.status(204).end();

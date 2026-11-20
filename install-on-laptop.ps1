@@ -1,186 +1,213 @@
 # ═══════════════════════════════════════════════════════════
-# WeildBuild Bridge, laptop setup (Windows 10/11, PowerShell)
+# WeildBuild Bridge — laptop setup (Windows 10/11, PowerShell 5.1+)
 # ═══════════════════════════════════════════════════════════
-# ONE-TIME setup. Run in PowerShell as Administrator. It will:
-#   1. install Node.js + PostgreSQL (via winget) if missing
-#   2. create the `weildbuild` database + role
-#   3. write the .env the bridge worker reads
-#   4. `npm install` + `prisma generate` + `prisma db push` + seed
-#   5. register a Scheduled Task that auto-starts the bridge at logon
-#      and restarts it every minute if it ever crashes
+# HOW TO RUN:  double-click  run-install.bat  in this same folder.
+#   Keeps the window open on errors, saves a transcript to
+#   install-log.txt, and sets ExecutionPolicy Bypass for you.
 #
-# Nothing here touches Render, your desktop app, or the internet.
-# It only sets up the laptop. You can re-run it safely (it skips what
-# is already done).
+# ── WHAT CHANGED vs the old installer ────────────────────────
+#  NO PostgreSQL installation. AT ALL. The database runs from
+#  embedded Postgres binaries that ship inside the repo's npm
+#  dependencies (node_modules). No installer, no Windows service,
+#  no superuser password prompt, no psql, no PATH hunting, no
+#  P1000/pg_hba errors. The password is generated here, written
+#  to .env, and used once when the data folder is first created.
+#  Forgot it / something's broken?  run reset-local-db.bat  →
+#  a fresh empty database with the SAME password. Done.
 #
-# Usage:  right-click → Run with PowerShell   (or)
-#         powershell -ExecutionPolicy Bypass -File .\install-on-laptop.ps1
+# What it does:
+#   1. install Node.js (via winget) if missing — the ONLY install
+#   2. npm install inside the server folder (also fetches the
+#      embedded Postgres binaries — they are npm packages)
+#   3. write .env (RENDER_URL, INTERNAL_TOKEN, STORAGE_DIR and the
+#      local Postgres settings; keeps an existing PG_PASSWORD)
+#   4. register a Scheduled Task that auto-starts the bridge at
+#      logon and restarts it every minute if it ever crashes
+#   5. start the bridge now
+#
+# Re-run any time — it skips anything already done.
 # ═══════════════════════════════════════════════════════════
 
 #requires -Version 5.1
 [CmdletBinding()]
 param(
-    [string] $RenderUrl       = "https://weildbuild-main.onrender.com",  # ← your Render main URL
-    [string] $InternalToken   = "",                                       # ← paste the INTERNAL_TOKEN from Render
-    [string] $ServerRepoDir   = "$env:USERPROFILE\weildbuild-server",     # ← where you cloned/copied server/
-    [string] $StorageDir      = "",                                       # ← blank = auto (D:\wb-storage if D: else C:\wb-storage)
-    [string] $PgPassword      = ""                                        # ← blank = prompt
+    [string] $RenderUrl     = "https://weildbuild-main.onrender.com",
+    [string] $InternalToken = "",
+    [string] $ServerRepoDir = "",
+    [string] $StorageDir    = ""
 )
 
 $ErrorActionPreference = "Stop"
-function Step($m) { Write-Host "`n=== $m ===" -ForegroundColor Cyan }
-function Ok($m)    { Write-Host "  ✓ $m" -ForegroundColor Green }
-function Warn($m)  { Write-Host "  ! $m" -ForegroundColor Yellow }
-function Die($m)   { Write-Host "  ✗ $m" -ForegroundColor Red; exit 1 }
 
-Write-Host @"
-╔══════════════════════════════════════════════════════════╗
-║  WeildBuild Bridge — laptop setup                        ║
-║  Installs Postgres + Node, writes .env, registers task.  ║
-╚══════════════════════════════════════════════════════════╝
+# Resolve this script's own folder WITHOUT trusting $PSScriptRoot alone:
+# on Windows PowerShell 5.1 it can come back empty, which made Join-Path
+# crash with "Cannot bind argument to parameter 'Path'". Fall back hard.
+$scriptDir = $PSScriptRoot
+if (-not $scriptDir -and $MyInvocation.MyCommand.Definition) { $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Definition }
+if (-not $scriptDir -and $PSCommandPath) { $scriptDir = Split-Path -Parent $PSCommandPath }
+if (-not $scriptDir) { $scriptDir = (Get-Location).Path }
+
+# Default the server repo to this folder (where package.json lives).
+if (-not $ServerRepoDir) { $ServerRepoDir = $scriptDir }
+
+$logFile = Join-Path $scriptDir "install-log.txt"
+try { Start-Transcript -Path $logFile -Force -ErrorAction SilentlyContinue | Out-Null } catch {}
+
+function Step($m) { Write-Host "`n=== $m ===" -ForegroundColor Cyan }
+function Ok($m)   { Write-Host "  OK   $m" -ForegroundColor Green }
+function Warn($m) { Write-Host "  !    $m" -ForegroundColor Yellow }
+function Die($m)  { Write-Host "  ERR  $m" -ForegroundColor Red; throw "SETUP FAILED: $m" }
+
+# Read KEY=VALUE lines from an existing .env into a hashtable.
+function Read-EnvFile($path) {
+    $map = @{}
+    if (Test-Path $path) {
+        foreach ($line in Get-Content $path) {
+            if ($line -match "^\s*([A-Z_][A-Z0-9_]*)\s*=(.*)\s*$") { $map[$Matches[1]] = $Matches[2].Trim('"',"'") }
+        }
+    }
+    return $map
+}
+
+try {
+  Write-Host @"
+------------------------------------------------------------
+ WeildBuild Bridge - laptop setup  (no-Postgres-installer edition)
+ Server repo: $ServerRepoDir
+ Transcript:  $logFile
+------------------------------------------------------------
 "@ -ForegroundColor White
 
-if (-not $InternalToken) {
-    $InternalToken = Read-Host "Paste the INTERNAL_TOKEN from Render env vars"
-    if (-not $InternalToken) { Die "INTERNAL_TOKEN is required (it's on Render → main → Environment)." }
-}
-if (-not $PgPassword) {
-    $PgPassword = Read-Host "Postgres superuser password (the one you set during install, or pick one now)"
-    if (-not $PgPassword) { Die "A Postgres password is required." }
-}
-if (-not $StorageDir) {
-    $StorageDir = if (Test-Path "D:\") { "D:\wb-storage" } else { "C:\wb-storage" }
-}
+  # 0. sanity: the server repo must contain package.json (catches the
+  # "extracted one level too deep" mistake with a clear message instead of ENOENT)
+  if (-not (Test-Path (Join-Path $ServerRepoDir "package.json"))) {
+      Die "No package.json in $ServerRepoDir. Put run-install.bat + install-on-laptop.ps1 + laptop-bridge.mjs INSIDE the server folder (next to package.json), or pass -ServerRepoDir."
+  }
+  if (-not (Test-Path (Join-Path $ServerRepoDir "laptop-bridge.mjs"))) {
+      Die "laptop-bridge.mjs is missing from $ServerRepoDir. Copy it from the zip next to install-on-laptop.ps1."
+  }
+  Ok "server repo looks valid (package.json + laptop-bridge.mjs present)"
 
-# ── 1. winget available? ──
-Step "1/5  Check package manager"
-$winget = Get-Command winget -ErrorAction SilentlyContinue
-if (-not $winget) { Die "winget is missing. Open Microsoft Store → install 'App Installer', then re-run." }
-Ok "winget found"
+  if (-not $InternalToken) {
+      $InternalToken = Read-Host "Paste the INTERNAL_TOKEN from Render (Render dashboard -> weildbuild-main -> Environment)"
+      if (-not $InternalToken) { Die "INTERNAL_TOKEN is required - the bridge and Render must share the same secret." }
+  }
+  if (-not $StorageDir) { $StorageDir = Join-Path $ServerRepoDir "wb-storage" }
 
-# ── 2. Node.js ──
-Step "2/5  Node.js"
-if (Get-Command node -ErrorAction SilentlyContinue) {
-    Ok "Node $(node -v) already installed"
-} else {
-    Warn "Installing Node.js LTS via winget (click through the installer if it prompts)..."
-    winget install -e --id OpenJS.NodeJS.LTS --accept-package-agreements --accept-source-agreements
-    $env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path","User")
-    if (-not (Get-Command node -ErrorAction SilentlyContinue)) { Die "Node install finished but `node` not on PATH. Reboot, then re-run." }
-    Ok "Node $(node -v) installed"
-}
+  $envFile = Join-Path $ServerRepoDir ".env"
+  $existing = Read-EnvFile $envFile
 
-# ── 3. PostgreSQL ──
-Step "3/5  PostgreSQL"
-if (Get-Command psql -ErrorAction SilentlyContinue) {
-    Ok "psql already available"
-} else {
-    Warn "Installing PostgreSQL 17 via winget. The installer will ask for a superuser password — USE THE SAME ONE you typed above."
-    Warn "(If you already typed a password above, just re-type the same one in the installer.)"
-    winget install -e --id PostgreSQL.PostgreSQL.17 --accept-package-agreements --accept-source-agreements
-    $env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path","User")
-    if (-not (Get-Command psql -ErrorAction SilentlyContinue)) { Die "Postgres installed but `psql` not on PATH. Reboot, then re-run." }
-    Ok "psql available"
-}
+  # 1. Node.js — the only thing we ever install
+  Step "1/4  Node.js"
+  if (Get-Command node -ErrorAction SilentlyContinue) {
+      Ok "Node $(node -v) already installed"
+  } else {
+      $winget = Get-Command winget -ErrorAction SilentlyContinue
+      if (-not $winget) { Die "Node.js is missing and winget is unavailable. Install Node.js LTS from https://nodejs.org , then re-run run-install.bat." }
+      Warn "Installing Node.js LTS via winget (click Yes if Windows asks)..."
+      winget install -e --id OpenJS.NodeJS.LTS --accept-package-agreements --accept-source-agreements
+      $env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path","User")
+      if (-not (Get-Command node -ErrorAction SilentlyContinue)) { Die "Node install finished but 'node' is not on PATH. Reboot, then re-run run-install.bat." }
+      Ok "Node $(node -v) installed"
+  }
 
-# Create weildbuild role + database (idempotent)
-$env:PGPASSWORD = $PgPassword
-$psqlArgs = "-U", "postgres", "-h", "localhost", "-p", "5432", "-tAc"
-& psql @psqlArgs "SELECT 1 FROM pg_roles WHERE rolname='weildbuild'" | Out-Null
-if ($LASTEXITCODE -ne 0) { Die "Can't connect to Postgres as `postgres`. Check the password and that the service is running (services.msc → postgresql-x64-17)." }
-$roleExists = & psql @psqlArgs "SELECT 1 FROM pg_roles WHERE rolname='weildbuild'"
-if ($roleExists -notmatch "1") {
-    & psql -U postgres -h localhost -p 5432 -c "CREATE ROLE weildbuild LOGIN PASSWORD '$PgPassword'" | Out-Null
-    Ok "created role `weildbuild`"
-} else { Ok "role `weildbuild` already exists" }
-$dbExists = & psql @psqlArgs "SELECT 1 FROM pg_database WHERE datname='weildbuild'"
-if ($dbExists -notmatch "1") {
-    & psql -U postgres -h localhost -p 5432 -c "CREATE DATABASE weildbuild OWNER weildbuild" | Out-Null
-    Ok "created database `weildbuild`"
-} else { Ok "database `weildbuild` already exists" }
-Remove-Item Env:\PGPASSWORD
+  # 2. npm install — also fetches the embedded Postgres binaries
+  Step "2/4  Dependencies (npm install)"
+  Push-Location $ServerRepoDir
+  try {
+      if (Test-Path (Join-Path $ServerRepoDir "node_modules\.prisma\client\index.js")) {
+          Ok "dependencies already installed (node_modules present)"
+      } else {
+          Write-Host "  npm install (a few minutes the first time)..."
+          npm install --no-audit --no-fund 2>&1 | Out-Host
+          if ($LASTEXITCODE -ne 0) { Die "npm install failed - see the output above." }
+          Ok "dependencies installed (including the embedded Postgres binaries)"
+      }
+  } finally { Pop-Location }
 
-# ── 4. Server repo + migrations ──
-Step "4/5  Server repo + schema"
-if (-not (Test-Path $ServerRepoDir)) { Die "Server repo not found at $ServerRepoDir. Copy the `server/` folder there first (or pass -ServerRepoDir)." }
-Ok "server repo: $ServerRepoDir"
+  # 3. .env — keep an existing PG_PASSWORD so an existing data folder keeps working
+  Step "3/4  Configuration (.env)"
+  $pgPassword = $existing["PG_PASSWORD"]
+  if (-not $pgPassword) {
+      # letters+digits only: safe inside a DATABASE_URL with no escaping
+      $chars = "abcdefghijkmnpqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789".ToCharArray()
+      $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+      $buf = New-Object byte[] 24
+      $rng.GetBytes($buf)
+      $pgPassword = ($buf | ForEach-Object { $chars[$_] % $chars.Length }) -join ""
+      Ok "generated a fresh local Postgres password (stored in .env, you never need to type it)"
+  } else {
+      Ok "keeping the existing PG_PASSWORD from .env"
+  }
+  $pgDataDir = $existing["PG_DATA_DIR"]; if (-not $pgDataDir) { $pgDataDir = Join-Path $ServerRepoDir "pgdata" }
+  $pgPort    = $existing["PG_PORT"];     if (-not $pgPort)    { $pgPort    = "5433" }   # 5433 dodges any old half-removed Postgres on 5432
 
-# Drop the bridge worker in if it isn't there already
-$bridgeSrc = Join-Path $PSScriptRoot "laptop-bridge.mjs"
-$bridgeDst = Join-Path $ServerRepoDir "laptop-bridge.mjs"
-if ((Test-Path $bridgeSrc) -and (-not (Test-Path $bridgeDst))) {
-    Copy-Item $bridgeSrc $bridgeDst
-    Ok "copied laptop-bridge.mjs into server repo"
-}
-
-Push-Location $ServerRepoDir
-try {
-    Write-Host "  npm install (this takes a few minutes the first time)..."
-    npm install --no-audit --no-fund 2>&1 | Out-Host
-    if ($LASTEXITCODE -ne 0) { Die "npm install failed." }
-    Ok "dependencies installed"
-
-    & npx prisma generate 2>&1 | Out-Null
-    Ok "prisma client generated"
-
-    $env:DATABASE_URL = "postgresql://weildbuild:$PgPassword@localhost:5432/weildbuild"
-    & npx prisma db push 2>&1 | Out-Host
-    if ($LASTEXITCODE -ne 0) { Die "prisma db push failed. Is the weildbuild database created?" }
-    Ok "schema pushed to local Postgres"
-
-    $userCount = & psql -U weildbuild -h localhost -p 5432 -d weildbuild -tAc "SELECT count(*) FROM users" 2>$null
-    if ($userCount -notmatch "\d" -or [int]$userCount -eq 0) {
-        Warn "database is empty, seeding..."
-        npm run seed 2>&1 | Out-Host
-        Ok "seeded"
-    } else {
-        Ok "database already has $userCount users, skipping seed"
-    }
-} finally {
-    Pop-Location
-    Remove-Item Env:\DATABASE_URL -ErrorAction SilentlyContinue
-}
-
-# ── 5. .env + scheduled task ──
-Step "5/5  .env + auto-start"
-$envFile = Join-Path $ServerRepoDir ".env"
-@"
+  @"
 RENDER_URL=$RenderUrl
 INTERNAL_TOKEN=$InternalToken
-DATABASE_URL=postgresql://weildbuild:$PgPassword@localhost:5432/weildbuild
 STORAGE_DIR=$StorageDir
+USE_EMBEDDED_PG=1
+PG_PORT=$pgPort
+PG_DATA_DIR=$pgDataDir
+PG_PASSWORD=$pgPassword
+DATABASE_URL=postgresql://postgres:$pgPassword@127.0.0.1:$pgPort/weildbuild
 "@ | Set-Content -Path $envFile -Encoding UTF8
-Ok "wrote $envFile"
+  Ok "wrote $envFile"
 
-New-Item -ItemType Directory -Path $StorageDir -Force | Out-Null
-Ok "storage folder: $StorageDir"
+  New-Item -ItemType Directory -Path $StorageDir -Force | Out-Null
+  Ok "file storage folder: $StorageDir  (this is where uploads/backups/reports now live)"
+  if (-not (Test-Path (Join-Path $pgDataDir "PG_VERSION"))) {
+      Ok "local database will be created on first start: $pgDataDir"
+  } else {
+      Ok "existing local database found: $pgDataDir (left untouched)"
+  }
 
-# Register the bridge as a Scheduled Task: start at logon, restart forever.
-$taskName = "WeildBuildBridge"
-$action    = New-ScheduledTaskAction -Execute "node" -Argument "laptop-bridge.mjs" -WorkingDirectory $ServerRepoDir
-$trigger   = New-ScheduledTaskTrigger -AtLogOn
-$settings  = New-ScheduledTaskSettingsSet -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) -ExecutionTimeLimit ([TimeSpan]::Zero) -DontStopOnIdleEnd
-$principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive
-Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
-Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Settings $settings -Principal $principal -Force | Out-Null
-Ok "scheduled task '$taskName' registered (starts at logon, restarts on crash)"
+  # 4. Scheduled task — auto-start at logon, restart on crash, log to file
+  Step "4/4  Auto-start task"
+  $taskName = "WeildBuildBridge"
+  $action   = New-ScheduledTaskAction -Execute "cmd.exe" -Argument "/c node laptop-bridge.mjs >> bridge-log.txt 2>&1" -WorkingDirectory $ServerRepoDir
+  $trigger  = New-ScheduledTaskTrigger -AtLogOn
+  $settings = New-ScheduledTaskSettingsSet -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) -ExecutionTimeLimit ([TimeSpan]::Zero) -DontStopOnIdleEnd -StartWhenAvailable
+  $principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive
+  Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
+  Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Settings $settings -Principal $principal -Force | Out-Null
+  Ok "scheduled task '$taskName' registered (starts at logon, restarts within 1 minute if it crashes)"
 
-# Start it now
-Start-ScheduledTask -TaskName $taskName
-Ok "bridge started"
+  Start-ScheduledTask -TaskName $taskName
+  Ok "bridge started (logs: $(Join-Path $ServerRepoDir 'bridge-log.txt'))"
 
-Write-Host @"
+  Write-Host @"
 
-╔══════════════════════════════════════════════════════════╗
-║  DONE. The laptop is now the database + file storage.    ║
-║                                                          ║
-║  • Bridge is running in the scheduled task.              ║
-║  • It polls Render every ~0s (long-poll, 25s hold).      ║
-║  • Watch it live:  Get-Content $envFile                  ║
-║    and logs:       Get-ScheduledTaskInfo WeildBuildBridge ║
-║                                                          ║
-║  Next: on Render, set USE_BRIDGE=1 and redeploy main.    ║
-║  Then visit:  $RenderUrl/__bridge/status                 ║
-║  → connected=true means the laptop is wired up.          ║
-╚══════════════════════════════════════════════════════════╝
-"@ -ForegroundColor White
+============================================================
+ DONE - this laptop is now the database + file storage.
+
+ * Postgres runs INSIDE the bridge process (embedded binaries,
+   no service, no installer). Data folder: $pgDataDir
+ * Uploaded files land in: $StorageDir
+ * Check it: open  $RenderUrl/__bridge/status  in a browser.
+   -> "connected":true  means the laptop is wired up. The first
+   sync can take a minute after a fresh boot.
+ * To see it live: double-click start-bridge.bat (a window with
+   the log). Close that window any time; the task restarts it.
+ * Your app now works while the laptop is ON. If the laptop is
+   off, the backend is down (that is the deal with self-hosting).
+============================================================
+"@ -ForegroundColor Green
+}
+catch {
+    Write-Host ""
+    Write-Host "============================================================" -ForegroundColor Red
+    Write-Host "  SETUP FAILED - see the error below." -ForegroundColor Red
+    Write-Host "============================================================" -ForegroundColor Red
+    Write-Host "  $_" -ForegroundColor Red
+    Write-Host ""
+    Write-Host "  The full transcript is saved in: $logFile" -ForegroundColor Yellow
+    Write-Host "  Copy the last ~30 lines above (or send that file)" -ForegroundColor Yellow
+    Write-Host "  back and we will fix it together." -ForegroundColor Yellow
+    Write-Host "============================================================" -ForegroundColor Red
+}
+finally {
+    try { Stop-Transcript -ErrorAction SilentlyContinue | Out-Null } catch {}
+    Write-Host ""
+    Read-Host "Press Enter to close this window"
+}
