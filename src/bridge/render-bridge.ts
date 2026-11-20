@@ -89,6 +89,20 @@ function reviveTransport(value: unknown): unknown {
 }
 
 function enqueue(job: Omit<Job, "jobId">): Promise<unknown> {
+  // v1.10.2 THE DEPLOY-PARADOX FIX. When the laptop is not connected, fail
+  // in ~150 ms instead of holding every caller for the full 45 s job
+  // timeout. With the old behavior a SINGLE relay call inside /health hung
+  // long enough that Render's deploy port-detection saw "no open HTTP
+  // ports" → deploy failed → Render kept serving the OLD build → the
+  // laptop's /__bridge/poll got 404 → the bridge could never connect.
+  // Deploy waited for the bridge, the bridge waited for the deploy.
+  // The rule now: RENDER NEVER WAITS FOR THE LAPTOP. Boot, bind the port,
+  // answer every request instantly, let the laptop dial in when it can.
+  if (!isBridgeConnected()) {
+    return Promise.reject(
+      new Error("bridge offline — laptop not connected (fast-fail)")
+    );
+  }
   const jobId = crypto.randomUUID();
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => {

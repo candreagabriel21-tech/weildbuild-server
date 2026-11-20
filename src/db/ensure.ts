@@ -43,7 +43,7 @@ import { readdirSync, readFileSync, existsSync } from "fs";
 import { randomBytes, scryptSync } from "crypto";
 import { prisma } from "./client";
 import { ITEM_COLORS } from "../shared/item-colors";
-import { waitForBridgeConnection } from "../bridge/render-bridge";
+import { isBridgeConnected } from "../bridge/render-bridge";
 
 const execAsync = promisify(exec);
 
@@ -290,6 +290,51 @@ function bootstrapAdminFromEnv(): void {
     });
 }
 
+// ─────────────────────────────────────────────────────────────
+// v1.10.2 BRIDGE BOOT TASKS — fully non-blocking.
+// The laptop is NOT part of the deploy: Render must bind its port and
+// answer /health instantly even when the laptop is off. These tasks
+// (admin bootstrap, item re-sync, world migration) therefore run on a
+// setTimeout chain that simply polls isBridgeConnected() every 5 s and
+// starts working the moment the laptop dials in. NOTHING here is ever
+// awaited from the boot path, so nothing can delay the deploy.
+// ─────────────────────────────────────────────────────────────
+function scheduleBridgeBootTasks(): void {
+  const taskList: Array<[string, () => Promise<unknown> | void]> = [
+    ["admin bootstrap", () => bootstrapAdminFromEnv()],
+    ["official shop item re-sync", () => syncOfficialItems()],
+    ["encrypted-world → plain storage migration", () => migrateGamesToPlain()],
+  ];
+  let index = 0;
+  const runNext = (): void => {
+    if (index >= taskList.length) {
+      console.log("[db-setup] All bridge boot tasks done (admin, items, worlds).");
+      return;
+    }
+    if (!isBridgeConnected()) {
+      // Laptop not dialed in yet — check again shortly. Zero blocking.
+      setTimeout(runNext, 5000);
+      return;
+    }
+    const [label, run] = taskList[index];
+    Promise.resolve()
+      .then(run)
+      .then(() => {
+        console.log(`[db-setup] Bridge boot task "${label}": done.`);
+        index += 1;
+        runNext();
+      })
+      .catch((err: any) => {
+        console.warn(
+          `[db-setup] Bridge boot task "${label}" failed (non-fatal, retried on next restart): ${String(err?.message ?? err).split("\n")[0]}`
+        );
+        index += 1;
+        runNext();
+      });
+  };
+  setTimeout(runNext, 3000);
+}
+
 export async function ensureDatabase(): Promise<void> {
   console.log("─".repeat(58));
   if (BRIDGE_MODE) {
@@ -297,78 +342,67 @@ export async function ensureDatabase(): Promise<void> {
     console.log("[db-setup] worker owns the database — it runs `prisma db push` on every start.");
     console.log("[db-setup] Skipping the CLI schema sync and CLI seed (they cannot reach the");
     console.log("[db-setup] laptop's Postgres from Render). Items/admin still sync via the relay.");
-  } else {
-    console.log("[db-setup] Automatic database setup started (v1.3.1)");
-    console.log("[db-setup] Step 1/4, syncing database schema…");
+    // v1.10.2: schedule the relay-dependent work in the background and
+    // RETURN AT ONCE. The deploy/port detection must never wait for the
+    // laptop, and with the relay's offline fast-fail no request can hang.
+    scheduleBridgeBootTasks();
+    console.log("[db-setup] Bridge boot tasks scheduled (they start once the laptop dials in).");
+    console.log("─".repeat(58));
+    return;
+  }
+  console.log("[db-setup] Automatic database setup started (v1.3.1)");
+  console.log("[db-setup] Step 1/4, syncing database schema…");
 
-    const pushed = await runWithRetries(
-      "npx prisma db push --skip-generate",
-      "schema sync"
+  const pushed = await runWithRetries(
+    "npx prisma db push --skip-generate",
+    "schema sync"
+  );
+
+  if (!pushed) {
+    console.error(
+      "!! [db-setup] Could not sync the database schema after 3 attempts.\n" +
+        "    The server keeps running and will try again on the next restart.\n" +
+        "    Until it succeeds, the v1.3 admin features may not work (the\n" +
+        "    version gate falls back to the environment variables)."
     );
-
-    if (!pushed) {
-      console.error(
-        "!! [db-setup] Could not sync the database schema after 3 attempts.\n" +
-          "    The server keeps running and will try again on the next restart.\n" +
-          "    Until it succeeds, the v1.3 admin features may not work (the\n" +
-          "    version gate falls back to the environment variables)."
-      );
-      console.log("─".repeat(58));
-      return;
-    }
-
-    console.log("[db-setup] Step 2/4, checking whether seeding is needed…");
-    try {
-      const users = await prisma.user.count();
-      if (users === 0) {
-        console.log(
-          "[db-setup] Empty database detected, seeding the official shop items…"
-        );
-        const seeded = await runWithRetries("npx tsx prisma/seed.ts", "seed");
-        if (seeded) {
-          console.log("[db-setup] Seed complete (shop items only).");
-        }
-      } else {
-        console.log(
-          `[db-setup] Database ready, ${users} user account(s) found, seed skipped.`
-        );
-      }
-    } catch (err: any) {
-      const msg = String(err?.message ?? err).split("\n")[0];
-      console.warn(`[db-setup] Could not check for seeding (non-fatal): ${msg}`);
-    }
+    console.log("─".repeat(58));
+    return;
   }
 
-  // v1.10.1 (bridge mode): give the laptop worker a moment to dial in
-  // before the first relay calls (admin bootstrap + item re-sync) —
-  // into an offline queue each would hang for the whole job timeout.
-  let bridgeUp = true;
-  if (BRIDGE_MODE) bridgeUp = await waitForBridgeConnection(90_000);
+  console.log("[db-setup] Step 2/4, checking whether seeding is needed…");
+  try {
+    const users = await prisma.user.count();
+    if (users === 0) {
+      console.log(
+        "[db-setup] Empty database detected, seeding the official shop items…"
+      );
+      const seeded = await runWithRetries("npx tsx prisma/seed.ts", "seed");
+      if (seeded) {
+        console.log("[db-setup] Seed complete (shop items only).");
+      }
+    } else {
+      console.log(
+        `[db-setup] Database ready, ${users} user account(s) found, seed skipped.`
+      );
+    }
+  } catch (err: any) {
+    const msg = String(err?.message ?? err).split("\n")[0];
+    console.warn(`[db-setup] Could not check for seeding (non-fatal): ${msg}`);
+  }
 
   // v2.1: admin bootstrap from ADMIN_USERNAME/ADMIN_PASSWORD env vars.
   // Create-if-missing (role re-asserted, password NEVER overwritten).
-  if (!BRIDGE_MODE || bridgeUp) {
-    bootstrapAdminFromEnv();
-  } else {
-    console.warn("[db-setup] Bridge offline — admin bootstrap skipped this boot (retried on next restart).");
-  }
+  bootstrapAdminFromEnv();
 
   // v1.8.1: ALWAYS re-sync the official catalog (idempotent upserts).
   // This is what pushes catalog edits (names/descriptions/prices/colors)
   // to an EXISTING database, a redeploy is all it takes.
   console.log("[db-setup] Step 3/4, re-syncing the official shop items…");
-  if (BRIDGE_MODE && !bridgeUp) {
-    console.warn(
-      "[db-setup] Laptop bridge not connected yet — item re-sync skipped this boot.\n" +
-        "    It will run automatically on the next restart once the bridge is online."
-    );
-  } else {
-    try {
-      await syncOfficialItems();
-    } catch (err: any) {
-      const msg = String(err?.message ?? err).split("\n")[0];
-      console.warn(`[db-setup] Official item re-sync failed (non-fatal, retried on next boot): ${msg}`);
-    }
+  try {
+    await syncOfficialItems();
+  } catch (err: any) {
+    const msg = String(err?.message ?? err).split("\n")[0];
+    console.warn(`[db-setup] Official item re-sync failed (non-fatal, retried on next boot): ${msg}`);
   }
 
   // v2.0: decrypt any v1.x encrypted world rows back into plain JSON

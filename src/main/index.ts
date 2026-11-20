@@ -22,7 +22,7 @@ import { storageRouter } from "./routes/storage";
 import { reportsRouter } from "./routes/reports";
 import { instancesRouter, internalRouter } from "./routes/instances";
 import { votesRouter } from "./routes/votes";
-import { bridgeRouter } from "../bridge/render-bridge";
+import { bridgeRouter, isBridgeConnected } from "../bridge/render-bridge";
 import { getEffectiveSettings } from "../db/settings";
 import { ensureDatabase } from "../db/ensure";
 import { prisma } from "../db/client";
@@ -46,39 +46,51 @@ app.use(express.json({ limit: "8mb" }));
 app.use("/__bridge", bridgeRouter);
 
 // ── Health check (Render + uptime monitors) ──
+// v1.10.2: THE RESPONSE IS INSTANT, ALWAYS. This endpoint decides Render's
+// deploy port-detection; a single hung relay call here fails the whole
+// deploy ("Port scan timeout reached"). Three layers guarantee it:
+//   1. the relay itself fails fast (<0.2 s) when the laptop is offline
+//   2. this 2.5 s race is a hard ceiling no matter what
+//   3. every failure path returns the same 200 shape (hosts zeroed)
+// The response also reports bridge connectivity, so "is my laptop
+// connected?" is answerable from /health alone.
 const startedAt = Date.now();
 app.get("/", healthHandler);
 app.get("/health", healthHandler);
+function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
+  return Promise.race([
+    p,
+    new Promise<T>((_, reject) =>
+      setTimeout(() => reject(new Error("health census timeout")), ms)
+    ),
+  ]);
+}
 function healthHandler(_req: express.Request, res: express.Response) {
   // v1.4.2: include the host registry census, "hosts: { registered: 0 }"
   // instantly explains "No game hosts are registered" join failures without
   // opening a database console.
-  prisma.serverHost
-    .groupBy({ by: ["status"], _count: { _all: true } })
+  const base = () => ({
+    status: "ok",
+    service: "weildbuild-main",
+    version: SERVER_VERSION,
+    bridge: { connected: isBridgeConnected() },
+    uptimeSeconds: Math.floor((Date.now() - startedAt) / 1000),
+    timestamp: new Date().toISOString(),
+  });
+  withTimeout(
+    prisma.serverHost.groupBy({ by: ["status"], _count: { _all: true } }),
+    2500
+  )
     .then((groups) => {
       let online = 0, registered = 0;
       for (const g of groups) {
         registered += g._count._all;
         if (g.status === "online") online += g._count._all;
       }
-      res.json({
-        status: "ok",
-        service: "weildbuild-main",
-        version: SERVER_VERSION,
-        hosts: { online, registered },
-        uptimeSeconds: Math.floor((Date.now() - startedAt) / 1000),
-        timestamp: new Date().toISOString(),
-      });
+      res.json({ ...base(), hosts: { online, registered } });
     })
     .catch(() => {
-      res.json({
-        status: "ok",
-        service: "weildbuild-main",
-        version: SERVER_VERSION,
-        hosts: { online: 0, registered: 0 },
-        uptimeSeconds: Math.floor((Date.now() - startedAt) / 1000),
-        timestamp: new Date().toISOString(),
-      });
+      res.json({ ...base(), hosts: { online: 0, registered: 0 } });
     });
 }
 
@@ -88,7 +100,10 @@ function healthHandler(_req: express.Request, res: express.Response) {
 // `latest` / `minimum` / `downloadUrl` unchanged, `downloads` is new.
 app.get("/version", async (_req, res) => {
   try {
-    const settings = await getEffectiveSettings();
+    // v1.10.2: same hard ceiling as /health — with the laptop offline the
+    // relay fast-fails in ~0.2 s, this race is the second belt. The client
+    // boot must never stall on a dead database path.
+    const settings = await withTimeout(getEffectiveSettings(), 2500);
     res.json({
       latest: settings.latestVersion,
       minimum: settings.minVersion,
