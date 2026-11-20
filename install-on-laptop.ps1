@@ -21,17 +21,18 @@
 #      embedded Postgres binaries — they are npm packages)
 #   3. write .env (RENDER_URL, INTERNAL_TOKEN, STORAGE_DIR and the
 #      local Postgres settings; keeps an existing PG_PASSWORD)
-#   4. register a Scheduled Task that auto-starts the bridge at
-#      logon and restarts it every minute if it ever crashes
+#   4. install a hidden auto-start in YOUR Startup folder (no admin
+#      needed anywhere) that launches the bridge at logon; the
+#      keeper loop restarts it within 15s if it ever crashes
 #   5. start the bridge now
 #
-# Re-run any time — it skips anything already done.
+# Re-run any time - it skips anything already done.
 # ═══════════════════════════════════════════════════════════
 
 #requires -Version 5.1
 [CmdletBinding()]
 param(
-    [string] $RenderUrl     = "https://weildbuild-main.onrender.com",
+    [string] $RenderUrl     = "https://weildbuild-server.onrender.com",
     [string] $InternalToken = "",
     [string] $ServerRepoDir = "",
     [string] $StorageDir    = ""
@@ -89,7 +90,7 @@ try {
   Ok "server repo looks valid (package.json + laptop-bridge.mjs present)"
 
   if (-not $InternalToken) {
-      $InternalToken = Read-Host "Paste the INTERNAL_TOKEN from Render (Render dashboard -> weildbuild-main -> Environment)"
+      $InternalToken = Read-Host "Paste the INTERNAL_TOKEN from Render (Render dashboard -> weildbuild-server -> Environment)"
       if (-not $InternalToken) { Die "INTERNAL_TOKEN is required - the bridge and Render must share the same secret." }
   }
   if (-not $StorageDir) { $StorageDir = Join-Path $ServerRepoDir "wb-storage" }
@@ -162,18 +163,29 @@ DATABASE_URL=postgresql://postgres:$pgPassword@127.0.0.1:$pgPort/weildbuild
       Ok "existing local database found: $pgDataDir (left untouched)"
   }
 
-  # 4. Scheduled task — auto-start at logon, restart on crash, log to file
-  Step "4/4  Auto-start task"
-  $taskName = "WeildBuildBridge"
-  $action   = New-ScheduledTaskAction -Execute "cmd.exe" -Argument "/c node laptop-bridge.mjs >> bridge-log.txt 2>&1" -WorkingDirectory $ServerRepoDir
-  $trigger  = New-ScheduledTaskTrigger -AtLogOn
-  $settings = New-ScheduledTaskSettingsSet -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) -ExecutionTimeLimit ([TimeSpan]::Zero) -DontStopOnIdleEnd -StartWhenAvailable
-  $principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive
-  Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
-  Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Settings $settings -Principal $principal -Force | Out-Null
-  Ok "scheduled task '$taskName' registered (starts at logon, restarts within 1 minute if it crashes)"
+  # 4. Auto-start at logon — via YOUR OWN Startup folder, NOT a scheduled
+  # task. Registering a scheduled task needs account rights many standard
+  # accounts don't have ("Access is denied" at exactly this step); the
+  # Startup folder is user-writable by design and needs no admin at all.
+  # Crash-restarts are handled by run-bridge-forever.bat (the keeper loop).
+  Step "4/4  Auto-start at logon"
+  $startupDir = [Environment]::GetFolderPath("Startup")
+  if (-not $startupDir) { $startupDir = Join-Path $env:APPDATA "Microsoft\Windows\Start Menu\Programs\Startup" }
+  $vbsPath = Join-Path $startupDir "start-weildbuild-bridge.vbs"
+  $repoPathVbs = $ServerRepoDir -replace "'", "''"
+  @"
+' WeildBuild bridge - hidden auto-start (created by install-on-laptop.ps1)
+CreateObject("WScript.Shell").Run """$repoPathVbs\run-bridge-forever.bat""", 0, False
+"@ | Set-Content -Path $vbsPath -Encoding Default
+  Ok "auto-start installed: $vbsPath"
+  Ok "(runs the bridge hidden at every logon; the keeper loop restarts it within 15s if it crashes)"
 
-  Start-ScheduledTask -TaskName $taskName
+  # tidy up: remove the scheduled task from an OLDER setup, if it exists
+  Unregister-ScheduledTask -TaskName "WeildBuildBridge" -Confirm:$false -ErrorAction SilentlyContinue
+
+  # start it now (hidden), exactly like at the next logon
+  & wscript.exe $vbsPath
+  Start-Sleep -Seconds 2
   Ok "bridge started (logs: $(Join-Path $ServerRepoDir 'bridge-log.txt'))"
 
   Write-Host @"
@@ -187,10 +199,13 @@ DATABASE_URL=postgresql://postgres:$pgPassword@127.0.0.1:$pgPort/weildbuild
  * Check it: open  $RenderUrl/__bridge/status  in a browser.
    -> "connected":true  means the laptop is wired up. The first
    sync can take a minute after a fresh boot.
- * To see it live: double-click start-bridge.bat (a window with
-   the log). Close that window any time; the task restarts it.
+ * The bridge runs hidden and auto-starts at every logon.
+   - see it live:  double-click start-bridge.bat (window with log)
+   - stop it:      double-click stop-bridge.bat
  * Your app now works while the laptop is ON. If the laptop is
    off, the backend is down (that is the deal with self-hosting).
+ * If you ever MOVE the server folder, re-run run-install.bat
+   so the auto-start points at the new location.
 ============================================================
 "@ -ForegroundColor Green
 }

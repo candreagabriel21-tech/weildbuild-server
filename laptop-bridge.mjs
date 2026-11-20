@@ -16,7 +16,7 @@
 // (install-on-laptop.ps1 does those two steps + the auto-start task)
 //
 // Config (in .env next to this file, or real env vars):
-//   RENDER_URL        https://weildbuild-main.onrender.com
+//   RENDER_URL        https://weildbuild-server.onrender.com
 //   INTERNAL_TOKEN    (same value Render has)
 //   STORAGE_DIR       D:\wb-storage   (optional, default .\wb-storage)
 //   USE_EMBEDDED_PG   1 (default) — set 0 to use an external Postgres
@@ -54,6 +54,12 @@ const DB_NAME = process.env.PG_DB_NAME || "weildbuild";
 const DATABASE_URL =
   process.env.DATABASE_URL ||
   `postgresql://${PG_USER}:${encodeURIComponent(PG_PASSWORD)}@127.0.0.1:${PG_PORT}/${DB_NAME}`;
+// v1.10.1: the relay's PrismaClient reads process.env.DATABASE_URL at query
+// time (schema.prisma: url = env("DATABASE_URL")). Computing the local URL is
+// not enough — it must be EXPORTED, otherwise every relayed job fails with
+// "Environment variable not found: DATABASE_URL" (the installer normally
+// writes it into .env, but do not depend on that).
+process.env.DATABASE_URL = process.env.DATABASE_URL || DATABASE_URL;
 
 const log = (...a) => console.log(`[wb-bridge ${new Date().toISOString().slice(11, 19)}]`, ...a);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -61,6 +67,37 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 if (!RENDER_URL || !INTERNAL_TOKEN) {
   console.error("✗ Set RENDER_URL and INTERNAL_TOKEN in .env first (the installer does this).");
   process.exit(1);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Single-instance guard: only one bridge may own the local
+// Postgres port. Exits with code 3 when another live instance
+// holds the lock (the auto-start keeper script bows out on 3).
+// ─────────────────────────────────────────────────────────────
+const LOCK_PATH = path.join(__dirname, "bridge.lock");
+let lockHolder = null;
+try {
+  const fd = fs.openSync(LOCK_PATH, "wx");
+  fs.writeSync(fd, String(process.pid));
+  fs.closeSync(fd);
+} catch {
+  try { lockHolder = parseInt(fs.readFileSync(LOCK_PATH, "utf8").trim(), 10) || null; } catch {}
+  let alive = false;
+  if (lockHolder) {
+    try { process.kill(lockHolder, 0); alive = true; }
+    catch (e) { alive = e.code === "EPERM"; } // EPERM = exists but not signalable
+  }
+  if (alive) {
+    console.log(`WeildBuild bridge is already running (process ${lockHolder}). Nothing to do.`);
+    process.exit(3);
+  }
+  // stale lock from a crash — take it over
+  try { fs.unlinkSync(LOCK_PATH); } catch {}
+  try {
+    const fd = fs.openSync(LOCK_PATH, "wx");
+    fs.writeSync(fd, String(process.pid));
+    fs.closeSync(fd);
+  } catch {}
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -159,8 +196,47 @@ function runPrismaCmd(args, timeoutMs = 240_000) {
 }
 
 function ensurePrismaClient() {
-  const client = path.join(__dirname, "node_modules", ".prisma", "client", "index.js");
-  if (!fs.existsSync(client)) runPrismaCmd("generate", 180_000);
+  // v1.10.1 FIX: checking only that index.js EXISTS is not enough. When
+  // `prisma generate` never ran (or failed), @prisma/client's postinstall
+  // leaves PLACEHOLDER files in .prisma/client — including an index.js —
+  // and every import then dies at runtime with
+  //   "@prisma/client did not initialize yet. Please run "prisma generate"…"
+  // (thrown from the placeholder's PrismaClient constructor, default.js:43).
+  // The real generated client always ships a copy of schema.prisma in the
+  // same folder; the placeholder set never does. So: index.js + schema.prisma
+  // present AND index.js not the placeholder stub = a usable client.
+  const dotPrisma = path.join(__dirname, "node_modules", ".prisma", "client");
+  const indexJs = path.join(dotPrisma, "index.js");
+  const schemaCopy = path.join(dotPrisma, "schema.prisma");
+  let looksReal = fs.existsSync(indexJs) && fs.existsSync(schemaCopy);
+  if (looksReal) {
+    try {
+      if (fs.readFileSync(indexJs, "utf8").includes("did not initialize yet")) looksReal = false;
+    } catch {}
+  }
+  if (!looksReal) {
+    log("Prisma client is missing or a placeholder — running prisma generate…");
+    runPrismaCmd("generate", 180_000);
+  }
+}
+
+// v1.10.1: loading the client is now self-healing. If the import or the
+// constructor still fails (placeholder leftovers, half-written generate,
+// antivirus lock), run prisma generate and retry ONCE before giving up —
+// this kills the "worked on the second start, failed on the third" flakiness.
+async function loadPrismaClient() {
+  const attempt = async () => {
+    const { PrismaClient } = await import("@prisma/client");
+    return new PrismaClient({ log: ["error"] });
+  };
+  try {
+    return await attempt();
+  } catch (e) {
+    console.error(`! Prisma client did not load (${String(e.message || e).split("\n")[0]}).`);
+    log("running prisma generate, then retrying…");
+    runPrismaCmd("generate", 180_000);
+    return await attempt();
+  }
 }
 
 async function boot() {
@@ -184,8 +260,7 @@ async function bootAndStartLoop() {
     process.exit(1);
   }
 
-  const { PrismaClient } = await import("@prisma/client");
-  const prisma = new PrismaClient({ log: ["error"] });
+  const prisma = await loadPrismaClient();
 
   async function doJob(job) {
     // ── DB job: prisma.<model>.<op>(args) or prisma.$executeRawUnsafe(sql,...) ──
@@ -291,9 +366,24 @@ async function shutdown() {
   exiting = true;
   log("shutting down…");
   try { if (pg) await pg.stop(); } catch {}
+  try { fs.unlinkSync(LOCK_PATH); } catch {}
   process.exit(0);
 }
 process.on("SIGINT", shutdown);
 process.on("SIGTERM", shutdown);
+process.on("exit", () => { try { fs.unlinkSync(LOCK_PATH); } catch {} });
+
+// v1.10.1: an unexpected crash used to kill the process without stopping
+// the embedded Postgres (the next start then logged "database system was
+// not properly shut down; automatic recovery in progress"). Catch it,
+// log it in human form, and shut down cleanly instead.
+process.on("unhandledRejection", (e) => {
+  console.error("✗ unexpected error:", e instanceof Error ? (e.stack || e.message) : e);
+  shutdown();
+});
+process.on("uncaughtException", (e) => {
+  console.error("✗ unexpected error:", e instanceof Error ? (e.stack || e.message) : e);
+  shutdown();
+});
 
 bootAndStartLoop();

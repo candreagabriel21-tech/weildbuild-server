@@ -3,3 +3,13 @@ dist/
 .env
 *.log
 .DS_Store
+
+# ── bridge runtime (laptop-only, never commit these) ──
+pgdata/
+wb-storage/
+bridge.lock
+stop-now.flag
+bridge-log.txt
+bridge-log.old.txt
+install-log.txt
+tmp-import-test.mjs

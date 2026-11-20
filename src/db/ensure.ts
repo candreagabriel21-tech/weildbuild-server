@@ -43,8 +43,20 @@ import { readdirSync, readFileSync, existsSync } from "fs";
 import { randomBytes, scryptSync } from "crypto";
 import { prisma } from "./client";
 import { ITEM_COLORS } from "../shared/item-colors";
+import { waitForBridgeConnection } from "../bridge/render-bridge";
 
 const execAsync = promisify(exec);
+
+// v1.10.1 BRIDGE MODE: with the laptop pull-bridge there is NO database
+// Render can reach directly. The two CLI steps below (prisma db push and
+// the tsx seed) build their own Prisma client and dial DATABASE_URL — on
+// Render that either points at the retired Neon database or at nothing,
+// so every boot used to burn ~6 minutes of retries on a guaranteed
+// failure (and printed scary errors that were "completely harmless").
+// In bridge mode the laptop worker runs `prisma db push` on every start;
+// the shop catalog is filled by syncOfficialItems() below through the
+// relay, and the admin comes from ADMIN_USERNAME/ADMIN_PASSWORD.
+const BRIDGE_MODE = process.env.USE_BRIDGE === "1" || !process.env.DATABASE_URL;
 
 // dist/db/ensure.js → two levels up = repo root (where prisma/
 // and package.json live). Using this instead of process.cwd()
@@ -280,59 +292,83 @@ function bootstrapAdminFromEnv(): void {
 
 export async function ensureDatabase(): Promise<void> {
   console.log("─".repeat(58));
-  console.log("[db-setup] Automatic database setup started (v1.3.1)");
-  console.log("[db-setup] Step 1/4, syncing database schema…");
+  if (BRIDGE_MODE) {
+    console.log("[db-setup] BRIDGE MODE (USE_BRIDGE=1 or no DATABASE_URL): the laptop");
+    console.log("[db-setup] worker owns the database — it runs `prisma db push` on every start.");
+    console.log("[db-setup] Skipping the CLI schema sync and CLI seed (they cannot reach the");
+    console.log("[db-setup] laptop's Postgres from Render). Items/admin still sync via the relay.");
+  } else {
+    console.log("[db-setup] Automatic database setup started (v1.3.1)");
+    console.log("[db-setup] Step 1/4, syncing database schema…");
 
-  const pushed = await runWithRetries(
-    "npx prisma db push --skip-generate",
-    "schema sync"
-  );
-
-  if (!pushed) {
-    console.error(
-      "!! [db-setup] Could not sync the database schema after 3 attempts.\n" +
-        "    The server keeps running and will try again on the next restart.\n" +
-        "    Until it succeeds, the v1.3 admin features may not work (the\n" +
-        "    version gate falls back to the environment variables)."
+    const pushed = await runWithRetries(
+      "npx prisma db push --skip-generate",
+      "schema sync"
     );
-    console.log("─".repeat(58));
-    return;
+
+    if (!pushed) {
+      console.error(
+        "!! [db-setup] Could not sync the database schema after 3 attempts.\n" +
+          "    The server keeps running and will try again on the next restart.\n" +
+          "    Until it succeeds, the v1.3 admin features may not work (the\n" +
+          "    version gate falls back to the environment variables)."
+      );
+      console.log("─".repeat(58));
+      return;
+    }
+
+    console.log("[db-setup] Step 2/4, checking whether seeding is needed…");
+    try {
+      const users = await prisma.user.count();
+      if (users === 0) {
+        console.log(
+          "[db-setup] Empty database detected, seeding the official shop items…"
+        );
+        const seeded = await runWithRetries("npx tsx prisma/seed.ts", "seed");
+        if (seeded) {
+          console.log("[db-setup] Seed complete (shop items only).");
+        }
+      } else {
+        console.log(
+          `[db-setup] Database ready, ${users} user account(s) found, seed skipped.`
+        );
+      }
+    } catch (err: any) {
+      const msg = String(err?.message ?? err).split("\n")[0];
+      console.warn(`[db-setup] Could not check for seeding (non-fatal): ${msg}`);
+    }
   }
 
-  console.log("[db-setup] Step 2/4, checking whether seeding is needed…");
-  try {
-    const users = await prisma.user.count();
-    if (users === 0) {
-      console.log(
-        "[db-setup] Empty database detected, seeding the official shop items…"
-      );
-      const seeded = await runWithRetries("npx tsx prisma/seed.ts", "seed");
-      if (seeded) {
-        console.log("[db-setup] Seed complete (shop items only).");
-      }
-    } else {
-      console.log(
-        `[db-setup] Database ready, ${users} user account(s) found, seed skipped.`
-      );
-    }
-  } catch (err: any) {
-    const msg = String(err?.message ?? err).split("\n")[0];
-    console.warn(`[db-setup] Could not check for seeding (non-fatal): ${msg}`);
-  }
+  // v1.10.1 (bridge mode): give the laptop worker a moment to dial in
+  // before the first relay calls (admin bootstrap + item re-sync) —
+  // into an offline queue each would hang for the whole job timeout.
+  let bridgeUp = true;
+  if (BRIDGE_MODE) bridgeUp = await waitForBridgeConnection(90_000);
 
   // v2.1: admin bootstrap from ADMIN_USERNAME/ADMIN_PASSWORD env vars.
   // Create-if-missing (role re-asserted, password NEVER overwritten).
-  bootstrapAdminFromEnv();
+  if (!BRIDGE_MODE || bridgeUp) {
+    bootstrapAdminFromEnv();
+  } else {
+    console.warn("[db-setup] Bridge offline — admin bootstrap skipped this boot (retried on next restart).");
+  }
 
   // v1.8.1: ALWAYS re-sync the official catalog (idempotent upserts).
   // This is what pushes catalog edits (names/descriptions/prices/colors)
   // to an EXISTING database, a redeploy is all it takes.
   console.log("[db-setup] Step 3/4, re-syncing the official shop items…");
-  try {
-    await syncOfficialItems();
-  } catch (err: any) {
-    const msg = String(err?.message ?? err).split("\n")[0];
-    console.warn(`[db-setup] Official item re-sync failed (non-fatal, retried on next boot): ${msg}`);
+  if (BRIDGE_MODE && !bridgeUp) {
+    console.warn(
+      "[db-setup] Laptop bridge not connected yet — item re-sync skipped this boot.\n" +
+        "    It will run automatically on the next restart once the bridge is online."
+    );
+  } else {
+    try {
+      await syncOfficialItems();
+    } catch (err: any) {
+      const msg = String(err?.message ?? err).split("\n")[0];
+      console.warn(`[db-setup] Official item re-sync failed (non-fatal, retried on next boot): ${msg}`);
+    }
   }
 
   // v2.0: decrypt any v1.x encrypted world rows back into plain JSON

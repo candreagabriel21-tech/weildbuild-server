@@ -219,7 +219,9 @@ export const bridgeRouter = Router();
 
 // GET /__bridge/poll?token=...  — laptop pulls the next job (held ≤25s)
 bridgeRouter.get("/poll", (req, res) => {
-  if (req.query.token !== INTERNAL_TOKEN) {
+  // v1.10.1: an unset INTERNAL_TOKEN would make "" match "" — i.e. an OPEN
+  // door. If the token is not configured there is no bridge, fail closed.
+  if (!INTERNAL_TOKEN || req.query.token !== INTERNAL_TOKEN) {
     res.status(401).json({ error: "bad token" });
     return;
   }
@@ -247,7 +249,7 @@ bridgeRouter.get("/poll", (req, res) => {
 
 // POST /__bridge/result?token=...  { jobId, ok, data|error }  — laptop pushes result
 bridgeRouter.post("/result", (req, res) => {
-  if (INTERNAL_TOKEN && req.query.token !== INTERNAL_TOKEN) {
+  if (!INTERNAL_TOKEN || req.query.token !== INTERNAL_TOKEN) {
     res.status(401).json({ error: "bad token" });
     return;
   }
@@ -264,12 +266,30 @@ bridgeRouter.post("/result", (req, res) => {
 
 // GET /__bridge/status  — always 200, never blocks. For UptimeRobot + you.
 bridgeRouter.get("/status", (_req, res) => {
-  const connected = lastPollAt > 0 && Date.now() - lastPollAt < 60000;
   res.json({
-    connected,
+    connected: isBridgeConnected(),
     lastPollSecondsAgo: lastPollAt ? Math.round((Date.now() - lastPollAt) / 1000) : -1,
     pending: pending.size,
     queued: queue.length,
-    version: "wb-bridge-1.0",
+    version: "wb-bridge-1.1",
   });
 });
+
+// ─────────────────────────────────────────────────────────────
+// Connection probes for the boot sequence (src/db/ensure.ts):
+// the laptop polls within seconds of starting, so the item re-sync
+// just waits briefly for the first poll instead of firing 34 relay
+// jobs into an offline queue (each would hang for the job timeout).
+// ─────────────────────────────────────────────────────────────
+export function isBridgeConnected(): boolean {
+  return lastPollAt > 0 && Date.now() - lastPollAt < 60000;
+}
+
+export async function waitForBridgeConnection(timeoutMs: number): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (isBridgeConnected()) return true;
+    await new Promise((resolve) => setTimeout(resolve, 3000));
+  }
+  return isBridgeConnected();
+}

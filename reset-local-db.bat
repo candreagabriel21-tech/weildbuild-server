@@ -24,18 +24,27 @@ if /i not "%CONFIRM%"=="YES" (
     exit /b 0
 )
 echo.
-echo Stopping the bridge task...
-schtasks /End /TN WeildBuildBridge >nul 2>&1
+echo Stopping the bridge (including the auto-restart keeper)...
+type nul > stop-now.flag
 taskkill /f /im node.exe >nul 2>&1
+taskkill /f /fi "WINDOWTITLE eq WeildBuild Bridge*" >nul 2>&1
 timeout /t 3 /nobreak >nul
+del stop-now.flag >nul 2>&1
+del bridge.lock >nul 2>&1
 if exist pgdata (
     rmdir /s /q pgdata
     echo Deleted pgdata.
 ) else (
     echo No pgdata folder found - nothing to delete.
 )
-echo Starting the bridge again...
-schtasks /Run /TN WeildBuildBridge >nul 2>&1
+echo Starting the bridge again (hidden, same as at logon)...
+set "VBS=%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\start-weildbuild-bridge.vbs"
+if exist "%VBS%" (
+    wscript.exe "%VBS%"
+) else (
+    echo Auto-start not installed yet - run install-on-laptop.ps1 first,
+    echo or double-click start-bridge.bat to run the bridge in a window.
+)
 echo.
 echo Done. On the next start the bridge rebuilds the schema
 echo automatically. Check bridge-log.txt or open

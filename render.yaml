@@ -43,8 +43,14 @@ services:
     envVars:
       - key: NODE_ENV
         value: production
+      # ── v1.10.1 LAPTOP BRIDGE: main no longer talks to a cloud database ──
+      # USE_BRIDGE=1 tells the boot sequence that the database is the laptop's
+      # (the worker polls /__bridge/*). DATABASE_URL / B2_* below stay only so
+      # a `git revert` restores the old Neon+B2 behavior in one step.
+      - key: USE_BRIDGE
+        value: "1"
       # ── Secrets (fill in during blueprint setup, Render asks you) ──
-      - key: DATABASE_URL          # Neon connection string
+      - key: DATABASE_URL          # Neon connection string (UNUSED in bridge mode)
         sync: false
       - key: AUTH_SECRET           # same 96-hex-char value on EVERY service
         sync: false
