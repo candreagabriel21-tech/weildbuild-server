@@ -39,8 +39,27 @@ import { Router } from "express";
 import crypto from "crypto";
 
 const INTERNAL_TOKEN = process.env.INTERNAL_TOKEN || "";
-const JOB_TIMEOUT_MS = parseInt(process.env.BRIDGE_JOB_TIMEOUT_MS || "45000", 10);
-const POLL_HOLD_MS = parseInt(process.env.BRIDGE_POLL_HOLD_MS || "20000", 10);
+// v1.11.1 LATENCY FIX:
+//   JOB_TIMEOUT_MS 45000 -> 60000: a slow storage.put (a multi-MB world
+//     upload) on a cold laptop disk was hitting the 45s ceiling, failing
+//     the user's PUT /games with a "bridge error", and forcing a retry
+//     that doubled the perceived latency. 60s gives a 3 MB world
+//     written to a HDD plenty of room.
+//   POLL_HOLD_MS 20000 -> 30000: one long-poll now covers the full
+//     POLL_TIMEOUT_MS window the laptop uses (30s), so a single poll
+//     cycle on a quiet bridge burns exactly one HTTPS connection instead
+//     of two (the 20s hold left a 10s gap where the laptop had to
+//     reconnect). Fewer TLS handshakes = lower average request latency.
+const JOB_TIMEOUT_MS = parseInt(process.env.BRIDGE_JOB_TIMEOUT_MS || "60000", 10);
+const POLL_HOLD_MS = parseInt(process.env.BRIDGE_POLL_HOLD_MS || "30000", 10);
+// POLL_BATCH_MAX: how many jobs to drain from the queue per /poll call.
+// The laptop caps its own batch size (BRIDGE_POLL_BATCH_MAX, default 5),
+// so the effective batch is min(both). When the page boot fires 5
+// requests at once (refreshUser, fetchGames, fetchItems, /version,
+// fetchNotifications) they used to take 5 sequential laptop-poll cycles
+// (~5 × 2.5s = 12s on a quiet bridge). With batch pickup they take 1
+// cycle (~100ms wait + parallel local SQL).
+const POLL_BATCH_MAX = parseInt(process.env.BRIDGE_POLL_BATCH_MAX || "5", 10);
 const RESULT_MAX_BYTES = 8 * 1024 * 1024;
 let lastPollAt = 0;
 
@@ -264,15 +283,26 @@ function tokenOk(req: any): boolean {
 // ─────────────────────────────────────────────────────────────
 export const bridgeRouter = Router();
 
-// GET /__bridge/poll — laptop pulls the next job (held ≤25s).
+// GET /__bridge/poll — laptop pulls the next job (held ≤ POLL_HOLD_MS).
 // Auth via x-internal-token header (preferred) or ?token= (legacy).
+//
+// v1.11.1 BATCH PICKUP (opt-in): when the laptop sends `?batch=1` the
+// response is `{ jobs: [<job>, <job>, ...] }` with up to POLL_BATCH_MAX
+// jobs. Without `?batch=1` (or any pre-v1.11.1 laptop) the response is
+// the legacy single-job shape `{ jobId, type, ... }` — exactly one job
+// per poll. The opt-in is important: a batched response given to an
+// old laptop that only reads top-level `jobId` would silently drop the
+// rest of the batch on the floor (the jobs have already been shifted
+// off the queue). With opt-in, old laptops keep working one-at-a-time
+// and new laptops get the speedup.
 bridgeRouter.get("/poll", (req, res) => {
   if (!tokenOk(req)) { res.status(401).json({ error: "bad token" }); return; }
   lastPollAt = Date.now();
+  const wantsBatch = req.query.batch === "1" || req.query.batch === "true";
   (async () => {
     try {
-      let job = queue.shift() || null;
-      if (!job) {
+      let firstJob = queue.shift() || null;
+      if (!firstJob) {
         await new Promise<void>((resolve) => {
           waiters.push(resolve);
           setTimeout(() => {
@@ -281,9 +311,26 @@ bridgeRouter.get("/poll", (req, res) => {
             resolve();
           }, POLL_HOLD_MS);
         });
-        job = queue.shift() || null;
+        firstJob = queue.shift() || null;
       }
-      res.json(job || { jobs: [] });
+      if (!firstJob) { res.json(wantsBatch ? { jobs: [] } : { jobs: [] }); return; }
+
+      if (!wantsBatch) {
+        // Legacy single-job response. One job per poll. Keeps every
+        // pre-v1.11.1 laptop working unchanged.
+        res.json(firstJob);
+        return;
+      }
+      // Batched response: drain up to POLL_BATCH_MAX - 1 more jobs. Each
+      // has its own pending Promise + JOB_TIMEOUT_MS timer (set at
+      // enqueue() time), so batching does not change per-job timeout.
+      const batch = [firstJob];
+      while (batch.length < POLL_BATCH_MAX) {
+        const next = queue.shift();
+        if (!next) break;
+        batch.push(next);
+      }
+      res.json({ jobs: batch });
     } catch (e) {
       if (!res.headersSent) res.status(500).json({ error: String(e) });
     }

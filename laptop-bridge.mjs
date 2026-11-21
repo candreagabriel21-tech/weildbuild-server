@@ -78,6 +78,32 @@ const STORAGE_DIR = process.env.STORAGE_DIR || path.join(__dirname, "wb-storage"
 const POLL_TIMEOUT_MS = 30_000;
 const STATUS_PORT = parseInt(process.env.WB_STATUS_PORT || "7878", 10);
 
+// v1.11.1 LATENCY FIX: how aggressively the laptop polls Render.
+//
+//   POLL_IDLE_GAP_MS  - the gap between the previous poll finishing and
+//                      the next one starting. The old default was a flat
+//                      5000 ms — which means a job that arrived on Render
+//                      the instant the laptop went to sleep waited an
+//                      average of 2500 ms before anyone picked it up.
+//                      At 200 ms the average wait is 100 ms. Long-poll
+//                      keeps us parked on Render the rest of the time,
+//                      so a busy bridge sees ~0 ms wait; this only
+//                      matters when long-poll returns empty.
+//
+//   POLL_BATCH_MAX    - how many jobs to fetch and run at once when a
+//                      single poll returns a batch. The Render side
+//                      (render-bridge.ts POLL_BATCH_MAX) caps this too;
+//                      the effective batch size is min(both).
+//
+//   POLL_CONCURRENCY  - how many of those batched jobs run in parallel
+//                      against the local Postgres. Prisma handles
+//                      concurrent queries fine; 4 is conservative, 8 is
+//                      fine on a modern laptop. Set higher if your DB
+//                      is on an SSD and you're under heavy load.
+const POLL_IDLE_GAP_MS = parseInt(process.env.BRIDGE_POLL_IDLE_GAP_MS || "200", 10);
+const POLL_BATCH_MAX   = parseInt(process.env.BRIDGE_POLL_BATCH_MAX   || "5", 10);
+const POLL_CONCURRENCY = parseInt(process.env.BRIDGE_POLL_CONCURRENCY || "4", 10);
+
 const USE_EMBEDDED_PG = (process.env.USE_EMBEDDED_PG ?? "1") !== "0";
 const PG_DATA_DIR = process.env.PG_DATA_DIR || path.join(__dirname, "pgdata");
 const PG_PORT = parseInt(process.env.PG_PORT || "5433", 10);
@@ -351,8 +377,12 @@ async function postResult(jobId, ok, payload) {
 }
 
 async function pollOnce() {
+  // v1.11.1: send ?batch=1 so Render returns up to POLL_BATCH_MAX jobs
+  // per poll instead of one. A pre-v1.11.1 Render (or any Render that
+  // ignores the query string) still returns the legacy single-job
+  // shape, which our parser below handles via the `body?.jobId` branch.
   const res = await fetch(
-    `${RENDER_URL}/__bridge/poll?token=${encodeURIComponent(INTERNAL_TOKEN)}`,
+    `${RENDER_URL}/__bridge/poll?token=${encodeURIComponent(INTERNAL_TOKEN)}&batch=1`,
     { signal: AbortSignal.timeout(POLL_TIMEOUT_MS) }
   );
   if (res.status === 401) {
@@ -361,22 +391,59 @@ async function pollOnce() {
     return;
   }
   if (!res.ok) throw new Error(`poll HTTP ${res.status}`);
-  const job = await res.json();
-  if (job && job.jobId) {
-    const t0 = Date.now();
-    const label = job.type === "db" ? `db.${job.model}.${job.op}` : job.type;
-    try {
-      const data = await doJob(job);
-      await postResult(job.jobId, true, { data });
-      stats.jobsOk++;
-      stats.lastJobAt = Date.now();
-      log(`  ✓ ${job.jobId.slice(0, 8)} ${label} ${Date.now() - t0}ms`);
-    } catch (e) {
-      await postResult(job.jobId, false, { error: String(e.message || e) });
-      stats.jobsFail++;
-      stats.lastError = String(e.message || e);
-      console.error(`  ✗ ${job.jobId.slice(0, 8)} ${label} FAIL: ${e.message || e}`);
+  const body = await res.json();
+
+  // v1.11.1: Render returns either a single job ({ jobId, ... }) for
+  // backwards compat, or a batch ({ jobs: [{ jobId, ... }, ...] }).
+  // Normalise to an array, capped at POLL_BATCH_MAX so we never starve
+  // other polls if Render somehow returns a huge batch.
+  let jobs = [];
+  if (Array.isArray(body?.jobs)) {
+    jobs = body.jobs.slice(0, POLL_BATCH_MAX);
+  } else if (body?.jobId) {
+    jobs = [body];
+  }
+  if (jobs.length === 0) return;
+
+  // Run the batched jobs concurrently. Each job independently POSTs its
+  // result back to /__bridge/result as soon as it finishes, so a slow
+  // job (a 3 MB game.put) does not block the result of a fast one (a
+  // user.findUnique) in the same batch. Concurrency is capped at
+  // POLL_CONCURRENCY to protect the local Postgres connection pool.
+  const runners = [];
+  let active = 0;
+  for (const job of jobs) {
+    // simple concurrency limiter
+    while (active >= POLL_CONCURRENCY) {
+      await Promise.race(runners);
     }
+    const p = runOneJob(job).finally(() => {
+      active--;
+      // remove self from runners once settled so the array doesn't grow
+      const i = runners.indexOf(p);
+      if (i >= 0) runners.splice(i, 1);
+    });
+    runners.push(p);
+    active++;
+  }
+  await Promise.all(runners);
+}
+
+async function runOneJob(job) {
+  if (!job || !job.jobId) return;
+  const t0 = Date.now();
+  const label = job.type === "db" ? `db.${job.model}.${job.op}` : job.type;
+  try {
+    const data = await doJob(job);
+    await postResult(job.jobId, true, { data });
+    stats.jobsOk++;
+    stats.lastJobAt = Date.now();
+    log(`  ✓ ${job.jobId.slice(0, 8)} ${label} ${Date.now() - t0}ms`);
+  } catch (e) {
+    await postResult(job.jobId, false, { error: String(e.message || e) });
+    stats.jobsFail++;
+    stats.lastError = String(e.message || e);
+    console.error(`  ✗ ${job.jobId.slice(0, 8)} ${label} FAIL: ${e.message || e}`);
   }
 }
 

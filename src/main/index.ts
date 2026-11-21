@@ -22,6 +22,7 @@ import { storageRouter } from "./routes/storage";
 import { reportsRouter } from "./routes/reports";
 import { instancesRouter, internalRouter } from "./routes/instances";
 import { votesRouter } from "./routes/votes";
+import { bootstrapRouter } from "./routes/bootstrap";
 import { bridgeRouter, isBridgeConnected } from "../bridge/render-bridge";
 import { getEffectiveSettings } from "../db/settings";
 import { ensureDatabase } from "../db/ensure";
@@ -129,6 +130,12 @@ app.get("/version", async (_req, res) => {
 //    old Next.js app used, so the client only changes its base
 //    URL, nothing else) ──
 app.use("/api/auth", authRouter);
+// v1.11.1 LATENCY FIX: /api/bootstrap returns version + user + games +
+// items + notifications in ONE round-trip. The client uses it on boot
+// instead of firing five separate requests. Each section carries its
+// own `ok` flag so the client can fall back to the legacy endpoint for
+// any section that failed. See src/main/routes/bootstrap.ts.
+app.use("/api/bootstrap", bootstrapRouter);
 app.use("/api/users", usersRouter);
 app.use("/api/friends", friendsRouter);
 app.use("/api/games", gamesRouter);
