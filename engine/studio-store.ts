@@ -1952,7 +1952,20 @@ export const useStudioStore = create<StudioStore>((set, get) => ({
   setShowAxisGizmo: (show) => set({ showAxisGizmo: show }),
   setShowCharacterPreview: (show) => set({ showCharacterPreview: show }),
   // Global variables & timers
-  setGlobalVariable: (name, value) => set(state => ({ globalVariables: { ...state.globalVariables, [name]: value } })),
+  setGlobalVariable: (name, value) => set(state => {
+    // v1.11 security patch (prototype pollution guard).
+    // A world rule can set a variable named '__proto__' or 'constructor'
+    // which the spread below would write onto Object.prototype. Reject
+    // those names outright; see platform-patches/PATCHES.md (PATCH 2).
+    if (name === '__proto__' || name === 'constructor' || name === 'prototype'
+        || typeof name !== 'string' || name.length === 0) {
+      console.warn('[studio] rejected setGlobalVariable with dangerous name:', name);
+      return {};
+    }
+    const vars = { ...state.globalVariables };
+    vars[name] = value;
+    return { globalVariables: vars };
+  }),
   deleteGlobalVariable: (name) => set(state => {
     const vars = { ...state.globalVariables };
     delete vars[name];

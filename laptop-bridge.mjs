@@ -1,49 +1,82 @@
 // ═══════════════════════════════════════════════════════════
-// WeildBuild Bridge — laptop side (the worker)
+// WeildBuild Bridge — laptop worker (the ONE file)
 // ═══════════════════════════════════════════════════════════
-// Runs on the Windows laptop. Boots a LOCAL Postgres (embedded
-// binaries, no installer, no Windows service, no password prompts),
-// syncs the schema, then polls the Render main server over OUTBOUND
-// HTTPS, runs each job against the local database + a local storage
-// folder, and POSTs the result back. It never accepts inbound
-// connections, so it works behind any NAT / home router / CGNAT and
-// needs no tunnel, no port forward, no Cloudflare, no public IP.
+// What it does, in one sentence: it polls the Render main server
+// over outbound HTTPS, runs each job against a LOCAL embedded
+// Postgres + a local file-storage folder, and POSTs the result
+// back. Render never talks to the laptop first; the laptop only
+// ever calls out. No tunnel, no port-forward, no Cloudflare, no
+// public IP, no inbound port. It just works behind a home router.
 //
-// One process = Postgres + schema + bridge worker. Drop this file
-// into the server repo (next to package.json) and run:
-//   npm install
+// ONE process does everything:
+//   1. boots an embedded Postgres (no installer, no Windows
+//      service, no password prompt — the binaries ship in
+//      node_modules, the data lives in ./pgdata next to this file)
+//   2. runs `prisma db push` once so the schema matches schema.prisma
+//   3. runs the relay poll loop against Render
+//   4. serves a tiny status page at http://localhost:7878 so you
+//      have ONE place to look: "is the laptop connected to Render?"
+//      + "is the local database up?" + "how many jobs have run?".
+//      No more "BRIDGE NOT OPEN" guessing.
+//
+// THE LOCK IS THE PORT. Binding 127.0.0.1:7878 is the single-
+// instance guard. The OS releases it the instant the process
+// dies, so there is no `bridge.lock` file to go stale and no
+// "ghost" bridge from a crashed previous run. If you see
+// "EADDRINUSE" on startup it means another bridge is already
+// running — find it (Task Manager → node.exe in this folder) and
+// stop it with stop.bat, or just reboot. No more stale locks.
+//
+// Run it:
 //   node laptop-bridge.mjs
-// (install-on-laptop.ps1 does those two steps + the auto-start task)
+// Or use the batch files:
+//   start.bat   (visible window with the live log)
+//   stop.bat    (clean shutdown)
+//   db.bat      (open a SQL console against the local database)
 //
-// Config (in .env next to this file, or real env vars):
+// Config (in .env next to this file, or real env vars). The
+// installer writes .env for you — you almost never edit it by hand:
 //   RENDER_URL        https://weildbuild-server.onrender.com
-//   INTERNAL_TOKEN    (same value Render has)
+//   INTERNAL_TOKEN    (same value Render has, in its Environment tab)
 //   STORAGE_DIR       D:\wb-storage   (optional, default .\wb-storage)
 //   USE_EMBEDDED_PG   1 (default) — set 0 to use an external Postgres
 //   PG_DATA_DIR       (optional, default .\pgdata — delete it to reset)
 //   PG_PORT           (optional, default 5433)
 //   PG_PASSWORD       (required on first init; the installer writes it)
-//   DATABASE_URL      (optional — built from the PG_* values if omitted)
 
 import fs from "node:fs";
 import path from "node:path";
 import url from "node:url";
+import http from "node:http";
 import { execSync } from "node:child_process";
 
-// Load .env from the script's own folder (no dotenv dep needed).
 const __dirname = path.dirname(url.fileURLToPath(import.meta.url));
-const envPath = path.join(__dirname, ".env");
-if (fs.existsSync(envPath)) {
+
+// ── .env loader (no dotenv dependency) ──
+// Strips inline `# comments` and surrounding quotes — the old
+// hand-rolled parser left `INTERNAL_TOKEN=abc123 # note` with the
+// trailing comment baked into the token, which broke auth in a
+// way that was nearly impossible to debug.
+function loadDotEnv() {
+  const envPath = path.join(__dirname, ".env");
+  if (!fs.existsSync(envPath)) return;
   for (const line of fs.readFileSync(envPath, "utf8").split("\n")) {
     const m = line.match(/^\s*([A-Z_][A-Z0-9_]*)\s*=\s*(.*)\s*$/);
-    if (m && !process.env[m[1]]) process.env[m[1]] = m[2].replace(/^["']|["']$/g, "");
+    if (!m) continue;
+    let v = m[2];
+    const hash = v.indexOf(" #");
+    if (hash >= 0) v = v.slice(0, hash); // strip inline comment
+    v = v.trim().replace(/^["']|["']$/g, "");
+    if (!process.env[m[1]]) process.env[m[1]] = v;
   }
 }
+loadDotEnv();
 
 const RENDER_URL = (process.env.RENDER_URL || "").replace(/\/$/, "");
 const INTERNAL_TOKEN = process.env.INTERNAL_TOKEN || "";
 const STORAGE_DIR = process.env.STORAGE_DIR || path.join(__dirname, "wb-storage");
 const POLL_TIMEOUT_MS = 30_000;
+const STATUS_PORT = parseInt(process.env.WB_STATUS_PORT || "7878", 10);
 
 const USE_EMBEDDED_PG = (process.env.USE_EMBEDDED_PG ?? "1") !== "0";
 const PG_DATA_DIR = process.env.PG_DATA_DIR || path.join(__dirname, "pgdata");
@@ -54,57 +87,44 @@ const DB_NAME = process.env.PG_DB_NAME || "weildbuild";
 const DATABASE_URL =
   process.env.DATABASE_URL ||
   `postgresql://${PG_USER}:${encodeURIComponent(PG_PASSWORD)}@127.0.0.1:${PG_PORT}/${DB_NAME}`;
-// v1.10.1: the relay's PrismaClient reads process.env.DATABASE_URL at query
-// time (schema.prisma: url = env("DATABASE_URL")). Computing the local URL is
-// not enough — it must be EXPORTED, otherwise every relayed job fails with
-// "Environment variable not found: DATABASE_URL" (the installer normally
-// writes it into .env, but do not depend on that).
+// The relay's PrismaClient reads process.env.DATABASE_URL at query
+// time, so it must be EXPORTED here even if .env already has it.
 process.env.DATABASE_URL = process.env.DATABASE_URL || DATABASE_URL;
 
 const log = (...a) => console.log(`[wb-bridge ${new Date().toISOString().slice(11, 19)}]`, ...a);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 if (!RENDER_URL || !INTERNAL_TOKEN) {
-  console.error("✗ Set RENDER_URL and INTERNAL_TOKEN in .env first (the installer does this).");
+  console.error("✗ Set RENDER_URL and INTERNAL_TOKEN in .env first (run install.bat to do this for you).");
   process.exit(1);
 }
 
 // ─────────────────────────────────────────────────────────────
-// Single-instance guard: only one bridge may own the local
-// Postgres port. Exits with code 3 when another live instance
-// holds the lock (the auto-start keeper script bows out on 3).
+// SINGLE-INSTANCE LOCK = the status port. The OS releases it on
+// process death, so there is no stale-file race and no ghost.
 // ─────────────────────────────────────────────────────────────
-const LOCK_PATH = path.join(__dirname, "bridge.lock");
-let lockHolder = null;
-try {
-  const fd = fs.openSync(LOCK_PATH, "wx");
-  fs.writeSync(fd, String(process.pid));
-  fs.closeSync(fd);
-} catch {
-  try { lockHolder = parseInt(fs.readFileSync(LOCK_PATH, "utf8").trim(), 10) || null; } catch {}
-  let alive = false;
-  if (lockHolder) {
-    try { process.kill(lockHolder, 0); alive = true; }
-    catch (e) { alive = e.code === "EPERM"; } // EPERM = exists but not signalable
-  }
-  if (alive) {
-    console.log(`WeildBuild bridge is already running (process ${lockHolder}). Nothing to do.`);
-    process.exit(3);
-  }
-  // stale lock from a crash — take it over
-  try { fs.unlinkSync(LOCK_PATH); } catch {}
-  try {
-    const fd = fs.openSync(LOCK_PATH, "wx");
-    fs.writeSync(fd, String(process.pid));
-    fs.closeSync(fd);
-  } catch {}
+let statusServer = null;
+function acquireLock() {
+  return new Promise((resolve, reject) => {
+    statusServer = http.createServer();
+    statusServer.once("error", (e) => {
+      if (e.code === "EADDRINUSE") {
+        console.error(`✗ Another WeildBuild bridge is already running (status port ${STATUS_PORT} is taken).\n` +
+          `  Stop it with stop.bat (or close its window) and try again. No stale lock — the port freed\n` +
+          `  automatically when the other process exited, this just means it is still running RIGHT NOW.`);
+        process.exit(3);
+      }
+      reject(e);
+    });
+    statusServer.once("listening", () => resolve());
+    statusServer.listen(STATUS_PORT, "127.0.0.1");
+  });
 }
 
 // ─────────────────────────────────────────────────────────────
-// JSON transport helpers (mirror of render-bridge.ts).
-// Buffers (the 4 MB game-world blob), Dates and BigInts cannot
-// travel as plain JSON, so they travel as marked objects and are
-// rehydrated on the other side.
+// JSON transport helpers (mirror of render-bridge.ts). Buffers,
+// Dates and BigInts cannot travel as plain JSON, so they travel
+// as marked objects and are rehydrated on the other side.
 // ─────────────────────────────────────────────────────────────
 function reviveTransport(value) {
   if (Array.isArray(value)) return value.map(reviveTransport);
@@ -122,9 +142,8 @@ function reviveTransport(value) {
   }
   return value;
 }
-
 function jsonReplacer(_k, v) {
-  const raw = this[_k]; // the raw value BEFORE Buffer/Date toJSON mangled it
+  const raw = this[_k];
   if (Buffer.isBuffer(raw) || raw instanceof Uint8Array) {
     return { __wbBytes: Buffer.from(raw).toString("base64") };
   }
@@ -134,10 +153,35 @@ function jsonReplacer(_k, v) {
 }
 
 // ─────────────────────────────────────────────────────────────
+// Storage. The path-traversal guard here is FIXED vs the original:
+// it checks that the resolved full path is under STORAGE_DIR
+// itself (not under STORAGE_DIR/<bucket>, which let `bucket=../..`
+// escape). Buckets are also whitelisted to the four the server
+// actually uses, so a tampered job cannot invent a new bucket.
+// ─────────────────────────────────────────────────────────────
+const ALLOWED_BUCKETS = new Set([
+  "weildbuild", "weildbuild-gamefiles", "weildbuild-reports", "weildbuild-backups",
+]);
+const MAX_PUT_BYTES = 50 * 1024 * 1024; // 50 MB hard cap on any one file
+
+function safeStoragePath(bucket, key) {
+  if (!ALLOWED_BUCKETS.has(bucket)) throw new Error(`bad bucket ${bucket}`);
+  if (typeof key !== "string" || key.length === 0 || key.length > 1024) throw new Error("bad key");
+  if (key.includes("\0") || key.includes("\\") || key.includes("//")) throw new Error("bad key");
+  const root = path.resolve(STORAGE_DIR, bucket);
+  const full = path.resolve(root, key);
+  // `path.relative` returns a non-`.`-free string when `full` is
+  // outside `root`, so we check that the relative path stays inside
+  // and does not start with `..`.
+  const rel = path.relative(root, full);
+  if (rel.startsWith("..") || path.isAbsolute(rel)) throw new Error("bad storage key");
+  return full;
+}
+
+// ─────────────────────────────────────────────────────────────
 // Boot local Postgres (embedded, no installer) + sync the schema.
 // ─────────────────────────────────────────────────────────────
 let pg = null;
-
 async function bootDatabase() {
   if (!USE_EMBEDDED_PG) {
     log("USE_EMBEDDED_PG=0 — using external DATABASE_URL, skipping embedded Postgres boot");
@@ -146,7 +190,7 @@ async function bootDatabase() {
   const needsInit = !fs.existsSync(path.join(PG_DATA_DIR, "PG_VERSION"));
   if (needsInit && !PG_PASSWORD) {
     console.error("✗ PG_PASSWORD missing in .env but the local database is not initialised yet.\n" +
-      "  Re-run install-on-laptop.ps1 (it writes PG_PASSWORD), or delete .env and run it again.");
+      "  Run install.bat (it writes PG_PASSWORD), or delete .env and run it again.");
     process.exit(1);
   }
   let EmbeddedPostgres;
@@ -156,12 +200,16 @@ async function bootDatabase() {
     console.error("✗ embedded-postgres is not installed. Run:  npm install  (inside the server folder)");
     process.exit(1);
   }
+  // NOTE: we deliberately do NOT fall back to "postgres" if
+  // PG_PASSWORD is empty on a re-init. The original did, and that
+  // silently weakened a previously-strong generated password to a
+  // well-known one if .env was ever deleted. Fail loudly instead.
   pg = new EmbeddedPostgres({
     databaseDir: PG_DATA_DIR,
     user: PG_USER,
-    password: PG_PASSWORD || "postgres",
+    password: PG_PASSWORD,
     port: PG_PORT,
-    persistent: true, // keep the data files across restarts
+    persistent: true,
   });
   if (needsInit) {
     log(`initialising local Postgres cluster at ${PG_DATA_DIR} (first run only)…`);
@@ -185,7 +233,7 @@ function runPrismaCmd(args, timeoutMs = 240_000) {
       timeout: timeoutMs,
       env: { ...process.env, DATABASE_URL },
       stdio: ["ignore", "pipe", "pipe"],
-      shell: process.platform === "win32", // npx is npx.cmd on Windows
+      shell: process.platform === "win32",
     }).toString();
     log(out.trim().split("\n").slice(-3).join("\n    "));
   } catch (e) {
@@ -196,15 +244,10 @@ function runPrismaCmd(args, timeoutMs = 240_000) {
 }
 
 function ensurePrismaClient() {
-  // v1.10.1 FIX: checking only that index.js EXISTS is not enough. When
-  // `prisma generate` never ran (or failed), @prisma/client's postinstall
-  // leaves PLACEHOLDER files in .prisma/client — including an index.js —
-  // and every import then dies at runtime with
-  //   "@prisma/client did not initialize yet. Please run "prisma generate"…"
-  // (thrown from the placeholder's PrismaClient constructor, default.js:43).
-  // The real generated client always ships a copy of schema.prisma in the
-  // same folder; the placeholder set never does. So: index.js + schema.prisma
-  // present AND index.js not the placeholder stub = a usable client.
+  // The real generated client always ships a copy of schema.prisma in
+  // node_modules/.prisma/client. The placeholder the postinstall
+  // leaves when generate never ran does not. Use that to tell them
+  // apart.
   const dotPrisma = path.join(__dirname, "node_modules", ".prisma", "client");
   const indexJs = path.join(dotPrisma, "index.js");
   const schemaCopy = path.join(dotPrisma, "schema.prisma");
@@ -220,10 +263,6 @@ function ensurePrismaClient() {
   }
 }
 
-// v1.10.1: loading the client is now self-healing. If the import or the
-// constructor still fails (placeholder leftovers, half-written generate,
-// antivirus lock), run prisma generate and retry ONCE before giving up —
-// this kills the "worked on the second start, failed on the third" flakiness.
 async function loadPrismaClient() {
   const attempt = async () => {
     const { PrismaClient } = await import("@prisma/client");
@@ -244,139 +283,240 @@ async function boot() {
   fs.mkdirSync(STORAGE_DIR, { recursive: true });
   await bootDatabase();
   ensurePrismaClient();
-  // Idempotent: creates missing tables, no-ops when the schema is current.
   runPrismaCmd("db push --skip-generate");
   log("local database ready. Starting worker…");
 }
 
 // ─────────────────────────────────────────────────────────────
-// The worker itself.
+// The worker.
 // ─────────────────────────────────────────────────────────────
-async function bootAndStartLoop() {
+let prisma = null;
+let stats = { polls: 0, jobsOk: 0, jobsFail: 0, lastJobAt: 0, lastError: "" };
+
+async function doJob(job) {
+  if (job.type === "db") {
+    if (job.model === "$") {
+      // $executeRaw -> $executeRawUnsafe, $queryRaw -> $queryRawUnsafe.
+      // NOTE: the laptop does NOT trust the SQL — Render is the only
+      // thing that ever calls these (the bridge proxy on the server
+      // emits them from the prisma.$executeRaw tagged-template call
+      // site, which already uses parameter binding). A third party
+      // cannot reach this endpoint without the INTERNAL_TOKEN.
+      const fn = prisma["$" + job.op + "Unsafe"];
+      if (typeof fn !== "function") throw new Error(`unknown $ method $${job.op}`);
+      const params = (reviveTransport(job.args.params) || []);
+      return await fn.apply(prisma, [job.args.sql, ...params]);
+    }
+    const model = prisma[job.model];
+    if (!model) throw new Error(`unknown model ${job.model}`);
+    const op = model[job.op];
+    if (typeof op !== "function") throw new Error(`unknown op ${job.model}.${job.op}`);
+    return await op.call(model, reviveTransport(job.args) ?? {});
+  }
+  if (job.type === "storage.put") {
+    const full = safeStoragePath(job.bucket, job.key);
+    const buf = Buffer.from(job.bodyB64 || "", "base64");
+    if (buf.length > MAX_PUT_BYTES) throw new Error(`file too large (${buf.length} bytes)`);
+    fs.mkdirSync(path.dirname(full), { recursive: true });
+    fs.writeFileSync(full, buf);
+    return { key: job.key };
+  }
+  if (job.type === "storage.get") {
+    const full = safeStoragePath(job.bucket, job.key);
+    if (!fs.existsSync(full)) return null;
+    const buf = fs.readFileSync(full);
+    return { bodyB64: buf.toString("base64"), contentLength: buf.length, contentType: guessContentType(job.key) };
+  }
+  throw new Error(`unknown job type ${job.type}`);
+}
+
+function guessContentType(key) {
+  const ext = key.split(".").pop()?.toLowerCase();
+  const map = { png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg", gif: "image/gif",
+    webp: "image/webp", svg: "image/svg+xml", mp3: "audio/mpeg", wav: "audio/wav",
+    ogg: "audio/ogg", json: "application/json" };
+  return map[ext] || "application/octet-stream";
+}
+
+async function postResult(jobId, ok, payload) {
   try {
-    await boot();
-  } catch {
-    console.error("✗ boot failed — fix the error above and start the bridge again (start-bridge.bat).");
-    process.exit(1);
+    await fetch(`${RENDER_URL}/__bridge/result?token=${encodeURIComponent(INTERNAL_TOKEN)}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ jobId, ok, ...payload }, jsonReplacer),
+    });
+  } catch (e) {
+    console.error(`  ✗ failed to post result for ${jobId.slice(0, 8)}: ${e.message}`);
   }
+}
 
-  const prisma = await loadPrismaClient();
-
-  async function doJob(job) {
-    // ── DB job: prisma.<model>.<op>(args) or prisma.$executeRawUnsafe(sql,...) ──
-    if (job.type === "db") {
-      if (job.model === "$") {
-        // $executeRaw -> $executeRawUnsafe, $queryRaw -> $queryRawUnsafe
-        const fn = prisma["$" + job.op + "Unsafe"];
-        if (typeof fn !== "function") throw new Error(`unknown $ method $${job.op}`);
-        const params = (reviveTransport(job.args.params) || []);
-        return await fn.apply(prisma, [job.args.sql, ...params]);
-      }
-      const model = prisma[job.model];
-      if (!model) throw new Error(`unknown model ${job.model}`);
-      const op = model[job.op];
-      if (typeof op !== "function") throw new Error(`unknown op ${job.model}.${job.op}`);
-      return await op.call(model, reviveTransport(job.args) ?? {});
-    }
-    // ── storage.put: write bytes to <STORAGE_DIR>/<bucket>/<key> ──
-    if (job.type === "storage.put") {
-      const full = path.join(STORAGE_DIR, job.bucket, job.key);
-      // path traversal guard: the resolved path must stay inside the bucket
-      if (!path.resolve(full).startsWith(path.resolve(STORAGE_DIR, job.bucket) + path.sep)) {
-        throw new Error("bad storage key");
-      }
-      fs.mkdirSync(path.dirname(full), { recursive: true });
-      fs.writeFileSync(full, Buffer.from(job.bodyB64, "base64"));
-      return { key: job.key };
-    }
-    // ── storage.get: read bytes back as base64 ──
-    if (job.type === "storage.get") {
-      const full = path.join(STORAGE_DIR, job.bucket, job.key);
-      if (!path.resolve(full).startsWith(path.resolve(STORAGE_DIR, job.bucket) + path.sep)) {
-        throw new Error("bad storage key");
-      }
-      if (!fs.existsSync(full)) return null;
-      const buf = fs.readFileSync(full);
-      return { bodyB64: buf.toString("base64"), contentLength: buf.length, contentType: guessContentType(job.key) };
-    }
-    throw new Error(`unknown job type ${job.type}`);
+async function pollOnce() {
+  const res = await fetch(
+    `${RENDER_URL}/__bridge/poll?token=${encodeURIComponent(INTERNAL_TOKEN)}`,
+    { signal: AbortSignal.timeout(POLL_TIMEOUT_MS) }
+  );
+  if (res.status === 401) {
+    console.error("✗ 401 — INTERNAL_TOKEN in .env does not match Render. Fix .env, then restart.");
+    await sleep(5000);
+    return;
   }
-
-  function guessContentType(key) {
-    const ext = key.split(".").pop()?.toLowerCase();
-    const map = { png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg", gif: "image/gif",
-      webp: "image/webp", svg: "image/svg+xml", mp3: "audio/mpeg", wav: "audio/wav",
-      ogg: "audio/ogg", json: "application/json" };
-    return map[ext] || "application/octet-stream";
-  }
-
-  async function postResult(jobId, ok, payload) {
+  if (!res.ok) throw new Error(`poll HTTP ${res.status}`);
+  const job = await res.json();
+  if (job && job.jobId) {
+    const t0 = Date.now();
+    const label = job.type === "db" ? `db.${job.model}.${job.op}` : job.type;
     try {
-      await fetch(`${RENDER_URL}/__bridge/result?token=${encodeURIComponent(INTERNAL_TOKEN)}`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ jobId, ok, ...payload }, jsonReplacer),
-      });
+      const data = await doJob(job);
+      await postResult(job.jobId, true, { data });
+      stats.jobsOk++;
+      stats.lastJobAt = Date.now();
+      log(`  ✓ ${job.jobId.slice(0, 8)} ${label} ${Date.now() - t0}ms`);
     } catch (e) {
-      console.error(`  ✗ failed to post result for ${jobId.slice(0, 8)}: ${e.message}`);
+      await postResult(job.jobId, false, { error: String(e.message || e) });
+      stats.jobsFail++;
+      stats.lastError = String(e.message || e);
+      console.error(`  ✗ ${job.jobId.slice(0, 8)} ${label} FAIL: ${e.message || e}`);
     }
   }
+}
 
+async function pollLoop() {
   log(`polling ${RENDER_URL}/__bridge/poll (outbound long-poll) — press Ctrl+C to stop`);
   let backoff = 0;
-  while (true) {
+  while (!exiting) {
+    stats.polls++;
     try {
-      const res = await fetch(
-        `${RENDER_URL}/__bridge/poll?token=${encodeURIComponent(INTERNAL_TOKEN)}`,
-        { signal: AbortSignal.timeout(POLL_TIMEOUT_MS) }
-      );
-      if (res.status === 401) {
-        console.error("✗ 401 — INTERNAL_TOKEN in .env does not match Render. Fix .env, then restart.");
-        await sleep(5000);
-        continue;
-      }
-      if (!res.ok) throw new Error(`poll HTTP ${res.status}`);
-      const job = await res.json();
+      await pollOnce();
       backoff = 0;
-
-      if (job && job.jobId) {
-        const t0 = Date.now();
-        const label = job.type === "db" ? `db.${job.model}.${job.op}` : job.type;
-        try {
-          const data = await doJob(job);
-          await postResult(job.jobId, true, { data });
-          log(`  ✓ ${job.jobId.slice(0, 8)} ${label} ${Date.now() - t0}ms`);
-        } catch (e) {
-          await postResult(job.jobId, false, { error: String(e.message || e) });
-          console.error(`  ✗ ${job.jobId.slice(0, 8)} ${label} FAIL: ${e.message || e}`);
-        }
-      }
     } catch (e) {
       backoff = Math.min((backoff || 1) * 2, 15_000);
+      stats.lastError = String(e.message || e);
       console.error(`poll error, retry in ${backoff}ms: ${e.message}`);
       await sleep(backoff);
     }
   }
 }
 
-// Graceful shutdown: stop the embedded Postgres cleanly.
+// ─────────────────────────────────────────────────────────────
+// Status page — http://localhost:7878
+// ONE place to look. No more "BRIDGE NOT OPEN" guessing: it
+// shows the laptop's view (poll loop alive + DB up) and pings
+// Render's /__bridge/status (Render's view of the laptop) and
+// shows BOTH. Green dot = connected, red dot = not.
+// ─────────────────────────────────────────────────────────────
+function statusPageHtml() {
+  return `<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>WeildBuild bridge</title><style>
+  body{font:14px/1.5 -apple-system,Segoe UI,Roboto,sans-serif;background:#0f1115;color:#e6e6e6;margin:0;padding:24px}
+  .card{max-width:720px;margin:0 auto;background:#1a1d24;border:1px solid #2a2f3a;border-radius:12px;padding:24px}
+  h1{font-size:20px;margin:0 0 4px}.sub{color:#8b93a7;margin:0 0 20px}
+  .row{display:flex;align-items:center;gap:10px;padding:10px 0;border-top:1px solid #2a2f3a}
+  .dot{width:14px;height:14px;border-radius:50%;flex:0 0 auto}
+  .ok{background:#3ec47e;box-shadow:0 0 8px #3ec47e80}.bad{background:#ff5c5c;box-shadow:0 0 8px #ff5c5c80}
+  .wait{background:#f5a623;box-shadow:0 0 8px #f5a62380}
+  .label{flex:1}.small{color:#8b93a7;font-size:12px}
+  code{background:#0f1115;padding:2px 6px;border-radius:4px}
+  .stats{margin-top:16px;display:grid;grid-template-columns:repeat(2,1fr);gap:8px}
+  .stat{background:#0f1115;padding:10px;border-radius:6px}
+  .stat b{display:block;font-size:18px}.stat span{color:#8b93a7;font-size:12px}
+  a{color:#5b9dff}button{font:inherit;background:#2a2f3a;color:#e6e6e6;border:1px solid #3a3f4a;border-radius:6px;padding:6px 12px;cursor:pointer}
+</style></head><body><div class="card">
+<h1>WeildBuild bridge</h1>
+<p class="sub">The laptop worker. Polls <code>${RENDER_URL}</code> over outbound HTTPS.</p>
+<div id="r"></div>
+<div class="stats">
+  <div class="stat"><b id="ok">0</b><span>jobs completed</span></div>
+  <div class="stat"><b id="fail">0</b><span>jobs failed</span></div>
+  <div class="stat"><b id="polls">0</b><span>poll cycles</span></div>
+  <div class="stat"><b id="last">never</b><span>last successful job</span></div>
+</div>
+<p class="small" style="margin-top:18px">Stop the bridge: double-click <code>stop.bat</code> next to <code>laptop-bridge.mjs</code>.<br>
+Open a SQL console: double-click <code>db.bat</code>.<br>
+Reset the database: in <code>db.bat</code> type <code>RESET</code>.</p>
+</div><script>
+async function go(){
+  const r = document.getElementById('r');
+  try {
+    const j = await fetch('/api/status').then(r=>r.json());
+    const dot = (b,wait)=>'<span class="dot '+(b?'ok':(wait?'wait':'bad'))+'"></span>';
+    const ago = s => s < 0 ? 'never' : (s < 60 ? s+'s ago' : Math.floor(s/60)+'m ago');
+    r.innerHTML =
+      '<div class="row">'+dot(j.pollAlive, j.pollBackoff)+'<div class="label">Poll loop is '+(j.pollAlive?'alive':'backing off')+'</div><div class="small">'+(j.pollBackoff?('retry in '+j.pollBackoff+'ms'):'')+'</div></div>'
+      + '<div class="row">'+dot(j.dbUp)+'<div class="label">Local database (embedded Postgres on :'+j.pgPort+')</div><div class="small">'+(j.dbUp?'running':'down')+'</div></div>'
+      + '<div class="row">'+dot(j.renderSeesLaptop)+'<div class="label">Render sees this laptop</div><div class="small">'+(j.renderSeesLaptop?'connected — Render accepts jobs':'not yet — Render says <code>connected:false</code>. Wait for the next poll, or check INTERNAL_TOKEN.')+'</div></div>'
+      + '<div class="row"><span class="dot '+(j.lastError?'bad':'ok')+'"></span><div class="label">Last error</div><div class="small">'+(j.lastError||'none')+'</div></div>';
+    document.getElementById('ok').textContent = j.ok;
+    document.getElementById('fail').textContent = j.fail;
+    document.getElementById('polls').textContent = j.polls;
+    document.getElementById('last').textContent = j.lastJobAt ? ago(Math.floor((Date.now()-j.lastJobAt)/1000)) : 'never';
+  } catch(e){ r.innerHTML = '<div class="row"><span class="dot bad"></span><div class="label">'+e+'</div></div>'; }
+}
+go(); setInterval(go, 3000);
+</script></body></html>`;
+}
+
+let pollAlive = false;
+let pollBackoff = 0;
+
+async function renderSeesLaptop() {
+  // The laptop asks Render: "do you see me?" — Render's
+  // /__bridge/status is unauthenticated on purpose (it carries no
+  // secrets, just a boolean + counts). The token is NOT in the
+  // URL anymore (the original leaked it in Render's access logs).
+  try {
+    const r = await fetch(`${RENDER_URL}/__bridge/status`, { signal: AbortSignal.timeout(5000) });
+    if (!r.ok) return false;
+    const j = await r.json();
+    return !!(j && j.connected);
+  } catch { return false; }
+}
+
+function startStatusServer() {
+  statusServer.on("request", async (req, res) => {
+    if (req.url === "/" || req.url === "/index.html") {
+      res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+      res.end(statusPageHtml());
+      return;
+    }
+    if (req.url === "/api/status") {
+      let dbUp = false;
+      try {
+        if (prisma) await prisma.$queryRaw`SELECT 1`;
+        dbUp = !!prisma;
+      } catch {}
+      const render = await renderSeesLaptop();
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({
+        pollAlive, pollBackoff,
+        dbUp, pgPort: PG_PORT,
+        renderSeesLaptop: render,
+        ok: stats.jobsOk, fail: stats.jobsFail, polls: stats.polls,
+        lastJobAt: stats.lastJobAt, lastError: stats.lastError,
+        uptimeSeconds: Math.floor((Date.now() - startedAt) / 1000),
+      }));
+      return;
+    }
+    res.writeHead(404).end();
+  });
+}
+
+// ─────────────────────────────────────────────────────────────
+// Shutdown.
+// ─────────────────────────────────────────────────────────────
 let exiting = false;
+let startedAt = Date.now();
 async function shutdown() {
   if (exiting) return;
   exiting = true;
   log("shutting down…");
   try { if (pg) await pg.stop(); } catch {}
-  try { fs.unlinkSync(LOCK_PATH); } catch {}
+  try { if (prisma) await prisma.$disconnect(); } catch {}
+  try { if (statusServer) statusServer.close(); } catch {}
   process.exit(0);
 }
 process.on("SIGINT", shutdown);
 process.on("SIGTERM", shutdown);
-process.on("exit", () => { try { fs.unlinkSync(LOCK_PATH); } catch {} });
-
-// v1.10.1: an unexpected crash used to kill the process without stopping
-// the embedded Postgres (the next start then logged "database system was
-// not properly shut down; automatic recovery in progress"). Catch it,
-// log it in human form, and shut down cleanly instead.
 process.on("unhandledRejection", (e) => {
   console.error("✗ unexpected error:", e instanceof Error ? (e.stack || e.message) : e);
   shutdown();
@@ -386,4 +526,38 @@ process.on("uncaughtException", (e) => {
   shutdown();
 });
 
-bootAndStartLoop();
+// ─────────────────────────────────────────────────────────────
+// Main.
+// ─────────────────────────────────────────────────────────────
+async function main() {
+  await acquireLock(); // single-instance guard = the status port
+  startStatusServer();
+  log(`status page: http://localhost:${STATUS_PORT}  (open this in a browser — ONE place to look)`);
+  try {
+    await boot();
+  } catch {
+    console.error("✗ boot failed — fix the error above and start the bridge again (start.bat).");
+    process.exit(1);
+  }
+  prisma = await loadPrismaClient();
+  // Wrap pollLoop so the status page can see backoff state.
+  const _pollOnce = pollOnce;
+  let backoff = 0;
+  while (!exiting) {
+    pollAlive = true;
+    try {
+      await _pollOnce();
+      backoff = 0; pollBackoff = 0;
+      stats.polls++;
+    } catch (e) {
+      backoff = Math.min((backoff || 1) * 2, 15_000);
+      pollBackoff = backoff;
+      stats.lastError = String(e.message || e);
+      console.error(`poll error, retry in ${backoff}ms: ${e.message}`);
+      await sleep(backoff);
+    }
+  }
+  await shutdown();
+}
+
+main();

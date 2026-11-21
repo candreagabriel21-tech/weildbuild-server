@@ -50,6 +50,10 @@ sleep 3
 check "main health" '"weildbuild-main"' "$(curl -s http://localhost:8000/health)"
 
 echo "── 3. Admin login ──"
+# v1.11 security note: ADMIN_PASSWORD below is the LOCAL-TEST
+# bootstrap fixture (matches scripts/supabase-schema.sql seed).
+# It is NOT the live Render admin password. Do not reuse these
+# scripts against production. See platform-patches/PATCHES.md.
 LOGIN=$(curl -s -X POST http://localhost:8000/api/auth -H "Content-Type: application/json" -d '{"action":"login","username":"WeildBuild","password":"WeildBuild2026!"}')
 check "admin login" '"success":true' "$LOGIN"
 ADMIN_TOKEN=$(echo "$LOGIN" | jsonval . sessionToken)

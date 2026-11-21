@@ -60,6 +60,10 @@ check "gamehost health" 'weildbuild-gamehost' "$(curl -s http://localhost:3004/h
 
 echo "── 4. Logins ──"
 ADMIN_TOKEN=$(curl -s -X POST http://localhost:8000/api/auth -H "Content-Type: application/json" \
+# v1.11 security note: ADMIN_PASSWORD below is the LOCAL-TEST
+# bootstrap fixture (matches scripts/supabase-schema.sql seed).
+# It is NOT the live Render admin password. Do not reuse these
+# scripts against production. See platform-patches/PATCHES.md.
   -d '{"action":"login","username":"WeildBuild","password":"WeildBuild2026!"}' | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>console.log(JSON.parse(d).sessionToken||''))")
 [ -n "$ADMIN_TOKEN" ] && echo "  OK  admin login" || { echo "  XX  admin login failed"; exit 1; }
 REG=$(curl -s -X POST http://localhost:8000/api/auth -H "Content-Type: application/json" -d '{"action":"register","username":"Victim1","password":"testpass123"}')

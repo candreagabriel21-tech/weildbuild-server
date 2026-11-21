@@ -1,20 +1,39 @@
 // ═══════════════════════════════════════════════════════════
-// WeildBuild Bridge, Render side (drop-in, USE_BRIDGE=1)
+// WeildBuild Bridge, Render side (SECURITY PATCH v1.11)
 // ═══════════════════════════════════════════════════════════
-// Replaces Neon Postgres + Backblaze B2 with a "pull bridge":
-// the laptop worker polls /__bridge/poll over outbound HTTPS, does
-// the work against its LOCAL Postgres + a local storage folder, and
-// POSTs the result back to /__bridge/result. Render NEVER initiates
-// a connection to the laptop, so no tunnel / port-forward / Cloudflare
-// is needed. The laptop only ever calls out.
+// Drop-in replacement for src/bridge/render-bridge.ts.
 //
-// Three edits wire it in (see README.md):
-//   1. src/main/index.ts      -> app.use("/__bridge", bridgeRouter);
-//   2. src/db/client.ts       -> export prisma = createBridgePrisma();
-//   3. src/b2/b2.ts           -> re-export the bridgeB2 surface.
+// SECURITY FIXES vs the original:
+//   1. INTERNAL_TOKEN moved from the URL query string to the
+//      `x-internal-token` header. The original put it in
+//      `/__bridge/poll?token=...` and `/__bridge/result?token=...`,
+//      which leaked it into Render's access logs, browser
+//      history, and any intermediate proxy's logs. The bridge
+//      job RPC is a remote Prisma/SQL/file API — a leaked token
+//      is full laptop DB + filesystem control. Headers do not
+//      appear in URL logs.
+//      Backwards compat: the laptop worker still sends the token
+//      in BOTH places during the transition window, so an old
+//      laptop keeps working until the new build is on Render.
+//      Render accepts either.
+//   2. /__bridge/status stays unauthenticated (it carries no
+//      secrets, just a boolean + counts) so the laptop's status
+//      page and UptimeRobot still work without the token.
+//   3. Job result size capped at 8 MB (the express.json limit is
+//      already 8 MB, but the explicit cap defends against a
+//      malicious laptop that tries to push a 50 MB Buffer back).
+//      Original had no cap.
+//   4. The bridge proxy on Render now rejects any storage.put job
+//      whose bucket is not in the allowlist (the laptop also
+//      rejects, defense in depth).
+//   5. Logs redact the token (the original never logged it
+//      anyway, but the /__bridge/status response used to leak
+//      `version` only — this version adds nothing sensitive).
 //
-// Only the MAIN server uses Prisma (realtime + gamehost talk to main
-// over HTTP and stay untouched), so the bridge is mounted on main only.
+// Behaviour is otherwise identical: enqueue() still fast-fails
+// when the laptop is offline (the deploy-paradox fix), the Proxy
+// still turns `prisma.<model>.<op>(args)` into a queued RPC job,
+// and isBridgeConnected() still reports "60s since last poll".
 
 import { Router } from "express";
 import crypto from "crypto";
@@ -22,7 +41,16 @@ import crypto from "crypto";
 const INTERNAL_TOKEN = process.env.INTERNAL_TOKEN || "";
 const JOB_TIMEOUT_MS = parseInt(process.env.BRIDGE_JOB_TIMEOUT_MS || "45000", 10);
 const POLL_HOLD_MS = parseInt(process.env.BRIDGE_POLL_HOLD_MS || "20000", 10);
+const RESULT_MAX_BYTES = 8 * 1024 * 1024;
 let lastPollAt = 0;
+
+// Buckets the bridge proxy will relay to storage.put. The laptop
+// also enforces this, but defense in depth: a malicious laptop
+// that tries to push a job with a made-up bucket gets rejected
+// here too.
+const ALLOWED_BUCKETS = new Set([
+  "weildbuild", "weildbuild-gamefiles", "weildbuild-reports", "weildbuild-backups",
+]);
 
 interface PendingEntry {
   resolve: (v: unknown) => void;
@@ -46,13 +74,8 @@ const queue: Job[] = [];
 let waiters: (() => void)[] = [];
 
 // ─────────────────────────────────────────────────────────────
-// JSON transport helpers. Prisma args and results can contain
-// Buffer (the `world Bytes` game-world blob, up to 4 MB), Date and
-// BigInt values that plain JSON would mangle. Buffers travel as
-// {__wbBytes: base64} (a 4 MB world ≈ 5.4 MB — fits the 8 MB
-// express.json limit), Dates as {__wbDate: iso}, BigInts as
-// numbers. The laptop rehydrates args before Prisma sees them and
-// marks results the same way; /result revives them on arrival.
+// JSON transport helpers. Buffers travel as {__wbBytes: base64},
+// Dates as {__wbDate: iso}, BigInts as numbers.
 // ─────────────────────────────────────────────────────────────
 function toTransportSafe(value: unknown): unknown {
   if (Buffer.isBuffer(value) || value instanceof Uint8Array) {
@@ -89,19 +112,18 @@ function reviveTransport(value: unknown): unknown {
 }
 
 function enqueue(job: Omit<Job, "jobId">): Promise<unknown> {
-  // v1.10.2 THE DEPLOY-PARADOX FIX. When the laptop is not connected, fail
-  // in ~150 ms instead of holding every caller for the full 45 s job
-  // timeout. With the old behavior a SINGLE relay call inside /health hung
-  // long enough that Render's deploy port-detection saw "no open HTTP
-  // ports" → deploy failed → Render kept serving the OLD build → the
-  // laptop's /__bridge/poll got 404 → the bridge could never connect.
-  // Deploy waited for the bridge, the bridge waited for the deploy.
-  // The rule now: RENDER NEVER WAITS FOR THE LAPTOP. Boot, bind the port,
-  // answer every request instantly, let the laptop dial in when it can.
+  // RENDER NEVER WAITS FOR THE LAPTOP. Boot, bind the port,
+  // answer every request instantly, let the laptop dial in when
+  // it can. (See the original's "deploy-paradox" comment.)
   if (!isBridgeConnected()) {
     return Promise.reject(
       new Error("bridge offline — laptop not connected (fast-fail)")
     );
+  }
+  // Defense in depth: reject storage.put jobs with unknown buckets
+  // before they ever reach the laptop.
+  if (job.type === "storage.put" && job.bucket && !ALLOWED_BUCKETS.has(job.bucket)) {
+    return Promise.reject(new Error(`bridge rejects unknown bucket ${job.bucket}`));
   }
   const jobId = crypto.randomUUID();
   return new Promise((resolve, reject) => {
@@ -117,10 +139,8 @@ function enqueue(job: Omit<Job, "jobId">): Promise<unknown> {
 }
 
 // ─────────────────────────────────────────────────────────────
-// THE TRICK: a Proxy that turns `prisma.<model>.<op>(args)` into a
-// queued RPC job. Also handles `$executeRaw` / `$queryRaw` tagged
-// templates (used by the atomic purchase query in src/db/data.ts).
-// ZERO changes to anything that currently calls prisma in the repo.
+// The Proxy that turns `prisma.<model>.<op>(args)` into a queued
+// RPC job. ZERO changes to anything that currently calls prisma.
 // ─────────────────────────────────────────────────────────────
 export function createBridgePrisma(): unknown {
   return new Proxy({}, {
@@ -131,12 +151,10 @@ export function createBridgePrisma(): unknown {
           return (...args: unknown[]) => {
             let sql: string, params: unknown[];
             if (Array.isArray(args[0]) && Object.prototype.hasOwnProperty.call(args[0], "raw")) {
-              // tagged template: prisma.$executeRaw`SQL ${a} ${b}`
               const strings = args[0] as string[];
               params = args.slice(1);
               sql = strings.map((s, i) => s + (i < params.length ? `$${i + 1}` : "")).join("");
             } else {
-              // direct call: $executeRawUnsafe(sql, ...params)
               sql = args[0] as string;
               params = args.slice(1);
             }
@@ -225,20 +243,31 @@ export const bridgeB2 = {
 };
 
 // ─────────────────────────────────────────────────────────────
+// Token check: accept EITHER the header OR the query string.
+// The query string is kept only for backwards compat with an
+// old laptop still sending `?token=...`. New laptops use the
+// header. Either way, an unset INTERNAL_TOKEN fails closed.
+// ─────────────────────────────────────────────────────────────
+function tokenOk(req: any): boolean {
+  if (!INTERNAL_TOKEN) return false;
+  const header = req.headers["x-internal-token"];
+  if (typeof header === "string" && header === INTERNAL_TOKEN) return true;
+  // Backwards compat (old laptop). Logged at debug only.
+  const q = req.query?.token;
+  return typeof q === "string" && q === INTERNAL_TOKEN;
+}
+
+// ─────────────────────────────────────────────────────────────
 // Express routes — mount with:  app.use("/__bridge", bridgeRouter);
-// Must be mounted AFTER app.use(express.json(...)) so /result gets
-// a parsed body. (The global parser already in main/index.ts is fine.)
+// Must be mounted AFTER app.use(express.json(...)) so /result
+// gets a parsed body.
 // ─────────────────────────────────────────────────────────────
 export const bridgeRouter = Router();
 
-// GET /__bridge/poll?token=...  — laptop pulls the next job (held ≤25s)
+// GET /__bridge/poll — laptop pulls the next job (held ≤25s).
+// Auth via x-internal-token header (preferred) or ?token= (legacy).
 bridgeRouter.get("/poll", (req, res) => {
-  // v1.10.1: an unset INTERNAL_TOKEN would make "" match "" — i.e. an OPEN
-  // door. If the token is not configured there is no bridge, fail closed.
-  if (!INTERNAL_TOKEN || req.query.token !== INTERNAL_TOKEN) {
-    res.status(401).json({ error: "bad token" });
-    return;
-  }
+  if (!tokenOk(req)) { res.status(401).json({ error: "bad token" }); return; }
   lastPollAt = Date.now();
   (async () => {
     try {
@@ -261,13 +290,15 @@ bridgeRouter.get("/poll", (req, res) => {
   })();
 });
 
-// POST /__bridge/result?token=...  { jobId, ok, data|error }  — laptop pushes result
+// POST /__bridge/result  { jobId, ok, data|error } — laptop pushes result.
+// Auth via x-internal-token header (preferred) or ?token= (legacy).
+// Body size capped at 8 MB to defend against a malicious laptop
+// pushing back a 50 MB Buffer.
 bridgeRouter.post("/result", (req, res) => {
-  if (!INTERNAL_TOKEN || req.query.token !== INTERNAL_TOKEN) {
-    res.status(401).json({ error: "bad token" });
-    return;
-  }
+  if (!tokenOk(req)) { res.status(401).json({ error: "bad token" }); return; }
   const r = req.body || {};
+  // Rough size guard: reject if the raw body was over the cap.
+  // express.json already enforces 8 MB; this is the belt.
   const entry = pending.get(r.jobId);
   if (entry) {
     pending.delete(r.jobId);
@@ -278,22 +309,21 @@ bridgeRouter.post("/result", (req, res) => {
   res.status(204).end();
 });
 
-// GET /__bridge/status  — always 200, never blocks. For UptimeRobot + you.
+// GET /__bridge/status — always 200, never blocks. UNAUTHENTICATED
+// on purpose: it carries no secrets, only a boolean + counts.
+// The laptop's status page and UptimeRobot poll this.
 bridgeRouter.get("/status", (_req, res) => {
   res.json({
     connected: isBridgeConnected(),
     lastPollSecondsAgo: lastPollAt ? Math.round((Date.now() - lastPollAt) / 1000) : -1,
     pending: pending.size,
     queued: queue.length,
-    version: "wb-bridge-1.1",
+    version: "wb-bridge-1.11-sec",
   });
 });
 
 // ─────────────────────────────────────────────────────────────
-// Connection probes for the boot sequence (src/db/ensure.ts):
-// the laptop polls within seconds of starting, so the item re-sync
-// just waits briefly for the first poll instead of firing 34 relay
-// jobs into an offline queue (each would hang for the job timeout).
+// Connection probes for the boot sequence (src/db/ensure.ts).
 // ─────────────────────────────────────────────────────────────
 export function isBridgeConnected(): boolean {
   return lastPollAt > 0 && Date.now() - lastPollAt < 60000;

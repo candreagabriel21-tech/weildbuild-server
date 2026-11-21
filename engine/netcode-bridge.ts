@@ -79,8 +79,14 @@ export interface SelfCorrection {
 // relay, sampled at a fixed delay behind arrival time. The delay must
 // cover the 250 ms report period plus arrival jitter, so the render clock
 // always sits between two live samples - "if someone lags it's still
-// smooth" (the user's plan). 300 ms = 250 + 50 jitter budget.
-export const REMOTE_INTERP_DELAY_MS = 300;
+// smooth" (the user's plan). v1.11 (latency fix): 300 ms was sized for
+// 4 Hz reporting. With PLAYER_REPORT_HZ = 40 the report period is 25 ms,
+// so the interpolation delay only needs to cover 25 ms + jitter. 120 ms
+// cuts the "they look laggy" delay by more than half while keeping the
+// buffer dense enough to never stutter (the player sends 3 samples in
+// 75 ms, so 120 ms always sits between two). Bump back to 200 if you
+// ever see remote-player stutter on a bad connection.
+export const REMOTE_INTERP_DELAY_MS = 120;
 /** Consecutive samples farther apart than this are NOT interpolated
  * across (a delta-stream gap - an idle player simply stops being
  * broadcast until the 2 s keyframe - must not become a slow creep
@@ -304,10 +310,19 @@ export function pushSnapshot(data: {
     };
   }
   if (data.parts && data.parts.length > 0) {
-    // Cap the queue: if the local sim stalled (tab hidden), drop the oldest.
+    // v1.11 (latency fix): cap is 600, not 6000. A stalled tab used to
+    // accumulate 6000 corrections (~200 s of sim at 30 Hz), then dump 3000
+    // onto the renderer in one frame when the tab refocused — a 100 ms
+    // frame that took 2 s and looked like a freeze. With 600 the cap fills
+    // in ~20 s of sim, the renderer catches up in one frame at most, and
+    // the head of the queue (the OLDEST, stalest corrections) is dropped,
+    // not the tail. The local sim reconciles against the latest
+    // authoritative state on the next snapshot anyway, so dropping oldest
+    // is safe; dropping newest (the old `slice(-3000)`) discarded the
+    // most recent authoritative positions and forced a re-snapshot.
     partCorrections.push(...data.parts);
-    if (partCorrections.length > 6000) {
-      partCorrections = partCorrections.slice(-3000);
+    if (partCorrections.length > 600) {
+      partCorrections = partCorrections.slice(-600);
     }
   }
   if (data.fx && data.fx.length > 0) fxQueue.push(...data.fx);

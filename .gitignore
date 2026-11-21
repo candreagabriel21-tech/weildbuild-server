@@ -1,15 +1,37 @@
 node_modules/
 dist/
-.env
-*.log
-.DS_Store
+build/
+.cache/
+*.tsbuildinfo
 
-# ── bridge runtime (laptop-only, never commit these) ──
+# --- Secrets / local config (written by install.bat, never commit) ---
+.env
+.env.*
+!.env.example
+
+# --- Bridge runtime (laptop-only, never commit these) ---
 pgdata/
 wb-storage/
 bridge.lock
+supervisor.lock
 stop-now.flag
 bridge-log.txt
 bridge-log.old.txt
 install-log.txt
+pid.txt
 tmp-import-test.mjs
+
+# --- OS junk ---
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# --- Editor scratch ---
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+
+# --- General logs ---
+*.log

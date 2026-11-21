@@ -20,6 +20,10 @@ import { useStudioStore, isPart, StudioPart, Vector3, PartType } from './studio-
 import { playSound, playCue } from './sounds';
 import { WB_CAMERA_BRIDGE } from './welu/welu-runtime';
 import { playerInventory } from './player-inventory';
+// v1.11 security patch: safe math evaluator replaces `new Function(...)`
+// (RCE). See platform-patches/PATCHES.md (PATCH 1) and
+// platform-patches/safe-math.ts for the full grammar and test cases.
+import { safeEvalMath } from '../platform-patches/safe-math';
 
 // ─── Engine State ───
 
@@ -2378,39 +2382,42 @@ class WeildCodeEngine {
       if (part && isPart(part) && part.objectVariables) {
         for (const [name, val] of Object.entries(part.objectVariables)) {
           if (name === excludeName) continue;
-          resolvedExpr = this.replaceWordToken(resolvedExpr, name, String(val));
+          // v1.11 security patch: substitute as a number literal, not as
+          // raw text. The old code used String(val) which let a string
+          // variable value of "1; fetch(...)" inject JS source.
+          const n = typeof val === 'number' && isFinite(val) ? val
+                  : typeof val === 'boolean' ? (val ? 1 : 0)
+                  : Number(val);
+          resolvedExpr = isFinite(n)
+            ? this.replaceWordToken(resolvedExpr, name, String(n))
+            : this.replaceWordToken(resolvedExpr, name, '0');
         }
       }
     }
     for (const [name, val] of Object.entries(state.globalVariables)) {
       if (name === excludeName) continue;
-      resolvedExpr = this.replaceWordToken(resolvedExpr, name, String(val));
+      const n = typeof val === 'number' && isFinite(val) ? val
+              : typeof val === 'boolean' ? (val ? 1 : 0)
+              : Number(val);
+      resolvedExpr = isFinite(n)
+        ? this.replaceWordToken(resolvedExpr, name, String(n))
+        : this.replaceWordToken(resolvedExpr, name, '0');
     }
 
-    resolvedExpr = resolvedExpr
-      .replace(/\bsqrt\b/g, 'Math.sqrt')
-      .replace(/\babs\b/g, 'Math.abs')
-      .replace(/\bfloor\b/g, 'Math.floor')
-      .replace(/\bceil\b/g, 'Math.ceil')
-      .replace(/\bround\b/g, 'Math.round')
-      .replace(/\bsin\b/g, 'Math.sin')
-      .replace(/\bcos\b/g, 'Math.cos')
-      .replace(/\btan\b/g, 'Math.tan')
-      .replace(/\bpow\b/g, 'Math.pow')
-      .replace(/\bmin\b/g, 'Math.min')
-      .replace(/\bmax\b/g, 'Math.max')
-      .replace(/\bPI\b/g, 'Math.PI')
-      .replace(/\btimeOfDay\b/g, String(state.worldSettings.timeOfDay));
+    // Inject timeOfDay as a number literal (the safe evaluator does not
+    // understand `timeOfDay` as a name; the old code rewrote the word to
+    // `Math.PI`-style `Math.X` which the safe evaluator does understand
+    // natively).
+    resolvedExpr = this.replaceWordToken(resolvedExpr, 'timeOfDay',
+      String(isFinite(state.worldSettings.timeOfDay) ? state.worldSettings.timeOfDay : 0));
 
-    try {
-      // Use Function constructor for safe-ish evaluation (no access to scope)
-      const fn = new Function(`"use strict"; return (${resolvedExpr})`);
-      const result = Number(fn());
-      if (!isFinite(result)) return null;
-      return result;
-    } catch {
-      return null;
-    }
+    // SAFE EVAL: safe-math.ts whitelists + - * / % ** ( ) and the
+    // functions sqrt abs floor ceil round sin cos tan pow min max and the
+    // constants PI E. Everything else (strings, member access, semicolons,
+    // template literals, identifiers other than the whitelisted ones) is
+    // rejected at parse time. There is no way to reach Math, process,
+    // globalThis, Function, or eval.
+    return safeEvalMath(resolvedExpr);
   }
 
   /**

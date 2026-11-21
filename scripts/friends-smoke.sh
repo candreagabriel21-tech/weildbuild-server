@@ -42,6 +42,10 @@ curl -s -o /dev/null http://localhost:8000/health || { echo "main never came up"
 echo "── 3. Users ──"
 # Login as seeded admin WeildBuild
 ADMIN_TOKEN=$(curl -s -X POST http://localhost:8000/api/auth -H "Content-Type: application/json" \
+# v1.11 security note: ADMIN_PASSWORD below is the LOCAL-TEST
+# bootstrap fixture (matches scripts/supabase-schema.sql seed).
+# It is NOT the live Render admin password. Do not reuse these
+# scripts against production. See platform-patches/PATCHES.md.
   -d '{"action":"login","username":"WeildBuild","password":"WeildBuild2026!"}' | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>console.log(JSON.parse(d).sessionToken||''))")
 [ -n "$ADMIN_TOKEN" ] && echo "  OK  WeildBuild admin login" || { echo "  XX  admin login failed"; exit 1; }
 # Register Bob

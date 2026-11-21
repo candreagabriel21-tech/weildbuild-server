@@ -32,6 +32,11 @@ function verifyPassword(password: string, storedHash: string, salt: string, hash
 }
 
 // ── Known values from the original scripts/supabase-schema.sql ──
+// v1.11 security note: this is the SHA of the ORIGINAL bootstrap
+// password. The live admin password on Render was rotated after this
+// hash was generated; this test only verifies the seed logic ran and
+// produces the expected hash, NOT the live credential. Do not log in
+// to production with ADMIN_PASSWORD.
 const ADMIN_USER = "WeildBuild";
 const ADMIN_PASSWORD = "WeildBuild2026!";
 const ADMIN_SALT = "5765696c644275696c64323032362121";

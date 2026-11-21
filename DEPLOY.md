@@ -311,7 +311,12 @@ curl -s https://weildbuild-gamehost-2.onrender.com/health
 # 2. Version gate answers?
 curl -s $MAIN/version
 
-# 3. Login as the seeded admin (original password works!)
+# 3. Login as the seeded admin.
+#    v1.11 security note: the bootstrap password below ("WeildBuild2026!")
+#    is the ORIGINAL seed credential from scripts/supabase-schema.sql. It
+#    MUST be rotated on Render (Admin → Environment → change the admin
+#    user's password hash, or use the /api/auth reset flow) immediately
+#    after the first deploy. Do not run production with this password.
 curl -s -X POST $MAIN/api/auth -H "Content-Type: application/json" \
   -d '{"action":"login","username":"WeildBuild","password":"WeildBuild2026!"}'
 

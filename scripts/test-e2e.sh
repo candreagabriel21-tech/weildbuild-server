@@ -46,6 +46,10 @@ echo "── 4. Version gate ──"
 check "version endpoint" '"minimum":"1.0.0"' "$(curl -s http://localhost:8000/version)"
 
 echo "── 5. Auth: admin login (password compat!) ──"
+# v1.11 security note: ADMIN_PASSWORD below is the LOCAL-TEST
+# bootstrap fixture (matches scripts/supabase-schema.sql seed).
+# It is NOT the live Render admin password. Do not reuse these
+# scripts against production. See platform-patches/PATCHES.md.
 LOGIN=$(curl -s -X POST http://localhost:8000/api/auth -H "Content-Type: application/json" -d '{"action":"login","username":"WeildBuild","password":"WeildBuild2026!"}')
 check "admin login works with original password" '"success":true' "$LOGIN"
 ADMIN_TOKEN=$(echo "$LOGIN" | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>console.log(JSON.parse(d).sessionToken||''))")
